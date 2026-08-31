@@ -959,22 +959,52 @@ def sidebar():
         # origin it's actually using right now, and build the link from that.
         components.html(
             """
-            <div style="font-family:monospace;font-size:0.85rem;background:#15171C;
-                        color:#F4F3EF;border:1px solid #24262C;border-radius:6px;
-                        padding:0.5rem 0.7rem;word-break:break-all;">
-              <span id="ecc-display-url">computing…</span>
+            <div style="font-family:'Inter',sans-serif;font-size:0.85rem;">
+              <div style="display:flex;align-items:center;gap:0.4rem;
+                          background:#15171C;color:#F4F3EF;border:1px solid #24262C;
+                          border-radius:6px;padding:0.5rem 0.7rem;">
+                <a id="ecc-display-link" href="#" target="_blank" rel="noopener"
+                   style="flex:1;color:#C8A24A;text-decoration:underline;
+                          word-break:break-all;font-family:monospace;font-size:0.82rem;">
+                  computing…
+                </a>
+                <button id="ecc-copy-btn" onclick="eccCopyDisplayUrl()"
+                        style="flex-shrink:0;background:#24262C;color:#F4F3EF;border:none;
+                               border-radius:4px;padding:0.3rem 0.6rem;font-size:0.75rem;
+                               cursor:pointer;">Copy</button>
+              </div>
+              <div id="ecc-copy-msg" style="color:#9A9CA3;font-size:0.72rem;margin-top:0.2rem;"></div>
             </div>
             <script>
-              const url = window.location.origin + window.location.pathname + "?display=projector";
-              document.getElementById("ecc-display-url").innerText = url;
+              // NOTE: this snippet runs inside a sandboxed iframe (Streamlit's
+              // components.html), so window.location here refers to the iframe
+              // itself (origin "null", path "srcdoc") — not the real page.
+              // window.parent.location is the actual browser tab's address.
+              const linkEl = document.getElementById("ecc-display-link");
+              let displayUrl = null;
+              try {
+                displayUrl = window.parent.location.origin + window.parent.location.pathname + "?display=projector";
+                linkEl.href = displayUrl;
+                linkEl.innerText = displayUrl;
+              } catch (e) {
+                linkEl.innerText = "Couldn't detect the URL automatically — copy it from your browser's address bar and add ?display=projector to the end.";
+                linkEl.removeAttribute("href");
+              }
+              function eccCopyDisplayUrl() {
+                if (!displayUrl) return;
+                navigator.clipboard.writeText(displayUrl).then(() => {
+                  document.getElementById("ecc-copy-msg").innerText = "Copied!";
+                  setTimeout(() => { document.getElementById("ecc-copy-msg").innerText = ""; }, 1500);
+                });
+              }
             </script>
             """,
-            height=50,
+            height=70,
         )
         st.caption(
-            "Open this URL in a second window on your projector, then press fullscreen. "
-            "If you're running this app remotely (not on this machine), open that "
-            "same address on the projector's browser too — not 'localhost'."
+            "Click the link (or copy it) and open it in a second window on your projector, "
+            "then press fullscreen. If you're running this app remotely, that link already "
+            "reflects the real address you're using — no need to type 'localhost'."
         )
 
 

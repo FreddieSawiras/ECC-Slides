@@ -731,7 +731,12 @@ def inject_css():
         background: #0E0F13;
         border-right: 1px solid {CARD_BORDER};
     }}
-    #MainMenu, footer, header {{visibility: hidden;}}
+    /* Hide the hamburger menu and "Made with Streamlit" footer, but keep the
+       header bar itself — it's what holds the arrow to re-open the sidebar
+       once it's been collapsed, so hiding it entirely locks that control away. */
+    #MainMenu, footer {{visibility: hidden;}}
+    header {{background: transparent;}}
+    header [data-testid="stToolbar"] {{visibility: hidden;}}
 
     .ecc-wordmark {{
         font-weight: 800; font-size: 1.4rem; letter-spacing: 0.02em;
@@ -1584,5 +1589,4 @@ def render_login():
 if __name__ == "__main__":
     main()
 
-    #git status ; git add . ; git commit -m "Your commit message" ; git push
-
+# git status ; git add . ; git commit -m "Your commit message" ; git push

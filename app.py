@@ -882,48 +882,82 @@ def _looks_arabic(text):
 # ---------------------------------------------------------------------------
 
 def render_projector():
-    state = get_state()
-    projector_css(state["theme"] or "Modern Worship")
+    # Auto-refreshing fragment: only this function's output re-renders on
+    # each tick (not the whole script), and there's no full-page reload —
+    # that's what removes most of the lag you were seeing between clicking
+    # NEXT and the projector updating. Requires Streamlit >= 1.33 for
+    # st.fragment(run_every=...); if you're on an older version, upgrade
+    # with `pip install -U streamlit`.
+    @st.fragment(run_every=0.35)
+    def _tick():
+        state = get_state()
+        projector_css(state["theme"] or "Modern Worship")
 
-    text, ref, text2 = "", None, None
-    if state["cleared"] or not state["live"]:
-        text = ""
-    elif state["black"]:
-        text = ""
-    elif state["service_id"]:
-        service = get_service(state["service_id"])
-        if service:
-            items = json.loads(service["items"])
-            idx = state["item_index"]
-            if 0 <= idx < len(items):
-                slides = item_slides(items[idx])
-                si = state["slide_index"]
-                if 0 <= si < len(slides):
-                    ref, text, text2 = slides[si]
+        text, ref, text2 = "", None, None
+        if state["cleared"] or not state["live"]:
+            text = ""
+        elif state["black"]:
+            text = ""
+        elif state["service_id"]:
+            service = get_service(state["service_id"])
+            if service:
+                items = json.loads(service["items"])
+                idx = state["item_index"]
+                if 0 <= idx < len(items):
+                    slides = item_slides(items[idx])
+                    si = state["slide_index"]
+                    if 0 <= si < len(slides):
+                        ref, text, text2 = slides[si]
 
-    if text2:
-        top_dir = "rtl" if _looks_arabic(text) else "ltr"
-        bottom_dir = "rtl" if _looks_arabic(text2) else "ltr"
-        render_html(
-            f"""<div class="proj-split">
-            <div class="proj-half proj-half-top" dir="{top_dir}">
-            {f'<div class="proj-ref">{ref}</div>' if ref else ''}
-            <div class="proj-text">{text}</div>
-            </div>
-            <div class="proj-half proj-half-bottom" dir="{bottom_dir}">
-            <div class="proj-text-secondary">{text2}</div>
-            </div>
-            </div>"""
-        )
-    else:
-        render_html(
-            f"""<div class="proj-wrap">
-            {f'<div class="proj-ref">{ref}</div>' if ref else ''}
-            <div class="proj-text">{text}</div>
-            </div>"""
-        )
-    time.sleep(1)
-    st.rerun()
+        if text2:
+            top_dir = "rtl" if _looks_arabic(text) else "ltr"
+            bottom_dir = "rtl" if _looks_arabic(text2) else "ltr"
+            render_html(
+                f"""<div class="proj-split">
+                <div class="proj-half proj-half-top" dir="{top_dir}">
+                {f'<div class="proj-ref">{ref}</div>' if ref else ''}
+                <div class="proj-text">{text}</div>
+                </div>
+                <div class="proj-half proj-half-bottom" dir="{bottom_dir}">
+                <div class="proj-text-secondary">{text2}</div>
+                </div>
+                </div>"""
+            )
+        else:
+            render_html(
+                f"""<div class="proj-wrap">
+                {f'<div class="proj-ref">{ref}</div>' if ref else ''}
+                <div class="proj-text">{text}</div>
+                </div>"""
+            )
+
+    _tick()
+
+    # Press "F" anywhere on this page to toggle real browser fullscreen.
+    # (The old docstring told people to "press F" but nothing was ever
+    # listening for it — F on its own does nothing in a browser by default,
+    # only F11 does. This actually wires it up.)
+    components.html(
+        """
+        <script>
+        (function() {
+            const doc = window.parent.document;
+            if (doc._eccFsBound) return;
+            doc._eccFsBound = true;
+            doc.addEventListener('keydown', function(e) {
+                if (e.key.toLowerCase() === 'f' && !e.ctrlKey && !e.metaKey && !e.altKey) {
+                    if (!doc.fullscreenElement) {
+                        doc.documentElement.requestFullscreen().catch(() => {});
+                    } else {
+                        doc.exitFullscreen().catch(() => {});
+                    }
+                }
+            });
+        })();
+        </script>
+        """,
+        height=0,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -974,6 +1008,13 @@ def sidebar():
                                cursor:pointer;">Copy</button>
               </div>
               <div id="ecc-copy-msg" style="color:#9A9CA3;font-size:0.72rem;margin-top:0.2rem;"></div>
+              <button id="ecc-auto-btn" onclick="eccAutoPresent()"
+                      style="width:100%;margin-top:0.4rem;background:#C8A24A;color:#0B0C0F;
+                             border:none;border-radius:4px;padding:0.4rem 0.6rem;font-size:0.78rem;
+                             font-weight:700;cursor:pointer;">
+                ⛶ Open on second screen automatically
+              </button>
+              <div id="ecc-auto-msg" style="color:#9A9CA3;font-size:0.72rem;margin-top:0.2rem;"></div>
             </div>
             <script>
               // NOTE: this snippet runs inside a sandboxed iframe (Streamlit's
@@ -997,9 +1038,45 @@ def sidebar():
                   setTimeout(() => { document.getElementById("ecc-copy-msg").innerText = ""; }, 1500);
                 });
               }
+              // Uses the Window Management API (Chrome/Edge only, needs HTTPS
+              // or localhost). It lists connected monitors, opens the display
+              // link positioned exactly on whichever one isn't this window,
+              // and tries to fullscreen it — same trick apps like Canva/Slides
+              // use to make "extending" feel automatic. First use will prompt
+              // for a one-time permission ("Window Management" / "Manage
+              // Windows"). Fullscreen-on-open isn't guaranteed by every
+              // browser without an extra click in that new window — if it
+              // doesn't go fullscreen by itself, press "F" once it's open.
+              async function eccAutoPresent() {
+                const msg = document.getElementById("ecc-auto-msg");
+                if (!displayUrl) { msg.innerText = "URL not ready yet."; return; }
+                if (!window.parent.getScreenDetails) {
+                  msg.innerText = "Your browser doesn't support auto multi-screen (needs Chrome or Edge). Use the link above instead.";
+                  return;
+                }
+                try {
+                  const details = await window.parent.getScreenDetails();
+                  const current = details.currentScreen;
+                  const other = details.screens.find(s => s !== current) || current;
+                  const w = window.parent.open(
+                    displayUrl, "ecc_projector",
+                    `left=${other.availLeft},top=${other.availTop},width=${other.availWidth},height=${other.availHeight}`
+                  );
+                  if (!w) {
+                    msg.innerText = "Popup was blocked — allow popups for this site and try again.";
+                    return;
+                  }
+                  setTimeout(() => { try { w.document.documentElement.requestFullscreen(); } catch (e) {} }, 500);
+                  msg.innerText = other === current
+                    ? "Only one screen detected — opened here. Connect a projector/monitor first for auto-positioning."
+                    : "Opened on the second screen. Press F there if it isn't fullscreen yet.";
+                } catch (e) {
+                  msg.innerText = "Permission needed: " + e.message;
+                }
+              }
             </script>
             """,
-            height=70,
+            height=115,
         )
         st.caption(
             "Click the link (or copy it) and open it in a second window on your projector, "
@@ -1683,5 +1760,3 @@ def render_login():
 
 if __name__ == "__main__":
     main()
-
-#git status ; git add . ; git commit -m "Your commit message" ; git push

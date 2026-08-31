@@ -1588,5 +1588,3 @@ def render_login():
 
 if __name__ == "__main__":
     main()
-
-# git status ; git add . ; git commit -m "Your commit message" ; git push

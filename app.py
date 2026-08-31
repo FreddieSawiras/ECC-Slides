@@ -25,6 +25,7 @@ same local SQLite file so nothing is lost between sessions.
 """
 
 import streamlit as st
+import streamlit.components.v1 as components
 import sqlite3
 import json
 import os
@@ -564,18 +565,47 @@ def _flatten_bible_rows(data):
         sample = data[0]
         has_chapters_list = "chapters" in {k.lower() for k in sample.keys()}
         if has_chapters_list:
-            # Nested list-of-books shape
+            # Nested list-of-books shape. "chapters" itself comes in two
+            # common shapes depending on the source dataset:
+            #   (a) a list of {"chapter":.., "verses":[{"verse":..,"text":..}, ...]} dicts
+            #   (b) a list of plain lists of verse strings, e.g.
+            #       [["In the beginning...", "And the earth..."], [...]]
+            #       (used by the popular scrollmapper/bible_databases exports,
+            #       including ar_svd.json) — chapter/verse numbers here are
+            #       just the 1-based position in each list, since the file
+            #       doesn't label them explicitly.
             for book_entry in data:
                 book, book_number = _extract_book(book_entry, NAME_KEYS, NUMBER_KEYS)
                 chapters = _first_key(book_entry, ["chapters"])
-                for ch_entry in chapters:
-                    chapter = _first_key(ch_entry, CHAPTER_KEYS)
-                    verses = _first_key(ch_entry, ["verses"])
-                    for v_entry in verses:
-                        verse = _first_key(v_entry, VERSE_KEYS)
-                        text = _first_key(v_entry, TEXT_KEYS)
-                        if book and chapter is not None and verse is not None and text:
-                            rows.append((str(book), book_number, int(chapter), int(verse), text))
+                for chapter_idx, ch_entry in enumerate(chapters, start=1):
+                    if isinstance(ch_entry, list):
+                        # Shape (b): a bare list of verse strings for this chapter
+                        chapter = chapter_idx
+                        for verse_idx, text in enumerate(ch_entry, start=1):
+                            if book and text:
+                                rows.append((str(book), book_number, chapter, verse_idx, text))
+                    elif isinstance(ch_entry, dict):
+                        # Shape (a): an explicit {"chapter":.., "verses":[...]} dict
+                        chapter = _first_key(ch_entry, CHAPTER_KEYS)
+                        if chapter is None:
+                            chapter = chapter_idx
+                        verses = _first_key(ch_entry, ["verses"])
+                        for verse_idx, v_entry in enumerate(verses, start=1):
+                            if isinstance(v_entry, dict):
+                                verse = _first_key(v_entry, VERSE_KEYS)
+                                text = _first_key(v_entry, TEXT_KEYS)
+                            else:
+                                # verses list of bare strings inside a chapter dict
+                                verse, text = None, v_entry
+                            if verse is None:
+                                verse = verse_idx
+                            if book and chapter is not None and verse is not None and text:
+                                rows.append((str(book), book_number, int(chapter), int(verse), text))
+                    else:
+                        raise ValueError(
+                            f"Unrecognized chapter entry in '{book}': expected a list of verses "
+                            f"or a chapter dict, got {type(ch_entry).__name__}."
+                        )
         else:
             # Flat list of verse rows, whatever the exact field names are
             for entry in data:
@@ -918,10 +948,34 @@ def sidebar():
                 st.session_state.page = label
 
         st.markdown("---")
-        base_url = st.session_state.get("_base_url", "")
         st.caption("Projector / extended display")
-        st.code((base_url or "http://localhost:8501") + "?display=projector", language=None)
-        st.caption("Open this URL in a second window on your projector, then press fullscreen.")
+        # We can't reliably ask the Streamlit server for its own public URL
+        # (it may be behind a different host/port than the one the browser
+        # used — e.g. deployed on Streamlit Cloud, a reverse proxy, or just a
+        # different port locally). "http://localhost:8501" only ever works
+        # when the projector browser is the *same machine* as this one, so
+        # hardcoding it as a fallback silently gave a broken link whenever
+        # that wasn't true. Instead, ask the browser itself (via JS) what
+        # origin it's actually using right now, and build the link from that.
+        components.html(
+            """
+            <div style="font-family:monospace;font-size:0.85rem;background:#15171C;
+                        color:#F4F3EF;border:1px solid #24262C;border-radius:6px;
+                        padding:0.5rem 0.7rem;word-break:break-all;">
+              <span id="ecc-display-url">computing…</span>
+            </div>
+            <script>
+              const url = window.location.origin + window.location.pathname + "?display=projector";
+              document.getElementById("ecc-display-url").innerText = url;
+            </script>
+            """,
+            height=50,
+        )
+        st.caption(
+            "Open this URL in a second window on your projector, then press fullscreen. "
+            "If you're running this app remotely (not on this machine), open that "
+            "same address on the projector's browser too — not 'localhost'."
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1599,4 +1653,5 @@ def render_login():
 
 if __name__ == "__main__":
     main()
+
 #git status ; git add . ; git commit -m "Your commit message" ; git push

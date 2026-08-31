@@ -730,13 +730,24 @@ def inject_css():
     section[data-testid="stSidebar"] {{
         background: #0E0F13;
         border-right: 1px solid {CARD_BORDER};
+        min-width: 290px !important;
+        max-width: 290px !important;
+        margin-left: 0px !important;
+        transform: none !important;
+        visibility: visible !important;
     }}
-    /* Hide the hamburger menu and "Made with Streamlit" footer, but keep the
-       header bar itself — it's what holds the arrow to re-open the sidebar
-       once it's been collapsed, so hiding it entirely locks that control away. */
-    #MainMenu, footer {{visibility: hidden;}}
-    header {{background: transparent;}}
-    header [data-testid="stToolbar"] {{visibility: hidden;}}
+    /* The sidebar is meant to stay permanently open — hide every version of
+       Streamlit's collapse/expand controls so there's no button to click,
+       and hide the header/menu/footer chrome around it entirely. */
+    #MainMenu, footer, header {{visibility: hidden; display: none;}}
+    [data-testid="stSidebarCollapseButton"],
+    [data-testid="collapsedControl"],
+    [data-testid="stSidebarCollapsedControl"],
+    button[title="Collapse sidebar"],
+    button[title="Expand sidebar"] {{
+        display: none !important;
+        visibility: hidden !important;
+    }}
 
     .ecc-wordmark {{
         font-weight: 800; font-size: 1.4rem; letter-spacing: 0.02em;
@@ -1588,3 +1599,4 @@ def render_login():
 
 if __name__ == "__main__":
     main()
+#git status ; git add . ; git commit -m "Your commit message" ; git push

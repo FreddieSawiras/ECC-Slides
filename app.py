@@ -92,6 +92,14 @@ BIBLE_SAMPLE = {
 }
 BIBLE_TRANSLATION_LABEL = "KJV (Public Domain)"
 
+# Canonical book order (standard 66-book Protestant order) used to line up the
+# same passage across translations that name books differently (e.g. an
+# Arabic file whose book names are in Arabic script can still be matched to
+# an English translation by this shared number). Only covers the books used
+# by the built-in sample; imported files bring their own numbers with them.
+BIBLE_BOOK_NUMBERS = {"Psalm": 19, "John": 43, "Romans": 45, "Philippians": 50}
+BIBLE_NUMBER_TO_BOOK = {v: k for k, v in BIBLE_BOOK_NUMBERS.items()}
+
 # ---------------------------------------------------------------------------
 # DATABASE
 # ---------------------------------------------------------------------------
@@ -135,9 +143,15 @@ def init_db():
     c.execute("""CREATE TABLE IF NOT EXISTS bible_verses(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         book TEXT, chapter INTEGER, verse INTEGER, text TEXT, translation TEXT,
+        book_number INTEGER,
         UNIQUE(book, chapter, verse, translation)
     )""")
     conn.commit()
+    try:
+        c.execute("ALTER TABLE bible_verses ADD COLUMN book_number INTEGER")
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass  # column already exists (older database)
 
     if c.execute("SELECT COUNT(*) FROM settings").fetchone()[0] == 0:
         c.execute("INSERT INTO settings(id, church_name, default_theme) VALUES (1, 'ECC', 'Modern Worship')")
@@ -158,8 +172,8 @@ def init_db():
             for chapter, verses in chapters.items():
                 for verse, text in verses.items():
                     c.execute(
-                        "INSERT OR IGNORE INTO bible_verses(book, chapter, verse, text, translation) VALUES (?,?,?,?,?)",
-                        (book, chapter, verse, text, BIBLE_TRANSLATION_LABEL)
+                        "INSERT OR IGNORE INTO bible_verses(book, chapter, verse, text, translation, book_number) VALUES (?,?,?,?,?,?)",
+                        (book, chapter, verse, text, BIBLE_TRANSLATION_LABEL, BIBLE_BOOK_NUMBERS.get(book))
                     )
     conn.commit()
     conn.close()
@@ -340,14 +354,14 @@ def set_settings(**kwargs):
 # ---------------------------------------------------------------------------
 
 def item_slides(item):
-    """Return list of (reference_or_none, text) for a service item."""
+    """Return list of (reference_or_none, text, secondary_text_or_None) for a service item."""
     if item["type"] == "song":
-        return [(None, s) for s in item["slides"]]
+        return [(None, s, None) for s in item["slides"]]
     if item["type"] == "bible":
-        return [(v["ref"], v["text"]) for v in item["slides"]]
+        return [(v["ref"], v["text"], v.get("text2")) for v in item["slides"]]
     if item["type"] in ("custom", "announcement"):
-        return [(None, item["slides"][0] if item["slides"] else "")]
-    return [(None, "")]
+        return [(None, item["slides"][0] if item["slides"] else "", None)]
+    return [(None, "", None)]
 
 
 def make_song_item(song_row):
@@ -359,9 +373,22 @@ def make_song_item(song_row):
     }
 
 
-def make_bible_item(book, chapter, verse_nums, translation=None):
+def make_bible_item(book, chapter, verse_nums, translation=None, secondary_translation=None):
+    """
+    Build a Bible service item. If secondary_translation is given, each slide
+    also carries the same verse's text in that translation (looked up by the
+    shared canonical book number when available, so an Arabic and an English
+    translation can still be lined up even though they name books
+    differently) — this is what powers the bilingual split-screen display.
+    """
     verses = get_bible_verses(book, chapter, translation)
-    slides = [{"ref": f"{book} {chapter}:{v}", "text": verses.get(v, "")} for v in verse_nums]
+    book_number = get_book_number(book, translation) if translation else None
+    slides = []
+    for v in verse_nums:
+        slide = {"ref": f"{book} {chapter}:{v}", "text": verses.get(v, "")}
+        if secondary_translation:
+            slide["text2"] = get_verse_in_translation(book, chapter, v, secondary_translation, book_number)
+        slides.append(slide)
     label = f"{book} {chapter}:{verse_nums[0]}" if len(verse_nums) == 1 else \
         f"{book} {chapter}:{verse_nums[0]}-{verse_nums[-1]}"
     return {"type": "bible", "ref_id": None, "title": label, "slides": slides}
@@ -435,34 +462,170 @@ def get_verse_text(book, chapter, verse, translation=None):
     return verses.get(verse, "")
 
 
+def get_book_number(book, translation):
+    """Look up the canonical book_number stored against a book in a given translation."""
+    conn = get_conn()
+    r = conn.execute(
+        "SELECT book_number FROM bible_verses WHERE book=? AND translation=? AND book_number IS NOT NULL LIMIT 1",
+        (book, translation)
+    ).fetchone()
+    conn.close()
+    return r["book_number"] if r else None
+
+
+def get_verse_in_translation(book, chapter, verse, translation, book_number=None):
+    """
+    Look up the same verse in another translation. Tries matching by the
+    shared canonical book_number first (works even if the two translations
+    name the book differently, e.g. an Arabic book name vs. an English one),
+    then falls back to matching by the literal book name (works when both
+    translations use the same naming, e.g. two English translations).
+    Returns "" if no match is found.
+    """
+    conn = get_conn()
+    if book_number is not None:
+        r = conn.execute(
+            "SELECT text FROM bible_verses WHERE book_number=? AND chapter=? AND verse=? AND translation=? LIMIT 1",
+            (book_number, chapter, verse, translation)
+        ).fetchone()
+        if r:
+            conn.close()
+            return r["text"]
+    r = conn.execute(
+        "SELECT text FROM bible_verses WHERE book=? AND chapter=? AND verse=? AND translation=? LIMIT 1",
+        (book, chapter, verse, translation)
+    ).fetchone()
+    conn.close()
+    return r["text"] if r else ""
+
+
+def _first_key(d, candidates):
+    """Return the value of the first matching key (case-insensitive) found in d, else None."""
+    lower_map = {k.lower(): k for k in d.keys()}
+    for cand in candidates:
+        if cand in lower_map:
+            return d[lower_map[cand]]
+    return None
+
+
+def _extract_book(entry, name_keys, number_keys):
+    """
+    Pull both a display name and a canonical numeric book id off a row,
+    whatever the source calls them. Needed because a scrollmapper-style
+    export has both 'book_name' (text, e.g. Arabic script) and 'book'
+    (a shared numeric id, e.g. 1=Genesis) — the numeric id is what lets us
+    line up the same verse across two differently-named translations later.
+    """
+    name = _first_key(entry, name_keys)
+    num_raw = _first_key(entry, number_keys)
+    number = None
+    if num_raw is not None:
+        try:
+            number = int(num_raw)
+        except (TypeError, ValueError):
+            number = None
+    if name is None:
+        if number is not None and number in BIBLE_NUMBER_TO_BOOK:
+            name = BIBLE_NUMBER_TO_BOOK[number]
+        elif num_raw is not None and number is None:
+            name = str(num_raw)  # the "book" field turned out to hold a text name, not a number
+    return name, number
+
+
+def _flatten_bible_rows(data):
+    """
+    Normalize many common 'bible JSON dump' shapes into a flat list of
+    (book, book_number_or_None, chapter, verse, text) tuples. Handles, among
+    others:
+      - Flat list with keys book/chapter/verse/text (any common naming variant,
+        e.g. book_name, chapter_number, verse_number, verse_text — this covers
+        the popular scrollmapper/bible_databases exports like 'ar_svd.json',
+        which also carry a numeric book id alongside the text name)
+      - A wrapper dict with the real list under 'verses', 'data', or 'rows'
+      - Nested dict: {book: {chapter: {verse: text}}}
+      - Nested list-of-books: [{"name"/"book": "Genesis", "chapters": [{"chapter":1,"verses":[{"verse":1,"text":"..."}]}]}]
+    """
+    NAME_KEYS = ["book_name", "bookname", "name"]
+    NUMBER_KEYS = ["book_number", "booknumber", "book_id", "bookid", "book", "b", "number", "num"]
+    CHAPTER_KEYS = ["chapter", "chapter_number", "chapternumber", "c"]
+    VERSE_KEYS = ["verse", "verse_number", "versenumber", "v"]
+    TEXT_KEYS = ["text", "verse_text", "versetext", "t", "content"]
+
+    # Unwrap common wrapper dicts
+    if isinstance(data, dict):
+        for wrapper_key in ("verses", "data", "rows", "results"):
+            if wrapper_key in data and isinstance(data[wrapper_key], list):
+                data = data[wrapper_key]
+                break
+
+    rows = []
+
+    if isinstance(data, list) and data and isinstance(data[0], dict):
+        sample = data[0]
+        has_chapters_list = "chapters" in {k.lower() for k in sample.keys()}
+        if has_chapters_list:
+            # Nested list-of-books shape
+            for book_entry in data:
+                book, book_number = _extract_book(book_entry, NAME_KEYS, NUMBER_KEYS)
+                chapters = _first_key(book_entry, ["chapters"])
+                for ch_entry in chapters:
+                    chapter = _first_key(ch_entry, CHAPTER_KEYS)
+                    verses = _first_key(ch_entry, ["verses"])
+                    for v_entry in verses:
+                        verse = _first_key(v_entry, VERSE_KEYS)
+                        text = _first_key(v_entry, TEXT_KEYS)
+                        if book and chapter is not None and verse is not None and text:
+                            rows.append((str(book), book_number, int(chapter), int(verse), text))
+        else:
+            # Flat list of verse rows, whatever the exact field names are
+            for entry in data:
+                book, book_number = _extract_book(entry, NAME_KEYS, NUMBER_KEYS)
+                chapter = _first_key(entry, CHAPTER_KEYS)
+                verse = _first_key(entry, VERSE_KEYS)
+                text = _first_key(entry, TEXT_KEYS)
+                if book is None or chapter is None or verse is None or text is None:
+                    missing = [n for n, v in [("book", book), ("chapter", chapter), ("verse", verse), ("text", text)] if v is None]
+                    raise ValueError(
+                        f"Row is missing {', '.join(missing)}. Fields found on that row: {list(entry.keys())}"
+                    )
+                rows.append((str(book), book_number, int(chapter), int(verse), text))
+
+    elif isinstance(data, dict):
+        # Nested dict: {book: {chapter: {verse: text}}}
+        for book, chapters in data.items():
+            book_number = BIBLE_BOOK_NUMBERS.get(book)
+            for chapter, verses in chapters.items():
+                for verse, text in verses.items():
+                    rows.append((str(book), book_number, int(chapter), int(verse), text))
+    else:
+        raise ValueError("Unrecognized Bible JSON shape — see the format examples above.")
+
+    return rows
+
+
 def import_bible_json(data, translation, replace_translation=False):
     """
-    Import Bible text from parsed JSON. Two accepted shapes:
-      1) Nested:  {"John": {"3": {"16": "For God so loved...", ...}, ...}, ...}
-      2) Flat:    [{"book": "John", "chapter": 3, "verse": 16, "text": "..."}, ...]
+    Import Bible text from parsed JSON. Accepts the two documented shapes
+    (nested book/chapter/verse dict, or a flat list with book/chapter/verse/text
+    keys) plus several common variants used by public Bible JSON datasets
+    (different key names, a wrapper object, or a nested list-of-books/chapters
+    structure). When the source includes a numeric book id (most datasets do),
+    it's stored too, so this translation can be paired with another one for
+    bilingual/split-screen display even if the two name books differently.
     Only import text you or your church have the legal right to use — public
-    domain translations (e.g. KJV, WEB, ASV) or ones you're properly licensed for.
-    Returns the number of verses imported.
+    domain translations (e.g. KJV, WEB, ASV) or ones you're properly licensed
+    for. Returns the number of verses imported.
     """
+    rows = _flatten_bible_rows(data)
+    if not rows:
+        raise ValueError("No verses were found in that file.")
+
     conn = get_conn()
     if replace_translation:
         conn.execute("DELETE FROM bible_verses WHERE translation=?", (translation,))
-
-    rows = []
-    if isinstance(data, list):
-        for entry in data:
-            rows.append((entry["book"], int(entry["chapter"]), int(entry["verse"]), entry["text"], translation))
-    elif isinstance(data, dict):
-        for book, chapters in data.items():
-            for chapter, verses in chapters.items():
-                for verse, text in verses.items():
-                    rows.append((book, int(chapter), int(verse), text, translation))
-    else:
-        raise ValueError("Unrecognized Bible JSON shape.")
-
     conn.executemany(
-        "INSERT OR REPLACE INTO bible_verses(book, chapter, verse, text, translation) VALUES (?,?,?,?,?)",
-        rows
+        "INSERT OR REPLACE INTO bible_verses(book, chapter, verse, text, translation, book_number) VALUES (?,?,?,?,?,?)",
+        [(b, c, v, t, translation, bn) for (b, bn, c, v, t) in rows]
     )
     conn.commit()
     conn.close()
@@ -538,10 +701,24 @@ def import_songs_csv(rows):
 # STYLES
 # ---------------------------------------------------------------------------
 
+def render_html(html_str: str):
+    """
+    Render a (possibly multi-line) raw HTML string with st.markdown.
+
+    Python triple-quoted strings written with normal source-code indentation
+    keep that indentation as literal leading whitespace on every line after
+    the first. Streamlit's markdown parser treats any line indented 4+ spaces
+    as a preformatted code block, so without this the HTML tags print as
+    literal text instead of rendering (this is what caused the projector
+    display and slide previews to show raw <div> tags). Stripping each
+    line's leading whitespace before handing it to st.markdown avoids that.
+    """
+    st.markdown("\n".join(line.lstrip() for line in html_str.split("\n")), unsafe_allow_html=True)
+
+
 def inject_css():
-    st.markdown(f"""
-    <style>
-    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=Manrope:wght@400;500;700&display=swap');
+    render_html(f"""
+    <style>    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=Manrope:wght@400;500;700&display=swap');
 
     html, body, [class*="css"]  {{
         font-family: 'Inter', -apple-system, sans-serif;
@@ -605,12 +782,12 @@ def inject_css():
     }}
     .slide-thumb.active {{ border-color: {ACCENT}; color: {TEXT_PRIMARY}; background: {ACCENT}14; }}
     </style>
-    """, unsafe_allow_html=True)
+    """)
 
 
 def projector_css(theme_name):
     t = THEMES.get(theme_name, THEMES["Modern Worship"])
-    st.markdown(f"""
+    render_html(f"""
     <style>
     #MainMenu, footer, header {{visibility: hidden;}}
     section[data-testid="stSidebar"] {{display:none;}}
@@ -629,8 +806,29 @@ def projector_css(theme_name):
         font-family: {t['font']}; color: {t['fg']}; font-size: clamp(2.2rem, 5.4vw, 5.5rem);
         line-height: 1.35; font-weight: 700; white-space: pre-line;
     }}
+    .proj-split {{
+        height: 100vh; width: 100vw; display:flex; flex-direction:column;
+    }}
+    .proj-half {{
+        flex: 1; display:flex; flex-direction:column; align-items:center;
+        justify-content:center; text-align:center; padding: 2.5vw; overflow:hidden;
+    }}
+    .proj-half-top {{ border-bottom: 1px solid {t['sub']}44; }}
+    .proj-text-secondary {{
+        font-family: {t['font']}; color: {t['fg']}; font-size: clamp(1.6rem, 4vw, 3.6rem);
+        line-height: 1.35; font-weight: 700; white-space: pre-line;
+    }}
+    [dir="rtl"] .proj-text, [dir="rtl"] .proj-text-secondary {{
+        font-family: 'Traditional Arabic', 'Noto Naskh Arabic', 'Segoe UI', Tahoma, sans-serif;
+    }}
     </style>
-    """, unsafe_allow_html=True)
+    """)
+
+
+def _looks_arabic(text):
+    """True if the text contains Arabic-script characters, so we can set text
+    direction/font automatically without the operator having to configure it."""
+    return any("\u0600" <= ch <= "\u06FF" for ch in (text or ""))
 
 
 # ---------------------------------------------------------------------------
@@ -641,7 +839,7 @@ def render_projector():
     state = get_state()
     projector_css(state["theme"] or "Modern Worship")
 
-    text, ref = "", None
+    text, ref, text2 = "", None, None
     if state["cleared"] or not state["live"]:
         text = ""
     elif state["black"]:
@@ -655,15 +853,29 @@ def render_projector():
                 slides = item_slides(items[idx])
                 si = state["slide_index"]
                 if 0 <= si < len(slides):
-                    ref, text = slides[si]
+                    ref, text, text2 = slides[si]
 
-    st.markdown(
-        f"""<div class="proj-wrap">
-        {f'<div class="proj-ref">{ref}</div>' if ref else ''}
-        <div class="proj-text">{text}</div>
-        </div>""",
-        unsafe_allow_html=True,
-    )
+    if text2:
+        top_dir = "rtl" if _looks_arabic(text) else "ltr"
+        bottom_dir = "rtl" if _looks_arabic(text2) else "ltr"
+        render_html(
+            f"""<div class="proj-split">
+            <div class="proj-half proj-half-top" dir="{top_dir}">
+            {f'<div class="proj-ref">{ref}</div>' if ref else ''}
+            <div class="proj-text">{text}</div>
+            </div>
+            <div class="proj-half proj-half-bottom" dir="{bottom_dir}">
+            <div class="proj-text-secondary">{text2}</div>
+            </div>
+            </div>"""
+        )
+    else:
+        render_html(
+            f"""<div class="proj-wrap">
+            {f'<div class="proj-ref">{ref}</div>' if ref else ''}
+            <div class="proj-text">{text}</div>
+            </div>"""
+        )
     time.sleep(1)
     st.rerun()
 
@@ -862,14 +1074,13 @@ def page_song_workspace():
         theme = st.session_state.get("preview_theme", "Modern Worship")
         t = THEMES[theme]
         st.markdown("**Preview (what the projector will show)**")
-        st.markdown(
+        render_html(
             f"""<div style="background:{t['bg']};border-radius:16px;padding:3rem 2rem;
             min-height:320px;display:flex;align-items:center;justify-content:center;
             text-align:center;border:1px solid {CARD_BORDER};">
             <div style="color:{t['fg']};font-family:{t['font']};font-size:1.7rem;
             font-weight:700;white-space:pre-line;line-height:1.4;">{slides[sel]}</div>
-            </div>""",
-            unsafe_allow_html=True,
+            </div>"""
         )
         edited = st.text_area("Edit this slide", value=slides[sel], height=120, key=f"edit_{song_id}_{sel}")
         if edited != slides[sel]:
@@ -906,9 +1117,19 @@ def page_bible():
     st.markdown("### Bible")
 
     translations = get_bible_translations()
-    translation = st.selectbox("Translation", translations, key="bible_translation",
-                                label_visibility="collapsed" if len(translations) == 1 else "visible")
-    st.caption(f"Showing {translation}. Import more (public-domain or licensed) in Church Settings.")
+    top1, top2 = st.columns([1, 1])
+    with top1:
+        translation = st.selectbox("Translation", translations, key="bible_translation")
+    with top2:
+        bilingual = st.checkbox("Bilingual (split screen)", key="bible_bilingual",
+                                 disabled=len(translations) < 2,
+                                 help="Shows a second translation stacked underneath the first on the projector — e.g. Arabic on top, English on the bottom.")
+    secondary_translation = None
+    if bilingual:
+        other_options = [t for t in translations if t != translation] or translations
+        secondary_translation = st.selectbox("Second translation (shown on the bottom half)", other_options, key="bible_secondary_translation")
+    st.caption(f"Browsing {translation}" + (f" · paired with {secondary_translation}" if secondary_translation else "") +
+               ". Import more (public-domain or licensed) in Church Settings.")
 
     books = get_bible_books(translation)
     if not books:
@@ -939,17 +1160,20 @@ def page_bible():
     with right:
         st.markdown("**Selected**")
         chosen_sorted = sorted(st.session_state.get("bible_selected_verses", []))
+        book_number = get_book_number(book, translation) if secondary_translation else None
         if chosen_sorted:
             for v in chosen_sorted:
                 st.markdown(f"**{book} {chapter}:{v}**")
                 st.caption(verses[v])
+                if secondary_translation:
+                    st.caption("↳ " + get_verse_in_translation(book, chapter, v, secondary_translation, book_number))
         else:
             st.caption("Select verses on the left.")
 
         st.write("")
         if st.button("+ Add to Service", disabled=not chosen_sorted, use_container_width=True):
             st.session_state.setdefault("bible_staging", [])
-            st.session_state.bible_staging.append((book, chapter, tuple(chosen_sorted), translation))
+            st.session_state.bible_staging.append((book, chapter, tuple(chosen_sorted), translation, secondary_translation))
             st.session_state.bible_selected_verses = []
             st.success("Added to staging — attach it in Service Builder.")
             st.rerun()
@@ -957,8 +1181,9 @@ def page_bible():
         staging = st.session_state.get("bible_staging", [])
         if staging:
             st.markdown("**Staged passages**")
-            for i, (b, c, vs, tr) in enumerate(staging):
-                st.caption(f"{b} {c}:{vs[0]}" + (f"-{vs[-1]}" if len(vs) > 1 else "") + f" ({tr})")
+            for i, (b, c, vs, tr, tr2) in enumerate(staging):
+                label = f"{b} {c}:{vs[0]}" + (f"-{vs[-1]}" if len(vs) > 1 else "") + f" ({tr}" + (f" + {tr2})" if tr2 else ")")
+                st.caption(label)
             if st.button("Go to Service Builder →"):
                 st.session_state.page = "Service Builder"; st.rerun()
 
@@ -1029,16 +1254,20 @@ def page_service_builder():
     st.markdown("#### Add to the service")
     a1, a2, a3, a4 = st.columns(4)
     with a1.popover("🎵 Add Song"):
-        songs = get_songs()
-        pick = st.selectbox("Song", songs, format_func=lambda s: s["title"], key="pick_song")
-        if st.button("Add", key="add_song_btn"):
-            items.append(make_song_item(pick))
-            update_service_items(sid, items); st.rerun()
+        song_options = {s["id"]: dict(s) for s in get_songs()}
+        if song_options:
+            pick_id = st.selectbox("Song", list(song_options.keys()),
+                                    format_func=lambda i: song_options[i]["title"], key="pick_song")
+            if st.button("Add", key="add_song_btn"):
+                items.append(make_song_item(song_options[pick_id]))
+                update_service_items(sid, items); st.rerun()
+        else:
+            st.caption("No songs yet — add one from the Songs tab.")
     with a2:
         staging = st.session_state.get("bible_staging", [])
         if st.button(f"📖 Add Staged Bible ({len(staging)})", disabled=not staging, use_container_width=True):
-            for (b, c, vs, tr) in staging:
-                items.append(make_bible_item(b, c, list(vs), tr))
+            for (b, c, vs, tr, tr2) in staging:
+                items.append(make_bible_item(b, c, list(vs), tr, tr2))
             st.session_state.bible_staging = []
             update_service_items(sid, items); st.rerun()
     with a3.popover("📣 Add Announcement"):
@@ -1119,26 +1348,44 @@ def page_presentation():
         st.markdown("**Current — shown on projector**")
         theme = state["theme"] or "Modern Worship"
         t = THEMES[theme]
-        cur_ref, cur_text = slides[slide_index] if slides else (None, "Nothing selected")
-        st.markdown(
-            f"""<div style="background:{t['bg']};border-radius:16px;padding:2.4rem 1.6rem;
-            min-height:260px;display:flex;flex-direction:column;align-items:center;justify-content:center;
-            text-align:center;border:1px solid {CARD_BORDER};">
-            {f'<div style="color:{t["sub"]};letter-spacing:.1em;text-transform:uppercase;margin-bottom:1rem;font-family:{t["font"]};">{cur_ref}</div>' if cur_ref else ''}
-            <div style="color:{t['fg']};font-family:{t['font']};font-size:1.5rem;font-weight:700;white-space:pre-line;line-height:1.4;">{cur_text if not (state["black"] or state["cleared"]) else "(hidden from projector)"}</div>
-            </div>""",
-            unsafe_allow_html=True,
-        )
+        cur_ref, cur_text, cur_text2 = slides[slide_index] if slides else (None, "Nothing selected", None)
+        hidden = state["black"] or state["cleared"]
+        if cur_text2 and not hidden:
+            top_dir = "rtl" if _looks_arabic(cur_text) else "ltr"
+            bottom_dir = "rtl" if _looks_arabic(cur_text2) else "ltr"
+            render_html(
+                f"""<div style="background:{t['bg']};border-radius:16px;overflow:hidden;
+                min-height:260px;border:1px solid {CARD_BORDER};display:flex;flex-direction:column;">
+                <div dir="{top_dir}" style="flex:1;padding:1.2rem;display:flex;flex-direction:column;
+                align-items:center;justify-content:center;text-align:center;border-bottom:1px solid {CARD_BORDER};">
+                {f'<div style="color:{t["sub"]};letter-spacing:.1em;text-transform:uppercase;margin-bottom:0.6rem;font-family:{t["font"]};font-size:0.8rem;">{cur_ref}</div>' if cur_ref else ''}
+                <div style="color:{t['fg']};font-family:{t['font']};font-size:1.2rem;font-weight:700;white-space:pre-line;line-height:1.4;">{cur_text}</div>
+                </div>
+                <div dir="{bottom_dir}" style="flex:1;padding:1.2rem;display:flex;align-items:center;justify-content:center;text-align:center;">
+                <div style="color:{t['fg']};font-family:{t['font']};font-size:1.1rem;font-weight:700;white-space:pre-line;line-height:1.4;">{cur_text2}</div>
+                </div>
+                </div>"""
+            )
+            st.caption("Bilingual split screen — top/bottom shown exactly as on the projector.")
+        else:
+            render_html(
+                f"""<div style="background:{t['bg']};border-radius:16px;padding:2.4rem 1.6rem;
+                min-height:260px;display:flex;flex-direction:column;align-items:center;justify-content:center;
+                text-align:center;border:1px solid {CARD_BORDER};">
+                {f'<div style="color:{t["sub"]};letter-spacing:.1em;text-transform:uppercase;margin-bottom:1rem;font-family:{t["font"]};">{cur_ref}</div>' if cur_ref else ''}
+                <div style="color:{t['fg']};font-family:{t['font']};font-size:1.5rem;font-weight:700;white-space:pre-line;line-height:1.4;">{cur_text if not hidden else "(hidden from projector)"}</div>
+                </div>"""
+            )
         st.markdown("**Up Next**")
-        nxt_ref, nxt_text = (None, "—")
+        nxt_ref, nxt_text, nxt_text2 = (None, "—", None)
         if slides and slide_index + 1 < len(slides):
-            nxt_ref, nxt_text = slides[slide_index + 1]
+            nxt_ref, nxt_text, nxt_text2 = slides[slide_index + 1]
         elif item_index + 1 < len(items):
             nslides = item_slides(items[item_index + 1])
             if nslides:
-                nxt_ref, nxt_text = nslides[0]
+                nxt_ref, nxt_text, nxt_text2 = nslides[0]
             nxt_text = f"(Next item) {items[item_index + 1]['title']} — {nxt_text}"
-        st.markdown(f'<div class="ecc-card">{(nxt_ref + " — ") if nxt_ref else ""}{nxt_text}</div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="ecc-card">{(nxt_ref + " — ") if nxt_ref else ""}{nxt_text}{(" / " + nxt_text2) if nxt_text2 else ""}</div>', unsafe_allow_html=True)
 
     with right:
         st.markdown("**Controls**")
@@ -1263,12 +1510,11 @@ def page_display_settings():
     st.write("")
     st.markdown("#### Preview")
     t = THEMES[theme]
-    st.markdown(
+    render_html(
         f"""<div style="background:{t['bg']};border-radius:16px;padding:3rem;text-align:center;">
         <div style="color:{t['sub']};text-transform:uppercase;letter-spacing:.1em;margin-bottom:.8rem;font-family:{t['font']};">JOHN 3:16</div>
         <div style="color:{t['fg']};font-size:1.6rem;font-weight:700;font-family:{t['font']};">For God so loved the world...</div>
-        </div>""",
-        unsafe_allow_html=True,
+        </div>"""
     )
 
 
@@ -1315,14 +1561,13 @@ def main():
 
 
 def render_login():
-    st.markdown(
+    render_html(
         f"""
         <div style="min-height:80vh;display:flex;flex-direction:column;align-items:center;justify-content:center;">
         <div style="font-weight:800;font-size:2.4rem;margin-bottom:0.2rem;">ECC <span style="color:{ACCENT}">Worship</span></div>
         <div style="color:{TEXT_MUTED};margin-bottom:2rem;">Welcome to ECC — Prepare. Present. Worship.</div>
         </div>
-        """,
-        unsafe_allow_html=True,
+        """
     )
     c1, c2, c3 = st.columns([1, 1, 1])
     with c2:
@@ -1338,3 +1583,6 @@ def render_login():
 
 if __name__ == "__main__":
     main()
+
+    #git status ; git add . ; git commit -m "Your commit message" ; git push
+

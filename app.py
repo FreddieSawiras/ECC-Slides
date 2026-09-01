@@ -55,6 +55,66 @@ THEMES = {
     "Classic": {"bg": "#03122B", "fg": "#FFFFFF", "sub": "#9FB6D9", "font": "Georgia, serif"},
 }
 
+# Preset projector backgrounds — original CSS gradients (no stock photos, so
+# nothing to license and nothing that breaks if you're offline), styled after
+# the ambient motion-background look apps like ProPresenter ship with. Each
+# one overrides the theme's flat background color; text color/font still
+# come from the selected theme. "anim" is an optional slow background-drift
+# animation name (defined once in projector_css); leave it out for a static
+# background.
+BACKGROUNDS = {
+    "None (theme color)": None,
+    "Warm Bokeh": {
+        "css": "radial-gradient(circle at 20% 30%, rgba(255,180,120,0.35), transparent 40%),"
+               "radial-gradient(circle at 80% 70%, rgba(255,140,90,0.30), transparent 45%),"
+               "radial-gradient(circle at 50% 50%, rgba(255,210,150,0.18), transparent 60%),"
+               "#1a120a",
+        "size": "220% 220%", "anim": "eccDrift 20s ease-in-out infinite alternate",
+        "swatch": "linear-gradient(135deg,#3a2414,#7a3f1d,#c9863f)",
+    },
+    "Aurora Glow": {
+        "css": "radial-gradient(circle at 30% 20%, rgba(80,220,180,0.30), transparent 45%),"
+               "radial-gradient(circle at 70% 60%, rgba(120,90,220,0.30), transparent 50%),"
+               "radial-gradient(circle at 50% 90%, rgba(60,160,220,0.25), transparent 55%),"
+               "#05070d",
+        "size": "220% 220%", "anim": "eccDrift 24s ease-in-out infinite alternate",
+        "swatch": "linear-gradient(135deg,#063a2e,#2d1f6e,#0d4f7a)",
+    },
+    "Golden Rays": {
+        "css": "conic-gradient(from 0deg at 50% 50%, rgba(200,162,74,0.24), rgba(11,9,4,0) 20%,"
+               "rgba(200,162,74,0.16) 40%, rgba(11,9,4,0) 60%, rgba(200,162,74,0.20) 80%,"
+               "rgba(11,9,4,0) 100%), #0b0904",
+        "size": "100% 100%", "anim": None,
+        "swatch": "conic-gradient(from 0deg, #c8a24a, #241c0e, #c8a24a, #241c0e)",
+    },
+    "Deep Space": {
+        "css": "radial-gradient(1.5px 1.5px at 12% 22%, #fff, transparent),"
+               "radial-gradient(1px 1px at 78% 38%, #fff, transparent),"
+               "radial-gradient(1.5px 1.5px at 48% 78%, #fff, transparent),"
+               "radial-gradient(2px 2px at 32% 58%, #fff, transparent),"
+               "radial-gradient(1px 1px at 88% 88%, #fff, transparent),"
+               "radial-gradient(1px 1px at 64% 14%, #fff, transparent),"
+               "radial-gradient(1.5px 1.5px at 6% 68%, #fff, transparent),"
+               "#05060b",
+        "size": "100% 100%", "anim": "eccTwinkle 5s ease-in-out infinite alternate",
+        "swatch": "radial-gradient(circle at 30% 30%, #fff 1px, transparent 2px) 0 0/12px 12px, #05060b",
+    },
+    "Ocean Waves": {
+        "css": "radial-gradient(circle at 30% 100%, rgba(30,120,180,0.35), transparent 55%),"
+               "radial-gradient(circle at 70% 100%, rgba(20,80,140,0.35), transparent 55%),"
+               "linear-gradient(180deg,#020814,#03101f)",
+        "size": "200% 200%", "anim": "eccDrift 16s ease-in-out infinite alternate",
+        "swatch": "linear-gradient(180deg,#03101f,#0f4c75,#1e78b0)",
+    },
+    "Soft Clouds": {
+        "css": "radial-gradient(circle at 25% 30%, rgba(255,255,255,0.10), transparent 45%),"
+               "radial-gradient(circle at 75% 65%, rgba(255,255,255,0.08), transparent 50%),"
+               "linear-gradient(160deg,#20242c,#0d0f13)",
+        "size": "220% 220%", "anim": "eccDrift 26s ease-in-out infinite alternate",
+        "swatch": "linear-gradient(160deg,#3a3f47,#20242c,#0d0f13)",
+    },
+}
+
 SONG_CATEGORIES = ["Worship", "Praise", "Hymns", "Contemporary"]
 
 # A small public-domain (KJV) Bible sample. Real deployments should load a
@@ -134,12 +194,13 @@ def init_db():
     )""")
     c.execute("""CREATE TABLE IF NOT EXISTS settings(
         id INTEGER PRIMARY KEY CHECK (id=1),
-        church_name TEXT, default_theme TEXT
+        church_name TEXT, default_theme TEXT, default_background TEXT
     )""")
     c.execute("""CREATE TABLE IF NOT EXISTS presentation_state(
         id INTEGER PRIMARY KEY CHECK (id=1),
         service_id INTEGER, item_index INTEGER, slide_index INTEGER,
-        black INTEGER, cleared INTEGER, live INTEGER, theme TEXT, updated_at TEXT
+        black INTEGER, cleared INTEGER, live INTEGER, theme TEXT, background TEXT, updated_at TEXT,
+        adhoc_active INTEGER, adhoc_slides TEXT, adhoc_index INTEGER
     )""")
     c.execute("""CREATE TABLE IF NOT EXISTS bible_verses(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -153,12 +214,28 @@ def init_db():
         conn.commit()
     except sqlite3.OperationalError:
         pass  # column already exists (older database)
+    # Ad-hoc "Present Now" support (Bible tab: present a verse straight to the
+    # projector without adding it to a service first). Older databases won't
+    # have these columns yet, so add them if missing.
+    for col, coltype in [("adhoc_active", "INTEGER"), ("adhoc_slides", "TEXT"), ("adhoc_index", "INTEGER"),
+                         ("background", "TEXT")]:
+        try:
+            c.execute(f"ALTER TABLE presentation_state ADD COLUMN {col} {coltype}")
+            conn.commit()
+        except sqlite3.OperationalError:
+            pass  # column already exists (older database)
+    try:
+        c.execute("ALTER TABLE settings ADD COLUMN default_background TEXT")
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass  # column already exists (older database)
 
     if c.execute("SELECT COUNT(*) FROM settings").fetchone()[0] == 0:
-        c.execute("INSERT INTO settings(id, church_name, default_theme) VALUES (1, 'ECC', 'Modern Worship')")
+        c.execute("INSERT INTO settings(id, church_name, default_theme, default_background) "
+                  "VALUES (1, 'ECC', 'Modern Worship', 'None (theme color)')")
     if c.execute("SELECT COUNT(*) FROM presentation_state").fetchone()[0] == 0:
-        c.execute("""INSERT INTO presentation_state(id, service_id, item_index, slide_index, black, cleared, live, theme, updated_at)
-                     VALUES (1, NULL, 0, 0, 0, 1, 1, 'Modern Worship', ?)""", (now(),))
+        c.execute("""INSERT INTO presentation_state(id, service_id, item_index, slide_index, black, cleared, live, theme, background, updated_at, adhoc_active, adhoc_slides, adhoc_index)
+                     VALUES (1, NULL, 0, 0, 0, 1, 1, 'Modern Worship', 'None (theme color)', ?, 0, NULL, 0)""", (now(),))
     conn.commit()
 
     if c.execute("SELECT COUNT(*) FROM songs").fetchone()[0] == 0:
@@ -333,6 +410,28 @@ def set_state(**kwargs):
     conn.execute(f"UPDATE presentation_state SET {cols} WHERE id=1", tuple(kwargs.values()))
     conn.commit()
     conn.close()
+
+
+def present_adhoc_now(slides):
+    """
+    Push slides straight to the projector without needing a saved service —
+    used by the Bible tab's "Present Now" buttons. `slides` is a list of
+    (ref, text, text2_or_None) tuples, same shape as item_slides() returns.
+    Any in-progress service navigation (item_index/slide_index) is left
+    untouched so resuming the service afterward picks up where it left off;
+    adhoc_active just tells the projector/operator view to show this instead.
+    """
+    set_state(
+        adhoc_active=1,
+        adhoc_slides=json.dumps(slides),
+        adhoc_index=0,
+        black=0, cleared=0, live=1,
+    )
+
+
+def exit_adhoc_present():
+    """Return the projector to whatever the normal service state points at."""
+    set_state(adhoc_active=0, adhoc_slides=None, adhoc_index=0)
 
 
 def get_settings():
@@ -831,14 +930,36 @@ def inject_css():
     """)
 
 
-def projector_css(theme_name):
+def projector_css(theme_name, background_key=None):
     t = THEMES.get(theme_name, THEMES["Modern Worship"])
+    bg_def = BACKGROUNDS.get(background_key) if background_key else None
+    app_bg = bg_def["css"] if bg_def else t["bg"]
+    bg_size_rule = f"background-size: {bg_def['size']};" if bg_def else ""
+    bg_anim_rule = f"animation: {bg_def['anim']};" if bg_def and bg_def.get("anim") else ""
     render_html(f"""
     <style>
     #MainMenu, footer, header {{visibility: hidden;}}
     section[data-testid="stSidebar"] {{display:none;}}
     .block-container {{ padding: 0 !important; max-width: 100% !important; }}
-    .stApp {{ background: {t['bg']}; cursor: none; }}
+    .stApp {{ background: {app_bg}; {bg_size_rule} {bg_anim_rule} cursor: none; position: relative; }}
+    @keyframes eccDrift {{
+        0% {{ background-position: 0% 50%; }}
+        50% {{ background-position: 100% 50%; }}
+        100% {{ background-position: 0% 50%; }}
+    }}
+    @keyframes eccTwinkle {{
+        0% {{ filter: brightness(0.85); }}
+        100% {{ filter: brightness(1.15); }}
+    }}
+    /* Subtle vignette over any background image so slide text stays readable
+       regardless of which preset is chosen — sits above the background,
+       below the text, and never intercepts clicks/taps. */
+    .stApp::before {{
+        content: {"''" if bg_def else "none"};
+        position: fixed; inset: 0; pointer-events: none; z-index: 0;
+        background: radial-gradient(circle, transparent 35%, rgba(0,0,0,0.45) 100%);
+    }}
+    .proj-wrap, .proj-split {{ position: relative; z-index: 1; }}
     .proj-wrap {{
         height: 100vh; width: 100vw; display:flex; flex-direction:column;
         align-items:center; justify-content:center; text-align:center; padding: 4vw;
@@ -851,6 +972,7 @@ def projector_css(theme_name):
     .proj-text {{
         font-family: {t['font']}; color: {t['fg']}; font-size: clamp(2.2rem, 5.4vw, 5.5rem);
         line-height: 1.35; font-weight: 700; white-space: pre-line;
+        text-shadow: {"0 2px 18px rgba(0,0,0,0.55)" if bg_def else "none"};
     }}
     .proj-split {{
         height: 100vh; width: 100vw; display:flex; flex-direction:column;
@@ -863,6 +985,7 @@ def projector_css(theme_name):
     .proj-text-secondary {{
         font-family: {t['font']}; color: {t['fg']}; font-size: clamp(1.6rem, 4vw, 3.6rem);
         line-height: 1.35; font-weight: 700; white-space: pre-line;
+        text-shadow: {"0 2px 18px rgba(0,0,0,0.55)" if bg_def else "none"};
     }}
     [dir="rtl"] .proj-text, [dir="rtl"] .proj-text-secondary {{
         font-family: 'Traditional Arabic', 'Noto Naskh Arabic', 'Segoe UI', Tahoma, sans-serif;
@@ -891,13 +1014,20 @@ def render_projector():
     @st.fragment(run_every=0.35)
     def _tick():
         state = get_state()
-        projector_css(state["theme"] or "Modern Worship")
+        projector_css(state["theme"] or "Modern Worship", state.get("background"))
 
         text, ref, text2 = "", None, None
         if state["cleared"] or not state["live"]:
             text = ""
         elif state["black"]:
             text = ""
+        elif state.get("adhoc_active"):
+            # "Present Now" from the Bible tab — bypasses the saved-service
+            # lookup entirely and reads straight from the ad-hoc slide list.
+            slides = json.loads(state["adhoc_slides"]) if state.get("adhoc_slides") else []
+            si = state.get("adhoc_index") or 0
+            if 0 <= si < len(slides):
+                ref, text, text2 = slides[si]
         elif state["service_id"]:
             service = get_service(state["service_id"])
             if service:
@@ -964,6 +1094,107 @@ def render_projector():
 # SIDEBAR
 # ---------------------------------------------------------------------------
 
+def render_display_open_widget(compact=False):
+    """
+    Renders the projector-link UI: a clickable link, a copy button, and an
+    "open on second screen automatically" button (Window Management API —
+    Chrome/Edge only). Used in both the sidebar (full version, with the
+    visible link) and inline on the Presentation page (compact — just the
+    auto-open button, since the link already lives in the sidebar).
+    """
+    link_row = "" if compact else """
+              <div style="display:flex;align-items:center;gap:0.4rem;
+                          background:#15171C;color:#F4F3EF;border:1px solid #24262C;
+                          border-radius:6px;padding:0.5rem 0.7rem;">
+                <a id="ecc-display-link" href="#" target="_blank" rel="noopener"
+                   style="flex:1;color:#C8A24A;text-decoration:underline;
+                          word-break:break-all;font-family:monospace;font-size:0.82rem;">
+                  computing…
+                </a>
+                <button id="ecc-copy-btn" onclick="eccCopyDisplayUrl()"
+                        style="flex-shrink:0;background:#24262C;color:#F4F3EF;border:none;
+                               border-radius:4px;padding:0.3rem 0.6rem;font-size:0.75rem;
+                               cursor:pointer;">Copy</button>
+              </div>
+              <div id="ecc-copy-msg" style="color:#9A9CA3;font-size:0.72rem;margin-top:0.2rem;"></div>
+    """
+    components.html(
+        f"""
+        <div style="font-family:'Inter',sans-serif;font-size:0.85rem;">
+          {link_row}
+          <button id="ecc-auto-btn" onclick="eccAutoPresent()"
+                  style="width:100%;margin-top:0.4rem;background:#C8A24A;color:#0B0C0F;
+                         border:none;border-radius:4px;padding:0.5rem 0.6rem;font-size:0.85rem;
+                         font-weight:700;cursor:pointer;">
+            ⛶ Open Presentation Display
+          </button>
+          <div id="ecc-auto-msg" style="color:#9A9CA3;font-size:0.72rem;margin-top:0.2rem;"></div>
+        </div>
+        <script>
+          // NOTE: this snippet runs inside a sandboxed iframe (Streamlit's
+          // components.html), so window.location here refers to the iframe
+          // itself (origin "null", path "srcdoc") — not the real page.
+          // window.parent.location is the actual browser tab's address.
+          const linkEl = document.getElementById("ecc-display-link");
+          let displayUrl = null;
+          try {{
+            displayUrl = window.parent.location.origin + window.parent.location.pathname + "?display=projector";
+            if (linkEl) {{ linkEl.href = displayUrl; linkEl.innerText = displayUrl; }}
+          }} catch (e) {{
+            if (linkEl) {{
+              linkEl.innerText = "Couldn't detect the URL automatically — copy it from your browser's address bar and add ?display=projector to the end.";
+              linkEl.removeAttribute("href");
+            }}
+          }}
+          function eccCopyDisplayUrl() {{
+            if (!displayUrl) return;
+            navigator.clipboard.writeText(displayUrl).then(() => {{
+              document.getElementById("ecc-copy-msg").innerText = "Copied!";
+              setTimeout(() => {{ document.getElementById("ecc-copy-msg").innerText = ""; }}, 1500);
+            }});
+          }}
+          // Uses the Window Management API (Chrome/Edge only, needs HTTPS
+          // or localhost). It lists connected monitors, opens the display
+          // link positioned exactly on whichever one isn't this window,
+          // and tries to fullscreen it — same trick apps like Canva/Slides
+          // use to make "extending" feel automatic. First use will prompt
+          // for a one-time permission ("Window Management" / "Manage
+          // Windows"). Fullscreen-on-open isn't guaranteed by every
+          // browser without an extra click in that new window — if it
+          // doesn't go fullscreen by itself, press "F" once it's open.
+          async function eccAutoPresent() {{
+            const msg = document.getElementById("ecc-auto-msg");
+            if (!displayUrl) {{ msg.innerText = "URL not ready yet."; return; }}
+            if (!window.parent.getScreenDetails) {{
+              msg.innerText = "Your browser doesn't support auto multi-screen (needs Chrome or Edge). Use the link above instead.";
+              return;
+            }}
+            try {{
+              const details = await window.parent.getScreenDetails();
+              const current = details.currentScreen;
+              const other = details.screens.find(s => s !== current) || current;
+              const w = window.parent.open(
+                displayUrl, "ecc_projector",
+                `left=${{other.availLeft}},top=${{other.availTop}},width=${{other.availWidth}},height=${{other.availHeight}}`
+              );
+              if (!w) {{
+                msg.innerText = "Popup was blocked — allow popups for this site and try again.";
+                return;
+              }}
+              setTimeout(() => {{ try {{ w.document.documentElement.requestFullscreen(); }} catch (e) {{}} }}, 500);
+              msg.innerText = other === current
+                ? "Only one screen detected — opened here. Connect a projector/monitor first for auto-positioning."
+                : "Opened on the second screen. Press F there if it isn't fullscreen yet.";
+            }} catch (e) {{
+              msg.innerText = "Permission needed: " + e.message;
+            }}
+          }}
+        </script>
+        """,
+        height=(115 if not compact else 65),
+    )
+
+
 def sidebar():
     with st.sidebar:
         st.markdown('<div class="ecc-wordmark">ECC <span>Worship</span></div>', unsafe_allow_html=True)
@@ -991,93 +1222,7 @@ def sidebar():
         # hardcoding it as a fallback silently gave a broken link whenever
         # that wasn't true. Instead, ask the browser itself (via JS) what
         # origin it's actually using right now, and build the link from that.
-        components.html(
-            """
-            <div style="font-family:'Inter',sans-serif;font-size:0.85rem;">
-              <div style="display:flex;align-items:center;gap:0.4rem;
-                          background:#15171C;color:#F4F3EF;border:1px solid #24262C;
-                          border-radius:6px;padding:0.5rem 0.7rem;">
-                <a id="ecc-display-link" href="#" target="_blank" rel="noopener"
-                   style="flex:1;color:#C8A24A;text-decoration:underline;
-                          word-break:break-all;font-family:monospace;font-size:0.82rem;">
-                  computing…
-                </a>
-                <button id="ecc-copy-btn" onclick="eccCopyDisplayUrl()"
-                        style="flex-shrink:0;background:#24262C;color:#F4F3EF;border:none;
-                               border-radius:4px;padding:0.3rem 0.6rem;font-size:0.75rem;
-                               cursor:pointer;">Copy</button>
-              </div>
-              <div id="ecc-copy-msg" style="color:#9A9CA3;font-size:0.72rem;margin-top:0.2rem;"></div>
-              <button id="ecc-auto-btn" onclick="eccAutoPresent()"
-                      style="width:100%;margin-top:0.4rem;background:#C8A24A;color:#0B0C0F;
-                             border:none;border-radius:4px;padding:0.4rem 0.6rem;font-size:0.78rem;
-                             font-weight:700;cursor:pointer;">
-                ⛶ Open on second screen automatically
-              </button>
-              <div id="ecc-auto-msg" style="color:#9A9CA3;font-size:0.72rem;margin-top:0.2rem;"></div>
-            </div>
-            <script>
-              // NOTE: this snippet runs inside a sandboxed iframe (Streamlit's
-              // components.html), so window.location here refers to the iframe
-              // itself (origin "null", path "srcdoc") — not the real page.
-              // window.parent.location is the actual browser tab's address.
-              const linkEl = document.getElementById("ecc-display-link");
-              let displayUrl = null;
-              try {
-                displayUrl = window.parent.location.origin + window.parent.location.pathname + "?display=projector";
-                linkEl.href = displayUrl;
-                linkEl.innerText = displayUrl;
-              } catch (e) {
-                linkEl.innerText = "Couldn't detect the URL automatically — copy it from your browser's address bar and add ?display=projector to the end.";
-                linkEl.removeAttribute("href");
-              }
-              function eccCopyDisplayUrl() {
-                if (!displayUrl) return;
-                navigator.clipboard.writeText(displayUrl).then(() => {
-                  document.getElementById("ecc-copy-msg").innerText = "Copied!";
-                  setTimeout(() => { document.getElementById("ecc-copy-msg").innerText = ""; }, 1500);
-                });
-              }
-              // Uses the Window Management API (Chrome/Edge only, needs HTTPS
-              // or localhost). It lists connected monitors, opens the display
-              // link positioned exactly on whichever one isn't this window,
-              // and tries to fullscreen it — same trick apps like Canva/Slides
-              // use to make "extending" feel automatic. First use will prompt
-              // for a one-time permission ("Window Management" / "Manage
-              // Windows"). Fullscreen-on-open isn't guaranteed by every
-              // browser without an extra click in that new window — if it
-              // doesn't go fullscreen by itself, press "F" once it's open.
-              async function eccAutoPresent() {
-                const msg = document.getElementById("ecc-auto-msg");
-                if (!displayUrl) { msg.innerText = "URL not ready yet."; return; }
-                if (!window.parent.getScreenDetails) {
-                  msg.innerText = "Your browser doesn't support auto multi-screen (needs Chrome or Edge). Use the link above instead.";
-                  return;
-                }
-                try {
-                  const details = await window.parent.getScreenDetails();
-                  const current = details.currentScreen;
-                  const other = details.screens.find(s => s !== current) || current;
-                  const w = window.parent.open(
-                    displayUrl, "ecc_projector",
-                    `left=${other.availLeft},top=${other.availTop},width=${other.availWidth},height=${other.availHeight}`
-                  );
-                  if (!w) {
-                    msg.innerText = "Popup was blocked — allow popups for this site and try again.";
-                    return;
-                  }
-                  setTimeout(() => { try { w.document.documentElement.requestFullscreen(); } catch (e) {} }, 500);
-                  msg.innerText = other === current
-                    ? "Only one screen detected — opened here. Connect a projector/monitor first for auto-positioning."
-                    : "Opened on the second screen. Press F there if it isn't fullscreen yet.";
-                } catch (e) {
-                  msg.innerText = "Permission needed: " + e.message;
-                }
-              }
-            </script>
-            """,
-            height=115,
-        )
+        render_display_open_widget(compact=False)
         st.caption(
             "Click the link (or copy it) and open it in a second window on your projector, "
             "then press fullscreen. If you're running this app remotely, that link already "
@@ -1327,12 +1472,24 @@ def page_bible():
         chosen = st.session_state.setdefault("bible_selected_verses", [])
         for vnum, text in verses.items():
             checked = vnum in chosen
-            if st.checkbox(f"{vnum}. {text}", value=checked, key=f"v_{book}_{chapter}_{vnum}"):
-                if vnum not in chosen:
-                    chosen.append(vnum)
-            else:
-                if vnum in chosen:
-                    chosen.remove(vnum)
+            vcol, pcol = st.columns([0.87, 0.13])
+            with vcol:
+                if st.checkbox(f"{vnum}. {text}", value=checked, key=f"v_{book}_{chapter}_{vnum}"):
+                    if vnum not in chosen:
+                        chosen.append(vnum)
+                else:
+                    if vnum in chosen:
+                        chosen.remove(vnum)
+            with pcol:
+                # One click, no service needed — builds the same slide shape
+                # a service item would use and pushes it straight to the
+                # projector via present_adhoc_now().
+                if st.button("▶", key=f"present_{book}_{chapter}_{vnum}",
+                             help=f"Present {book} {chapter}:{vnum} now"):
+                    item = make_bible_item(book, chapter, [vnum], translation, secondary_translation)
+                    present_adhoc_now(item_slides(item))
+                    st.toast(f"Presenting {book} {chapter}:{vnum}")
+                    st.rerun()
 
     with right:
         st.markdown("**Selected**")
@@ -1348,12 +1505,23 @@ def page_bible():
             st.caption("Select verses on the left.")
 
         st.write("")
-        if st.button("+ Add to Service", disabled=not chosen_sorted, use_container_width=True):
-            st.session_state.setdefault("bible_staging", [])
-            st.session_state.bible_staging.append((book, chapter, tuple(chosen_sorted), translation, secondary_translation))
-            st.session_state.bible_selected_verses = []
-            st.success("Added to staging — attach it in Service Builder.")
-            st.rerun()
+        scol1, scol2 = st.columns(2)
+        with scol1:
+            if st.button("▶ Present Now", disabled=not chosen_sorted, use_container_width=True,
+                         help="Show these verses on the projector immediately — no service needed."):
+                item = make_bible_item(book, chapter, chosen_sorted, translation, secondary_translation)
+                present_adhoc_now(item_slides(item))
+                label = f"{book} {chapter}:{chosen_sorted[0]}" + (f"-{chosen_sorted[-1]}" if len(chosen_sorted) > 1 else "")
+                st.session_state.bible_selected_verses = []
+                st.toast(f"Presenting {label}")
+                st.rerun()
+        with scol2:
+            if st.button("+ Add to Service", disabled=not chosen_sorted, use_container_width=True):
+                st.session_state.setdefault("bible_staging", [])
+                st.session_state.bible_staging.append((book, chapter, tuple(chosen_sorted), translation, secondary_translation))
+                st.session_state.bible_selected_verses = []
+                st.success("Added to staging — attach it in Service Builder.")
+                st.rerun()
 
         staging = st.session_state.get("bible_staging", [])
         if staging:
@@ -1484,42 +1652,60 @@ def page_service_builder():
         st.markdown('<div class="ecc-primary">', unsafe_allow_html=True)
         if st.button("▶ START SERVICE", use_container_width=True):
             set_state(service_id=sid, item_index=0, slide_index=0, black=0, cleared=0, live=1,
-                      theme=get_settings()["default_theme"])
+                      theme=get_settings()["default_theme"], background=get_settings().get("default_background"))
             st.session_state.page = "Presentation"
             st.rerun()
         st.markdown('</div>', unsafe_allow_html=True)
 
 
 def page_presentation():
+    adhoc = bool(get_state().get("adhoc_active"))
     sid = st.session_state.get("active_service_id") or ensure_active_service()
-    if not sid:
-        st.info("No active service. Build one in Service Builder first.")
+    if not sid and not adhoc:
+        st.info("No active service. Build one in Service Builder first — or present a Bible verse directly from the Bible tab.")
         return
-    service = get_service(sid)
-    items = json.loads(service["items"])
+
+    service = get_service(sid) if sid else None
+    items = json.loads(service["items"]) if service else []
     state = get_state()
-    if state["service_id"] != sid:
+    if service and state["service_id"] != sid and not adhoc:
         set_state(service_id=sid, item_index=0, slide_index=0, black=0, cleared=1, live=1)
         state = get_state()
 
-    st.markdown(f"### {service['name']}")
-    st.caption(f"{service['service_date']} · {service['service_time'] or ''}")
+    if adhoc:
+        st.markdown("### Presenting a verse")
+        st.caption("Presented directly from the Bible tab — not part of a saved service.")
+    elif service:
+        st.markdown(f"### {service['name']}")
+        st.caption(f"{service['service_date']} · {service['service_time'] or ''}")
 
     left, center, right = st.columns([1.2, 2.4, 1])
 
     with left:
         st.markdown("**Service Order**")
+        if adhoc:
+            st.caption("Paused while presenting a verse directly.")
+            if st.button("↩ Return to service", use_container_width=True, disabled=not sid):
+                exit_adhoc_present()
+                st.rerun()
         for i, item in enumerate(items):
             icon = {"song": "🎵", "bible": "📖", "custom": "🖼", "announcement": "📣"}.get(item["type"], "•")
-            active = " active" if i == state["item_index"] else ""
+            active = " active" if (not adhoc and i == state["item_index"]) else ""
             if st.button(f"{i+1:02d} {icon} {item['title']}", key=f"go_{i}", use_container_width=True):
-                set_state(item_index=i, slide_index=0, cleared=0, black=0)
+                set_state(item_index=i, slide_index=0, cleared=0, black=0, adhoc_active=0)
                 st.rerun()
 
-    item_index = state["item_index"]
-    item = items[item_index] if 0 <= item_index < len(items) else None
-    slides = item_slides(item) if item else []
-    slide_index = max(0, min(state["slide_index"], max(len(slides) - 1, 0)))
+    if adhoc:
+        adhoc_slides = json.loads(state["adhoc_slides"]) if state.get("adhoc_slides") else []
+        adhoc_index = max(0, min(state.get("adhoc_index") or 0, max(len(adhoc_slides) - 1, 0)))
+        slides = adhoc_slides
+        slide_index = adhoc_index
+        item_index, item = 0, None
+    else:
+        item_index = state["item_index"]
+        item = items[item_index] if 0 <= item_index < len(items) else None
+        slides = item_slides(item) if item else []
+        slide_index = max(0, min(state["slide_index"], max(len(slides) - 1, 0)))
 
     with center:
         st.markdown("**Current — shown on projector**")
@@ -1557,7 +1743,7 @@ def page_presentation():
         nxt_ref, nxt_text, nxt_text2 = (None, "—", None)
         if slides and slide_index + 1 < len(slides):
             nxt_ref, nxt_text, nxt_text2 = slides[slide_index + 1]
-        elif item_index + 1 < len(items):
+        elif not adhoc and item_index + 1 < len(items):
             nslides = item_slides(items[item_index + 1])
             if nslides:
                 nxt_ref, nxt_text, nxt_text2 = nslides[0]
@@ -1569,23 +1755,35 @@ def page_presentation():
         st.caption(f"Slide {slide_index + 1 if slides else 0} / {len(slides)}")
         cp, cn = st.columns(2)
         if cp.button("◀ PREV", use_container_width=True) and slide_index > 0:
-            set_state(slide_index=slide_index - 1, cleared=0); st.rerun()
+            if adhoc:
+                set_state(adhoc_index=slide_index - 1, cleared=0)
+            else:
+                set_state(slide_index=slide_index - 1, cleared=0)
+            st.rerun()
         if cn.button("NEXT ▶", use_container_width=True):
             if slide_index < len(slides) - 1:
-                set_state(slide_index=slide_index + 1, cleared=0); st.rerun()
-            elif item_index + 1 < len(items):
-                set_state(item_index=item_index + 1, slide_index=0, cleared=0); st.rerun()
+                if adhoc:
+                    set_state(adhoc_index=slide_index + 1, cleared=0)
+                else:
+                    set_state(slide_index=slide_index + 1, cleared=0)
+                st.rerun()
+            elif not adhoc and item_index + 1 < len(items):
+                set_state(item_index=item_index + 1, slide_index=0, cleared=0)
+                st.rerun()
         st.write("")
         if st.button("🖥 Present", use_container_width=True):
             set_state(cleared=0, black=0, live=1); st.rerun()
-        if st.button("⛶ Open Presentation Display", use_container_width=True):
-            st.info("Open the projector link shown in the sidebar in a second window, then drag it to your projector and press F for fullscreen there.")
+        # This used to be a plain st.button that only showed a text tip —
+        # a regular Streamlit button can't itself call browser JS, so it
+        # could never actually open anything. This renders the real
+        # clickable button (Window Management API auto-open) in its place.
+        render_display_open_widget(compact=True)
         if st.button("⬛ Black Screen", use_container_width=True):
             set_state(black=1 if not state["black"] else 0); st.rerun()
         if st.button("Clear Screen", use_container_width=True):
             set_state(cleared=1); st.rerun()
         if st.button("✕ Exit Presentation", use_container_width=True):
-            set_state(cleared=1, live=0)
+            set_state(cleared=1, live=0, adhoc_active=0)
             st.session_state.page = "Dashboard"
             st.rerun()
         st.write("")
@@ -1654,6 +1852,48 @@ def page_church_settings():
             st.error(f"Couldn't import that file: {e}")
 
     st.write("")
+    st.markdown("#### Song Backup / Restore")
+    st.caption(
+        "Every song you add or import is saved straight to a database file on disk right away — "
+        "so on a normal restart (closing and reopening the app on this same machine, or just Streamlit "
+        "re-running) nothing is lost; you won't need to re-download it from SongSelect.\n\n"
+        "The one case this doesn't cover: if this app is deployed somewhere with an ephemeral filesystem "
+        "(e.g. a free-tier host that resets everything not checked into your Git repo whenever it redeploys "
+        "or wakes from sleep), the database file itself can get wiped even though the app's code doesn't "
+        "change. That's a hosting-platform behavior, not something fixable from inside the app — the fix "
+        "there is either a persistent volume / external database from your host, or downloading a backup "
+        "here periodically and re-importing it after a reset."
+    )
+    bkcol1, bkcol2 = st.columns(2)
+    with bkcol1:
+        all_songs = get_songs()
+        backup_payload = [
+            {
+                "title": r["title"], "artist": r["artist"], "category": r["category"],
+                "tags": r["tags"], "slides": json.loads(r["slides"]),
+            }
+            for r in all_songs
+        ]
+        st.download_button(
+            "⬇ Download song backup (.json)",
+            data=json.dumps(backup_payload, ensure_ascii=False, indent=2),
+            file_name=f"songs_backup_{now().replace(':', '-')}.json",
+            mime="application/json",
+            use_container_width=True,
+            disabled=not all_songs,
+        )
+    with bkcol2:
+        restore_file = st.file_uploader("Restore from backup", type=["json"], key="song_backup_uploader",
+                                         label_visibility="collapsed")
+        if restore_file is not None and st.button("Restore Songs", use_container_width=True):
+            try:
+                data = json.load(restore_file)
+                n = import_songs_json(data)
+                st.success(f"Restored {n} songs.")
+            except Exception as e:
+                st.error(f"Couldn't restore that file: {e}")
+
+    st.write("")
     st.markdown("#### Import Songs (bulk)")
     st.caption(
         "Upload a JSON or CSV file of songs you/your church have the rights to use.\n\n"
@@ -1684,13 +1924,40 @@ def page_display_settings():
     if st.button("Save Default Theme"):
         set_settings(default_theme=theme)
         st.success("Saved.")
+
+    st.write("")
+    st.markdown("#### Background")
+    st.caption(
+        "Original animated/gradient backgrounds — no stock photos, so there's nothing to license "
+        "and they still render if you're ever offline. New services pick up whatever's saved here; "
+        "you can also override it per-service from Service Builder before you hit Start."
+    )
+    current_bg = settings.get("default_background") or "None (theme color)"
+    bg_names = list(BACKGROUNDS.keys())
+    swatch_cols = st.columns(len(bg_names))
+    for col, name in zip(swatch_cols, bg_names):
+        with col:
+            bg_def = BACKGROUNDS[name]
+            swatch_css = bg_def["swatch"] if bg_def else THEMES[theme]["bg"]
+            render_html(
+                f"""<div style="background:{swatch_css};height:70px;border-radius:8px;
+                border:2px solid {'#C8A24A' if name == current_bg else 'transparent'};"></div>"""
+            )
+            if st.button(name, key=f"bg_pick_{name}", use_container_width=True):
+                set_settings(default_background=name)
+                st.rerun()
+
     st.write("")
     st.markdown("#### Preview")
     t = THEMES[theme]
+    bg_def = BACKGROUNDS.get(current_bg)
+    preview_bg = bg_def["css"] if bg_def else t["bg"]
+    shadow = "text-shadow:0 2px 18px rgba(0,0,0,0.55);" if bg_def else ""
     render_html(
-        f"""<div style="background:{t['bg']};border-radius:16px;padding:3rem;text-align:center;">
-        <div style="color:{t['sub']};text-transform:uppercase;letter-spacing:.1em;margin-bottom:.8rem;font-family:{t['font']};">JOHN 3:16</div>
-        <div style="color:{t['fg']};font-size:1.6rem;font-weight:700;font-family:{t['font']};">For God so loved the world...</div>
+        f"""<div style="background:{preview_bg};border-radius:16px;padding:3rem;text-align:center;position:relative;overflow:hidden;">
+        <div style="position:absolute;inset:0;background:radial-gradient(circle, transparent 35%, rgba(0,0,0,0.45) 100%);"></div>
+        <div style="position:relative;color:{t['sub']};text-transform:uppercase;letter-spacing:.1em;margin-bottom:.8rem;font-family:{t['font']};{shadow}">JOHN 3:16</div>
+        <div style="position:relative;color:{t['fg']};font-size:1.6rem;font-weight:700;font-family:{t['font']};{shadow}">For God so loved the world...</div>
         </div>"""
     )
 
@@ -1760,3 +2027,5 @@ def render_login():
 
 if __name__ == "__main__":
     main()
+
+#git status ; git add . ; git commit -m "Your commit message" ; git push

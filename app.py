@@ -161,6 +161,49 @@ BIBLE_TRANSLATION_LABEL = "KJV (Public Domain)"
 BIBLE_BOOK_NUMBERS = {"Psalm": 19, "John": 43, "Romans": 45, "Philippians": 50}
 BIBLE_NUMBER_TO_BOOK = {v: k for k, v in BIBLE_BOOK_NUMBERS.items()}
 
+# Standard canonical book titles by language, keyed by the same 1-66 book
+# number used above. These are just conventional book titles (facts, not
+# copyrighted creative text — unlike the verse text itself), used so a
+# projector heading can show "التكوين" for an Arabic-language passage even
+# when the imported file only labeled that book in English (as ar_svd.json
+# does). Falls back to whatever name the source file used if a book number
+# isn't available or isn't in this table.
+LOCALIZED_BOOK_NAMES = {
+    1: {"en": "Genesis", "ar": "التكوين"}, 2: {"en": "Exodus", "ar": "الخروج"},
+    3: {"en": "Leviticus", "ar": "اللاويين"}, 4: {"en": "Numbers", "ar": "العدد"},
+    5: {"en": "Deuteronomy", "ar": "التثنية"}, 6: {"en": "Joshua", "ar": "يشوع"},
+    7: {"en": "Judges", "ar": "القضاة"}, 8: {"en": "Ruth", "ar": "راعوث"},
+    9: {"en": "1 Samuel", "ar": "صموئيل الأول"}, 10: {"en": "2 Samuel", "ar": "صموئيل الثاني"},
+    11: {"en": "1 Kings", "ar": "الملوك الأول"}, 12: {"en": "2 Kings", "ar": "الملوك الثاني"},
+    13: {"en": "1 Chronicles", "ar": "أخبار الأيام الأول"}, 14: {"en": "2 Chronicles", "ar": "أخبار الأيام الثاني"},
+    15: {"en": "Ezra", "ar": "عزرا"}, 16: {"en": "Nehemiah", "ar": "نحميا"},
+    17: {"en": "Esther", "ar": "أستير"}, 18: {"en": "Job", "ar": "أيوب"},
+    19: {"en": "Psalm", "ar": "المزامير"}, 20: {"en": "Proverbs", "ar": "الأمثال"},
+    21: {"en": "Ecclesiastes", "ar": "الجامعة"}, 22: {"en": "Song of Solomon", "ar": "نشيد الأنشاد"},
+    23: {"en": "Isaiah", "ar": "إشعياء"}, 24: {"en": "Jeremiah", "ar": "إرميا"},
+    25: {"en": "Lamentations", "ar": "مراثي إرميا"}, 26: {"en": "Ezekiel", "ar": "حزقيال"},
+    27: {"en": "Daniel", "ar": "دانيال"}, 28: {"en": "Hosea", "ar": "هوشع"},
+    29: {"en": "Joel", "ar": "يوئيل"}, 30: {"en": "Amos", "ar": "عاموس"},
+    31: {"en": "Obadiah", "ar": "عوبديا"}, 32: {"en": "Jonah", "ar": "يونان"},
+    33: {"en": "Micah", "ar": "ميخا"}, 34: {"en": "Nahum", "ar": "ناحوم"},
+    35: {"en": "Habakkuk", "ar": "حبقوق"}, 36: {"en": "Zephaniah", "ar": "صفنيا"},
+    37: {"en": "Haggai", "ar": "حجي"}, 38: {"en": "Zechariah", "ar": "زكريا"},
+    39: {"en": "Malachi", "ar": "ملاخي"}, 40: {"en": "Matthew", "ar": "متى"},
+    41: {"en": "Mark", "ar": "مرقس"}, 42: {"en": "Luke", "ar": "لوقا"},
+    43: {"en": "John", "ar": "يوحنا"}, 44: {"en": "Acts", "ar": "أعمال الرسل"},
+    45: {"en": "Romans", "ar": "رومية"}, 46: {"en": "1 Corinthians", "ar": "كورنثوس الأولى"},
+    47: {"en": "2 Corinthians", "ar": "كورنثوس الثانية"}, 48: {"en": "Galatians", "ar": "غلاطية"},
+    49: {"en": "Ephesians", "ar": "أفسس"}, 50: {"en": "Philippians", "ar": "فيلبي"},
+    51: {"en": "Colossians", "ar": "كولوسي"}, 52: {"en": "1 Thessalonians", "ar": "تسالونيكي الأولى"},
+    53: {"en": "2 Thessalonians", "ar": "تسالونيكي الثانية"}, 54: {"en": "1 Timothy", "ar": "تيموثاوس الأولى"},
+    55: {"en": "2 Timothy", "ar": "تيموثاوس الثانية"}, 56: {"en": "Titus", "ar": "تيطس"},
+    57: {"en": "Philemon", "ar": "فليمون"}, 58: {"en": "Hebrews", "ar": "العبرانيين"},
+    59: {"en": "James", "ar": "يعقوب"}, 60: {"en": "1 Peter", "ar": "بطرس الأولى"},
+    61: {"en": "2 Peter", "ar": "بطرس الثانية"}, 62: {"en": "1 John", "ar": "يوحنا الأولى"},
+    63: {"en": "2 John", "ar": "يوحنا الثانية"}, 64: {"en": "3 John", "ar": "يوحنا الثالثة"},
+    65: {"en": "Jude", "ar": "يهوذا"}, 66: {"en": "Revelation", "ar": "الرؤيا"},
+}
+
 # ---------------------------------------------------------------------------
 # DATABASE
 # ---------------------------------------------------------------------------
@@ -473,22 +516,57 @@ def make_song_item(song_row):
     }
 
 
-def make_bible_item(book, chapter, verse_nums, translation=None, secondary_translation=None):
+def localized_book_name(book, translation, sample_text=""):
+    """
+    Pick the right-language heading for a book, using the canonical book
+    number to cross-reference LOCALIZED_BOOK_NAMES — so the projector can
+    show "التكوين" for an Arabic passage even if the source file only ever
+    labeled that book "Genesis". Falls back to whatever name the source
+    file used if there's no book number or no entry for the detected
+    language.
+    """
+    book_number = get_book_number(book, translation)
+    lang = "ar" if _looks_arabic(sample_text) else "en"
+    names = LOCALIZED_BOOK_NAMES.get(book_number) if book_number else None
+    return (names.get(lang) or book) if names else book
+
+
+def make_bible_item(book, chapter, verse_nums, translation=None, secondary_translation=None, combine=False):
     """
     Build a Bible service item. If secondary_translation is given, each slide
     also carries the same verse's text in that translation (looked up by the
     shared canonical book number when available, so an Arabic and an English
     translation can still be lined up even though they name books
     differently) — this is what powers the bilingual split-screen display.
+
+    If combine=True, all the requested verses are merged into a single slide
+    (e.g. selecting verses 1,2,3 shows them together, referenced as
+    "Genesis 1:1-3") instead of one slide per verse.
     """
     verses = get_bible_verses(book, chapter, translation)
     book_number = get_book_number(book, translation) if translation else None
-    slides = []
-    for v in verse_nums:
-        slide = {"ref": f"{book} {chapter}:{v}", "text": verses.get(v, "")}
+    heading_book = localized_book_name(book, translation, next(iter(verses.values()), "")) if translation else book
+
+    if combine:
+        combined_text = "\n".join(f"{v} {verses.get(v, '')}".strip() for v in verse_nums)
+        ref = f"{heading_book} {chapter}:{verse_nums[0]}" if len(verse_nums) == 1 else \
+            f"{heading_book} {chapter}:{verse_nums[0]}-{verse_nums[-1]}"
+        slide = {"ref": ref, "text": combined_text}
         if secondary_translation:
-            slide["text2"] = get_verse_in_translation(book, chapter, v, secondary_translation, book_number)
-        slides.append(slide)
+            combined_text2 = "\n".join(
+                f"{v} {get_verse_in_translation(book, chapter, v, secondary_translation, book_number)}".strip()
+                for v in verse_nums
+            )
+            slide["text2"] = combined_text2
+        slides = [slide]
+    else:
+        slides = []
+        for v in verse_nums:
+            slide = {"ref": f"{heading_book} {chapter}:{v}", "text": verses.get(v, "")}
+            if secondary_translation:
+                slide["text2"] = get_verse_in_translation(book, chapter, v, secondary_translation, book_number)
+            slides.append(slide)
+
     label = f"{book} {chapter}:{verse_nums[0]}" if len(verse_nums) == 1 else \
         f"{book} {chapter}:{verse_nums[0]}-{verse_nums[-1]}"
     return {"type": "bible", "ref_id": None, "title": label, "slides": slides}
@@ -1462,6 +1540,16 @@ def page_bible():
         st.markdown("**Chapter**")
         chapter = st.selectbox("Chapter", chapters, key="bible_chapter", label_visibility="collapsed")
         verses = get_bible_verses(book, chapter, translation)
+
+        # If book/chapter/translation changed since the selection was made,
+        # old verse numbers might not exist in this new set at all — that
+        # mismatch is what caused the KeyError crash. Clear the stale
+        # selection instead of trying to carry it across.
+        nav_key = (book, chapter, translation)
+        if st.session_state.get("bible_nav_key") != nav_key:
+            st.session_state.bible_nav_key = nav_key
+            st.session_state.bible_selected_verses = []
+
         st.markdown("**Verses**")
         chosen = st.session_state.setdefault("bible_selected_verses", [])
         for vnum, text in verses.items():
@@ -1487,23 +1575,32 @@ def page_bible():
 
     with right:
         st.markdown("**Selected**")
-        chosen_sorted = sorted(st.session_state.get("bible_selected_verses", []))
+        # Only keep verse numbers that actually exist in the currently
+        # displayed chapter — belt-and-suspenders alongside the nav_key
+        # reset above, in case selection state gets out of sync some other way.
+        chosen_sorted = sorted(v for v in st.session_state.get("bible_selected_verses", []) if v in verses)
         book_number = get_book_number(book, translation) if secondary_translation else None
         if chosen_sorted:
             for v in chosen_sorted:
                 st.markdown(f"**{book} {chapter}:{v}**")
-                st.caption(verses[v])
+                st.caption(verses.get(v, ""))
                 if secondary_translation:
                     st.caption("↳ " + get_verse_in_translation(book, chapter, v, secondary_translation, book_number))
         else:
             st.caption("Select verses on the left.")
+
+        combine = st.checkbox(
+            "Combine into one slide", value=True, key="bible_combine",
+            help="Selected verses show together on a single slide, referenced as e.g. \"Genesis 1:1-3\", "
+                 "instead of one slide per verse."
+        )
 
         st.write("")
         scol1, scol2 = st.columns(2)
         with scol1:
             if st.button("▶ Present Now", disabled=not chosen_sorted, use_container_width=True,
                          help="Show these verses on the projector immediately — no service needed."):
-                item = make_bible_item(book, chapter, chosen_sorted, translation, secondary_translation)
+                item = make_bible_item(book, chapter, chosen_sorted, translation, secondary_translation, combine=combine)
                 present_adhoc_now(item_slides(item))
                 label = f"{book} {chapter}:{chosen_sorted[0]}" + (f"-{chosen_sorted[-1]}" if len(chosen_sorted) > 1 else "")
                 st.session_state.bible_selected_verses = []
@@ -1512,7 +1609,7 @@ def page_bible():
         with scol2:
             if st.button("+ Add to Service", disabled=not chosen_sorted, use_container_width=True):
                 st.session_state.setdefault("bible_staging", [])
-                st.session_state.bible_staging.append((book, chapter, tuple(chosen_sorted), translation, secondary_translation))
+                st.session_state.bible_staging.append((book, chapter, tuple(chosen_sorted), translation, secondary_translation, combine))
                 st.session_state.bible_selected_verses = []
                 st.success("Added to staging — attach it in Service Builder.")
                 st.rerun()
@@ -1520,8 +1617,8 @@ def page_bible():
         staging = st.session_state.get("bible_staging", [])
         if staging:
             st.markdown("**Staged passages**")
-            for i, (b, c, vs, tr, tr2) in enumerate(staging):
-                label = f"{b} {c}:{vs[0]}" + (f"-{vs[-1]}" if len(vs) > 1 else "") + f" ({tr}" + (f" + {tr2})" if tr2 else ")")
+            for i, (b, c, vs, tr, tr2, cmb) in enumerate(staging):
+                label = f"{b} {c}:{vs[0]}" + (f"-{vs[-1]}" if len(vs) > 1 else "") + f" ({tr}" + (f" + {tr2})" if tr2 else ")") + (" [combined]" if cmb else "")
                 st.caption(label)
             if st.button("Go to Service Builder →"):
                 st.session_state.page = "Service Builder"; st.rerun()
@@ -1605,8 +1702,8 @@ def page_service_builder():
     with a2:
         staging = st.session_state.get("bible_staging", [])
         if st.button(f"📖 Add Staged Bible ({len(staging)})", disabled=not staging, use_container_width=True):
-            for (b, c, vs, tr, tr2) in staging:
-                items.append(make_bible_item(b, c, list(vs), tr, tr2))
+            for (b, c, vs, tr, tr2, cmb) in staging:
+                items.append(make_bible_item(b, c, list(vs), tr, tr2, combine=cmb))
             st.session_state.bible_staging = []
             update_service_items(sid, items); st.rerun()
     with a3.popover("📣 Add Announcement"):
@@ -1939,6 +2036,12 @@ def page_display_settings():
             )
             if st.button(name, key=f"bg_pick_{name}", use_container_width=True):
                 set_settings(default_background=name)
+                # Also push it to the live presentation_state, not just the
+                # default for future services — otherwise this only takes
+                # effect the next time you hit "Start Service", and the
+                # projector you're currently looking at doesn't change,
+                # which is the bug you were hitting.
+                set_state(background=name)
                 st.rerun()
 
     st.write("")

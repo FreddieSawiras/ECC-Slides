@@ -1005,14 +1005,7 @@ def _looks_arabic(text):
 # ---------------------------------------------------------------------------
 
 def render_projector():
-    # Auto-refreshing fragment: only this function's output re-renders on
-    # each tick (not the whole script), and there's no full-page reload —
-    # that's what removes most of the lag you were seeing between clicking
-    # NEXT and the projector updating. Requires Streamlit >= 1.33 for
-    # st.fragment(run_every=...); if you're on an older version, upgrade
-    # with `pip install -U streamlit`.
-    @st.fragment(run_every=0.35)
-    def _tick():
+    def _render_body():
         state = get_state()
         projector_css(state["theme"] or "Modern Worship", state.get("background"))
 
@@ -1061,7 +1054,17 @@ def render_projector():
                 </div>"""
             )
 
-    _tick()
+    # Auto-refreshing fragment (only this output re-renders per tick, no
+    # full-page reload) needs Streamlit >= 1.33. Older installs don't have
+    # st.fragment at all — calling it would throw and blank the whole page,
+    # which is worse than the small extra lag, so detect it and fall back
+    # to the previous sleep-and-rerun loop instead of hard-requiring it.
+    if hasattr(st, "fragment"):
+        st.fragment(run_every=0.35)(_render_body)()
+    else:
+        _render_body()
+        time.sleep(1)
+        st.rerun()
 
     # Press "F" anywhere on this page to toggle real browser fullscreen.
     # (The old docstring told people to "press F" but nothing was ever

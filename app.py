@@ -941,7 +941,7 @@ def projector_css(theme_name, background_key=None):
     #MainMenu, footer, header {{visibility: hidden;}}
     section[data-testid="stSidebar"] {{display:none;}}
     .block-container {{ padding: 0 !important; max-width: 100% !important; }}
-    .stApp {{ background: {app_bg}; {bg_size_rule} {bg_anim_rule} cursor: none; position: relative; }}
+    .stApp {{ background: {app_bg}; {bg_size_rule} {bg_anim_rule} cursor: none; }}
     @keyframes eccDrift {{
         0% {{ background-position: 0% 50%; }}
         50% {{ background-position: 100% 50%; }}
@@ -951,15 +951,6 @@ def projector_css(theme_name, background_key=None):
         0% {{ filter: brightness(0.85); }}
         100% {{ filter: brightness(1.15); }}
     }}
-    /* Subtle vignette over any background image so slide text stays readable
-       regardless of which preset is chosen — sits above the background,
-       below the text, and never intercepts clicks/taps. */
-    .stApp::before {{
-        content: {"''" if bg_def else "none"};
-        position: fixed; inset: 0; pointer-events: none; z-index: 0;
-        background: radial-gradient(circle, transparent 35%, rgba(0,0,0,0.45) 100%);
-    }}
-    .proj-wrap, .proj-split {{ position: relative; z-index: 1; }}
     .proj-wrap {{
         height: 100vh; width: 100vw; display:flex; flex-direction:column;
         align-items:center; justify-content:center; text-align:center; padding: 4vw;

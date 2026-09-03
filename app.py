@@ -33,6 +33,8 @@ import time
 import datetime
 import csv
 import io
+import re
+import requests
 
 # ---------------------------------------------------------------------------
 # CONFIG / CONSTANTS
@@ -40,7 +42,128 @@ import io
 
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ecc_worship.db")
 
+# ---------------------------------------------------------------------------
+# TURSO (optional cloud backup) — SQLite stays the only thing anything reads
+# from during normal use; Turso is write-only and only touched on an
+# explicit click (Save Song / Sync to Turso), never on page load or in any
+# polling loop, so it can never slow down browsing/presenting.
+#
+# Set these in .streamlit/secrets.toml (or your host's "Secrets" settings):
+#   TURSO_DATABASE_URL = "libsql://your-db-org.turso.io"
+#   TURSO_AUTH_TOKEN   = "..."
+# Get both with the Turso CLI: `turso db show <name> --url` and
+# `turso db tokens create <name>`.
+# ---------------------------------------------------------------------------
+
+def _turso_config():
+    try:
+        url = st.secrets.get("TURSO_DATABASE_URL") or os.environ.get("TURSO_DATABASE_URL")
+        token = st.secrets.get("TURSO_AUTH_TOKEN") or os.environ.get("TURSO_AUTH_TOKEN")
+    except Exception:
+        url = os.environ.get("TURSO_DATABASE_URL")
+        token = os.environ.get("TURSO_AUTH_TOKEN")
+    return url, token
+
+
+def turso_configured():
+    url, token = _turso_config()
+    return bool(url and token)
+
+
+def _turso_arg(value):
+    if value is None:
+        return {"type": "null", "value": None}
+    if isinstance(value, bool):
+        return {"type": "integer", "value": str(int(value))}
+    if isinstance(value, int):
+        return {"type": "integer", "value": str(value)}
+    if isinstance(value, float):
+        return {"type": "float", "value": value}
+    return {"type": "text", "value": str(value)}
+
+
+def turso_pipeline(statements, timeout=10):
+    """
+    statements: list of (sql, args) tuples. Sends them all as ONE HTTP
+    request to Turso's /v2/pipeline endpoint (a single round trip no matter
+    how many statements), then closes the connection. Returns the parsed
+    JSON response, or raises if not configured / the request fails —
+    callers should wrap this in try/except so a Turso hiccup never breaks
+    the local save that already succeeded.
+    """
+    url, token = _turso_config()
+    if not url or not token:
+        raise RuntimeError("Turso isn't configured — add TURSO_DATABASE_URL and TURSO_AUTH_TOKEN to secrets.")
+    http_url = url.replace("libsql://", "https://").replace("turso://", "https://").rstrip("/") + "/v2/pipeline"
+    requests_payload = []
+    for sql, args in statements:
+        stmt = {"sql": sql}
+        if args:
+            stmt["args"] = [_turso_arg(a) for a in args]
+        requests_payload.append({"type": "execute", "stmt": stmt})
+    requests_payload.append({"type": "close"})
+    resp = requests.post(http_url, json={"requests": requests_payload},
+                          headers={"Authorization": f"Bearer {token}"}, timeout=timeout)
+    resp.raise_for_status()
+    return resp.json()
+
+
+TURSO_SONGS_SCHEMA = """CREATE TABLE IF NOT EXISTS songs(
+    id INTEGER PRIMARY KEY, title TEXT, artist TEXT, category TEXT,
+    tags TEXT, slides TEXT, updated_at TEXT
+)"""
+
+
+def turso_push_song(song_id, title, artist, category, tags, slides_json):
+    """One explicit push for one song — this is the only network call that
+    happens when you click Save on a song. Uses the local row's own id, so
+    editing/re-saving the same song later overwrites its Turso copy rather
+    than duplicating it."""
+    turso_pipeline([
+        (TURSO_SONGS_SCHEMA, None),
+        ("INSERT OR REPLACE INTO songs(id, title, artist, category, tags, slides, updated_at) "
+         "VALUES (?,?,?,?,?,?,?)", (song_id, title, artist, category, tags, slides_json, now())),
+    ])
+
+
+def turso_push_all_songs():
+    """Explicit bulk push (Church Settings → 'Sync all songs to Turso' button
+    only) — batches every song into ONE HTTP request via the pipeline's
+    multi-statement support, so syncing 100 songs is still a single round
+    trip rather than one request per song."""
+    songs = get_songs()
+    statements = [(TURSO_SONGS_SCHEMA, None)]
+    for r in songs:
+        statements.append((
+            "INSERT OR REPLACE INTO songs(id, title, artist, category, tags, slides, updated_at) "
+            "VALUES (?,?,?,?,?,?,?)",
+            (r["id"], r["title"], r["artist"], r["category"], r["tags"], r["slides"], now())
+        ))
+    turso_pipeline(statements, timeout=30)
+    return len(songs)
+
+
+def turso_pull_all_songs():
+    """Read-only pull, used ONLY once at cold-start and only when the local
+    songs table is completely empty (see init_db) — restores your library
+    after a host wipes the local filesystem on redeploy/sleep. Never called
+    during normal use, so it can't slow anything down."""
+    result = turso_pipeline([(TURSO_SONGS_SCHEMA, None), ("SELECT id, title, artist, category, tags, slides FROM songs", None)])
+    rows = result["results"][1]["response"]["result"]["rows"]
+    songs = []
+    for row in rows:
+        vals = [cell.get("value") for cell in row]
+        songs.append(dict(zip(["id", "title", "artist", "category", "tags", "slides"], vals)))
+    return songs
+
+
 ACCENT = "#C8A24A"          # warm gold — ECC accent
+
+# Basic shared login. This is a single shared password (not per-user
+# accounts), so treat it as a light front-door lock rather than real
+# security — anyone with the app's URL and this password gets full access.
+LOGIN_USERNAME = "ECC"
+LOGIN_PASSWORD = "5015"
 BG = "#0B0C0F"               # near-black
 CARD = "#15171C"             # charcoal card
 CARD_BORDER = "#24262C"
@@ -242,7 +365,7 @@ def init_db():
     c.execute("""CREATE TABLE IF NOT EXISTS presentation_state(
         id INTEGER PRIMARY KEY CHECK (id=1),
         service_id INTEGER, item_index INTEGER, slide_index INTEGER,
-        black INTEGER, cleared INTEGER, live INTEGER, theme TEXT, background TEXT, updated_at TEXT,
+        black INTEGER, cleared INTEGER, live INTEGER, theme TEXT, background TEXT, font_scale REAL, updated_at TEXT,
         adhoc_active INTEGER, adhoc_slides TEXT, adhoc_index INTEGER
     )""")
     c.execute("""CREATE TABLE IF NOT EXISTS bible_verses(
@@ -261,7 +384,7 @@ def init_db():
     # projector without adding it to a service first). Older databases won't
     # have these columns yet, so add them if missing.
     for col, coltype in [("adhoc_active", "INTEGER"), ("adhoc_slides", "TEXT"), ("adhoc_index", "INTEGER"),
-                         ("background", "TEXT")]:
+                         ("background", "TEXT"), ("font_scale", "REAL")]:
         try:
             c.execute(f"ALTER TABLE presentation_state ADD COLUMN {col} {coltype}")
             conn.commit()
@@ -277,12 +400,32 @@ def init_db():
         c.execute("INSERT INTO settings(id, church_name, default_theme, default_background) "
                   "VALUES (1, 'ECC', 'Modern Worship', 'None (theme color)')")
     if c.execute("SELECT COUNT(*) FROM presentation_state").fetchone()[0] == 0:
-        c.execute("""INSERT INTO presentation_state(id, service_id, item_index, slide_index, black, cleared, live, theme, background, updated_at, adhoc_active, adhoc_slides, adhoc_index)
-                     VALUES (1, NULL, 0, 0, 0, 1, 1, 'Modern Worship', 'None (theme color)', ?, 0, NULL, 0)""", (now(),))
+        c.execute("""INSERT INTO presentation_state(id, service_id, item_index, slide_index, black, cleared, live, theme, background, font_scale, updated_at, adhoc_active, adhoc_slides, adhoc_index)
+                     VALUES (1, NULL, 0, 0, 0, 1, 1, 'Modern Worship', 'None (theme color)', 1.0, ?, 0, NULL, 0)""", (now(),))
     conn.commit()
 
     if c.execute("SELECT COUNT(*) FROM songs").fetchone()[0] == 0:
-        seed_songs(conn)
+        # One-time, one-request check — only fires when the local songs
+        # table is genuinely empty (e.g. a host wiped the filesystem on
+        # redeploy). Restores from Turso if you've synced there before;
+        # otherwise falls back to the small built-in seed set. Either way
+        # this is a single network call at cold-start, not a recurring one.
+        restored = 0
+        if turso_configured():
+            try:
+                remote_songs = turso_pull_all_songs()
+                for r in remote_songs:
+                    c.execute(
+                        "INSERT INTO songs(id, title, artist, category, tags, slides, favorite, last_used) "
+                        "VALUES (?,?,?,?,?,?,0,?)",
+                        (r["id"], r["title"], r["artist"], r["category"], r["tags"], r["slides"], now())
+                    )
+                conn.commit()
+                restored = len(remote_songs)
+            except Exception:
+                restored = 0  # Turso unreachable/misconfigured — fall through to local seed below
+        if restored == 0:
+            seed_songs(conn)
     if c.execute("SELECT COUNT(*) FROM templates").fetchone()[0] == 0:
         c.execute("INSERT INTO templates(name, structure) VALUES (?, ?)", (
             "Sunday Worship",
@@ -358,12 +501,14 @@ def get_song(song_id):
 def add_song(title, artist, category, tags, lyrics):
     slides = [s.strip() for s in lyrics.split("\n\n") if s.strip()] or ["(empty)"]
     conn = get_conn()
-    conn.execute(
+    cur = conn.execute(
         "INSERT INTO songs(title, artist, category, tags, slides, favorite, last_used) VALUES (?,?,?,?,?,0,?)",
         (title, artist, category, tags, json.dumps(slides), now())
     )
+    song_id = cur.lastrowid
     conn.commit()
     conn.close()
+    return song_id, slides
 
 
 def update_song_slides(song_id, slides):
@@ -675,6 +820,37 @@ def get_verse_in_translation(book, chapter, verse, translation, book_number=None
     ).fetchone()
     conn.close()
     return r["text"] if r else ""
+
+
+def parse_bible_reference(text, translation):
+    """
+    Parses a typed reference like "John 3:16", "Genesis 1:1-3", or "1 John 2"
+    into (book, chapter, verse_numbers) for the quick-jump search box. Book
+    matching is case/spacing-insensitive and tries an exact match first,
+    then a prefix match, against whatever books actually exist for this
+    translation. Returns None if it can't confidently parse/match.
+    """
+    m = re.match(r"^\s*(\d?\s*[A-Za-z][A-Za-z .]*?)\s+(\d+)\s*(?::\s*(\d+)(?:\s*-\s*(\d+))?)?\s*$", text.strip())
+    if not m:
+        return None
+    book_query, chapter_str, v1, v2 = m.groups()
+    chapter = int(chapter_str)
+    norm = lambda s: re.sub(r"\s+", "", s).lower()
+    query_norm = norm(book_query)
+    books = get_bible_books(translation)
+    match = next((b for b in books if norm(b) == query_norm), None)
+    if not match:
+        match = next((b for b in books if norm(b).startswith(query_norm) or query_norm.startswith(norm(b))), None)
+    if not match:
+        return None
+    if chapter not in get_bible_chapters(match, translation):
+        return None
+    verse_nums = []
+    if v1:
+        start = int(v1)
+        end = int(v2) if v2 else start
+        verse_nums = [v for v in get_bible_verses(match, chapter, translation).keys() if start <= v <= end]
+    return match, chapter, verse_nums
 
 
 def _first_key(d, candidates):
@@ -1008,12 +1184,13 @@ def inject_css():
     """)
 
 
-def projector_css(theme_name, background_key=None):
+def projector_css(theme_name, background_key=None, font_scale=1.0):
     t = THEMES.get(theme_name, THEMES["Modern Worship"])
     bg_def = BACKGROUNDS.get(background_key) if background_key else None
     app_bg = bg_def["css"] if bg_def else t["bg"]
     bg_size_rule = f"background-size: {bg_def['size']};" if bg_def else ""
     bg_anim_rule = f"animation: {bg_def['anim']};" if bg_def and bg_def.get("anim") else ""
+    font_scale = font_scale or 1.0
     render_html(f"""
     <style>
     #MainMenu, footer, header {{visibility: hidden;}}
@@ -1029,9 +1206,14 @@ def projector_css(theme_name, background_key=None):
         0% {{ filter: brightness(0.85); }}
         100% {{ filter: brightness(1.15); }}
     }}
+    @keyframes eccFadeIn {{
+        0% {{ opacity: 0; }}
+        100% {{ opacity: 1; }}
+    }}
     .proj-wrap {{
         height: 100vh; width: 100vw; display:flex; flex-direction:column;
         align-items:center; justify-content:center; text-align:center; padding: 4vw;
+        animation: eccFadeIn 0.45s ease;
     }}
     .proj-ref {{
         font-family: {t['font']}; color: {t['sub']}; letter-spacing:0.15em;
@@ -1039,12 +1221,13 @@ def projector_css(theme_name, background_key=None):
         margin-bottom: 2vh; font-weight:600;
     }}
     .proj-text {{
-        font-family: {t['font']}; color: {t['fg']}; font-size: clamp(2.2rem, 5.4vw, 5.5rem);
+        font-family: {t['font']}; color: {t['fg']}; font-size: calc(clamp(2.2rem, 5.4vw, 5.5rem) * {font_scale});
         line-height: 1.35; font-weight: 700; white-space: pre-line;
         text-shadow: {"0 2px 18px rgba(0,0,0,0.55)" if bg_def else "none"};
     }}
     .proj-split {{
         height: 100vh; width: 100vw; display:flex; flex-direction:column;
+        animation: eccFadeIn 0.45s ease;
     }}
     .proj-half {{
         flex: 1; display:flex; flex-direction:column; align-items:center;
@@ -1052,7 +1235,7 @@ def projector_css(theme_name, background_key=None):
     }}
     .proj-half-top {{ border-bottom: 1px solid {t['sub']}44; }}
     .proj-text-secondary {{
-        font-family: {t['font']}; color: {t['fg']}; font-size: clamp(1.6rem, 4vw, 3.6rem);
+        font-family: {t['font']}; color: {t['fg']}; font-size: calc(clamp(1.6rem, 4vw, 3.6rem) * {font_scale});
         line-height: 1.35; font-weight: 700; white-space: pre-line;
         text-shadow: {"0 2px 18px rgba(0,0,0,0.55)" if bg_def else "none"};
     }}
@@ -1076,7 +1259,7 @@ def _looks_arabic(text):
 def render_projector():
     def _render_body():
         state = get_state()
-        projector_css(state["theme"] or "Modern Worship", state.get("background"))
+        projector_css(state["theme"] or "Modern Worship", state.get("background"), state.get("font_scale") or 1.0)
 
         text, ref, text2 = "", None, None
         if state["cleared"] or not state["live"]:
@@ -1160,6 +1343,134 @@ def render_projector():
         """,
         height=0,
     )
+
+
+def _stage_slide_info(state):
+    """Shared by Stage Display and the phone Remote: figures out the current
+    slide and a one-line preview of what's coming next, from whichever mode
+    is active (ad-hoc Bible verse vs. a saved service)."""
+    cur_ref, cur_text, cur_text2 = None, "", None
+    nxt_label = "—"
+    if state.get("adhoc_active"):
+        slides = json.loads(state["adhoc_slides"]) if state.get("adhoc_slides") else []
+        si = state.get("adhoc_index") or 0
+        if 0 <= si < len(slides):
+            cur_ref, cur_text, cur_text2 = slides[si]
+        if si + 1 < len(slides):
+            nxt_label = slides[si + 1][0] or slides[si + 1][1][:40]
+    elif state.get("service_id"):
+        service = get_service(state["service_id"])
+        if service:
+            items = json.loads(service["items"])
+            idx = state["item_index"]
+            if 0 <= idx < len(items):
+                slides = item_slides(items[idx])
+                si = state["slide_index"]
+                if 0 <= si < len(slides):
+                    cur_ref, cur_text, cur_text2 = slides[si]
+                if si + 1 < len(slides):
+                    nxt_label = slides[si + 1][0] or slides[si + 1][1][:40]
+                elif idx + 1 < len(items):
+                    nslides = item_slides(items[idx + 1])
+                    nxt_label = f"(Next) {items[idx + 1]['title']}" + (f" — {nslides[0][0] or nslides[0][1][:30]}" if nslides else "")
+    hidden = bool(state.get("black") or state.get("cleared") or not state.get("live"))
+    return cur_ref, cur_text, cur_text2, nxt_label, hidden
+
+
+def render_stage_display():
+    """A separate backstage-only view (open ?display=stage on a second
+    laptop/tablet) showing the current slide, what's coming up next, and a
+    clock — so whoever's operating always knows what's about to happen
+    without needing to peek at the projector or guess."""
+    def _tick():
+        state = get_state()
+        cur_ref, cur_text, cur_text2, nxt_label, hidden = _stage_slide_info(state)
+        clock = datetime.datetime.now().strftime("%I:%M %p").lstrip("0")
+        render_html(f"""
+        <style>
+        #MainMenu, footer, header {{visibility: hidden;}}
+        section[data-testid="stSidebar"] {{display:none;}}
+        .block-container {{ padding: 1.5vw 2vw !important; max-width: 100% !important; }}
+        .stApp {{ background: #0B0C0F; }}
+        .stage-clock {{ color: #C8A24A; font-family:'Inter',sans-serif; font-size: clamp(1.2rem,2.4vw,2.2rem);
+                        font-weight:700; text-align:right; margin-bottom: 1.5vh; }}
+        .stage-label {{ color:#8A8D93; font-family:'Inter',sans-serif; letter-spacing:.15em; text-transform:uppercase;
+                        font-size: clamp(0.75rem,1.2vw,1rem); margin-bottom: 0.6vh; }}
+        .stage-current {{ color:#FFFFFF; font-family:'Inter',sans-serif; font-weight:700;
+                          font-size: clamp(1.6rem,4vw,3.4rem); line-height:1.35; white-space:pre-line;
+                          padding-bottom: 3vh; border-bottom: 1px solid #24262C; margin-bottom: 3vh; }}
+        .stage-next {{ color:#C9CBD1; font-family:'Inter',sans-serif; font-size: clamp(1rem,2vw,1.6rem);
+                      line-height:1.4; }}
+        </style>
+        <div class="stage-clock">{clock}</div>
+        <div class="stage-label">Now</div>
+        <div class="stage-current">{"(hidden from projector)" if hidden else (cur_text or "Nothing live")}</div>
+        <div class="stage-label">Up Next</div>
+        <div class="stage-next">{nxt_label}</div>
+        """)
+
+    if hasattr(st, "fragment"):
+        st.fragment(run_every=0.5)(_tick)()
+    else:
+        _tick()
+        time.sleep(1)
+        st.rerun()
+
+
+def render_remote():
+    """A stripped-down mobile control view (open ?display=remote on a
+    phone) — big Prev/Next/Black buttons so any volunteer can advance
+    slides without needing the full operator screen."""
+    state = get_state()
+    cur_ref, cur_text, cur_text2, nxt_label, hidden = _stage_slide_info(state)
+
+    render_html("""
+    <style>
+    #MainMenu, footer, header {visibility: hidden;}
+    section[data-testid="stSidebar"] {display:none;}
+    .block-container { padding: 3vw 4vw !important; max-width: 100% !important; }
+    div[data-testid="stButton"] button { font-size: 1.3rem !important; padding: 1.2rem !important; font-weight:700 !important; }
+    </style>
+    """)
+    st.markdown(f"**Now:** {'(hidden)' if hidden else (cur_text[:80] or 'Nothing live')}")
+    st.caption(f"Up next: {nxt_label}")
+    st.write("")
+
+    adhoc = bool(state.get("adhoc_active"))
+    if adhoc:
+        slides = json.loads(state["adhoc_slides"]) if state.get("adhoc_slides") else []
+        si = state.get("adhoc_index") or 0
+    else:
+        service = get_service(state["service_id"]) if state.get("service_id") else None
+        items = json.loads(service["items"]) if service else []
+        idx = state.get("item_index") or 0
+        slides = item_slides(items[idx]) if 0 <= idx < len(items) else []
+        si = state.get("slide_index") or 0
+
+    c1, c2 = st.columns(2)
+    if c1.button("◀ PREV", use_container_width=True, key="remote_prev") and si > 0:
+        if adhoc:
+            set_state(adhoc_index=si - 1, cleared=0)
+        else:
+            set_state(slide_index=si - 1, cleared=0)
+        st.rerun()
+    if c2.button("NEXT ▶", use_container_width=True, key="remote_next"):
+        if si < len(slides) - 1:
+            if adhoc:
+                set_state(adhoc_index=si + 1, cleared=0)
+            else:
+                set_state(slide_index=si + 1, cleared=0)
+            st.rerun()
+        elif not adhoc and idx + 1 < len(items):
+            set_state(item_index=idx + 1, slide_index=0, cleared=0)
+            st.rerun()
+    st.write("")
+    if st.button("⬛ BLACK SCREEN", use_container_width=True, key="remote_black"):
+        set_state(black=0 if state.get("black") else 1)
+        st.rerun()
+    if st.button("Clear Screen", use_container_width=True, key="remote_clear"):
+        set_state(cleared=1)
+        st.rerun()
 
 
 # ---------------------------------------------------------------------------
@@ -1301,6 +1612,29 @@ def sidebar():
             "reflects the real address you're using — no need to type 'localhost'."
         )
 
+        st.write("")
+        st.caption("Stage Display / Remote (open on another device)")
+        components.html(
+            """
+            <div style="font-family:'Inter',sans-serif;font-size:0.82rem;display:flex;flex-direction:column;gap:0.4rem;">
+              <a id="ecc-stage-link" href="#" target="_blank" rel="noopener"
+                 style="color:#C8A24A;text-decoration:underline;">🖥 Stage Display (current + next slide, clock)</a>
+              <a id="ecc-remote-link" href="#" target="_blank" rel="noopener"
+                 style="color:#C8A24A;text-decoration:underline;">📱 Phone Remote (Next/Prev/Black)</a>
+            </div>
+            <script>
+              try {
+                const base = window.parent.location.origin + window.parent.location.pathname;
+                const stageEl = document.getElementById("ecc-stage-link");
+                const remoteEl = document.getElementById("ecc-remote-link");
+                stageEl.href = base + "?display=stage";
+                remoteEl.href = base + "?display=remote";
+              } catch (e) {}
+            </script>
+            """,
+            height=55,
+        )
+
 
 # ---------------------------------------------------------------------------
 # PAGES
@@ -1388,9 +1722,21 @@ def page_songs():
         lyrics = st.text_area("Lyrics (blank line = new slide)", height=150)
         if st.button("Save Song"):
             if t.strip():
-                add_song(t, a, cat_new, tags, lyrics)
-                st.session_state.show_add_song = False
-                st.success(f"Added '{t}'")
+                song_id, _ = add_song(t, a, cat_new, tags, lyrics)
+                if turso_configured():
+                    try:
+                        turso_push_song(song_id, t, a, cat_new, tags, json.dumps(
+                            [s.strip() for s in lyrics.split("\n\n") if s.strip()] or ["(empty)"]))
+                        st.session_state.show_add_song = False
+                        st.success(f"Added '{t}' and saved it to Turso — it'll survive an app restart.")
+                    except Exception as e:
+                        st.session_state.show_add_song = False
+                        st.warning(f"Saved '{t}' locally, but the Turso sync failed ({e}). "
+                                   f"It's safe on this machine but won't survive a host reset until synced.")
+                else:
+                    st.session_state.show_add_song = False
+                    st.success(f"Added '{t}' (Turso isn't configured yet, so this is local-only — "
+                               f"see Church Settings to set it up).")
                 st.rerun()
             else:
                 st.warning("Give the song a title first.")
@@ -1524,6 +1870,23 @@ def page_bible():
         secondary_translation = st.selectbox("Second translation (shown on the bottom half)", other_options, key="bible_secondary_translation")
     st.caption(f"Browsing {translation}" + (f" · paired with {secondary_translation}" if secondary_translation else "") +
                ". Import more (public-domain or licensed) in Church Settings.")
+
+    with st.form("bible_jump_form"):
+        jc1, jc2 = st.columns([4, 1])
+        jump_text = jc1.text_input("Quick jump", placeholder='e.g. "John 3:16" or "Genesis 1:1-3"',
+                                    label_visibility="collapsed")
+        jump_go = jc2.form_submit_button("Go →", use_container_width=True)
+    if jump_go and jump_text.strip():
+        parsed = parse_bible_reference(jump_text, translation)
+        if parsed:
+            jb, jc, jverses = parsed
+            st.session_state.bible_book = jb
+            st.session_state.bible_chapter = jc
+            st.session_state.bible_nav_key = (jb, jc, translation)
+            st.session_state.bible_selected_verses = jverses
+            st.rerun()
+        else:
+            st.warning(f"Couldn't find \"{jump_text}\" — try a format like \"Book Chapter:Verse\".")
 
     books = get_bible_books(translation)
     if not books:
@@ -1881,6 +2244,52 @@ def page_presentation():
         st.selectbox("Theme", list(THEMES.keys()), index=list(THEMES.keys()).index(theme), key="live_theme",
                      on_change=lambda: set_state(theme=st.session_state.live_theme))
 
+        st.write("")
+        st.markdown("**Font Size**")
+        cur_scale = state.get("font_scale") or 1.0
+        fm, fp, fpct = st.columns([1, 1, 1.4])
+        if fm.button("➖", use_container_width=True, key="font_minus", help="Smaller text on the projector"):
+            set_state(font_scale=round(max(0.5, cur_scale - 0.1), 2))
+            st.rerun()
+        if fp.button("➕", use_container_width=True, key="font_plus", help="Bigger text on the projector"):
+            set_state(font_scale=round(min(2.0, cur_scale + 0.1), 2))
+            st.rerun()
+        fpct.markdown(f"<div style='text-align:center;padding-top:0.4rem;'>{int(cur_scale*100)}%</div>", unsafe_allow_html=True)
+
+    st.caption("⌨️ Shortcuts: → or Space = Next · ← = Prev · B = Black screen")
+    components.html(
+        """
+        <script>
+        (function() {
+            const doc = window.parent.document;
+            if (doc._eccOperatorKeysBound) return;
+            doc._eccOperatorKeysBound = true;
+            function eccClickButtonByText(label) {
+                const buttons = doc.querySelectorAll('button');
+                for (const b of buttons) {
+                    if (b.innerText.trim() === label) { b.click(); return true; }
+                }
+                return false;
+            }
+            doc.addEventListener('keydown', function(e) {
+                const tag = (doc.activeElement && doc.activeElement.tagName) || '';
+                if (tag === 'INPUT' || tag === 'TEXTAREA') return;  // don't hijack typing
+                if (e.key === 'ArrowRight' || e.key === ' ') {
+                    e.preventDefault();
+                    eccClickButtonByText('NEXT ▶');
+                } else if (e.key === 'ArrowLeft') {
+                    e.preventDefault();
+                    eccClickButtonByText('◀ PREV');
+                } else if (e.key.toLowerCase() === 'b' && !e.ctrlKey && !e.metaKey) {
+                    eccClickButtonByText('⬛ Black Screen');
+                }
+            });
+        })();
+        </script>
+        """,
+        height=0,
+    )
+
 
 def page_song_library():
     st.markdown("### Song Library")
@@ -1985,6 +2394,29 @@ def page_church_settings():
                 st.error(f"Couldn't restore that file: {e}")
 
     st.write("")
+    st.markdown("#### Turso Cloud Sync")
+    if not turso_configured():
+        st.caption(
+            "Not set up yet. Add `TURSO_DATABASE_URL` and `TURSO_AUTH_TOKEN` to your "
+            "`.streamlit/secrets.toml` (or your host's Secrets settings) to enable this — "
+            "get both from the Turso CLI: `turso db show <name> --url` and "
+            "`turso db tokens create <name>`."
+        )
+    else:
+        st.caption(
+            "Connected. Saving a song (the Save Song button above) automatically pushes just that "
+            "one song to Turso — nothing else runs in the background, and nothing is checked on "
+            "every page load. Use the button below only if you've bulk-imported songs and want to "
+            "push everything at once."
+        )
+        if st.button("☁️ Sync all songs to Turso", use_container_width=True):
+            try:
+                n = turso_push_all_songs()
+                st.success(f"Synced {n} songs to Turso in one request.")
+            except Exception as e:
+                st.error(f"Sync failed: {e}")
+
+    st.write("")
     st.markdown("#### Import Songs (bulk)")
     st.caption(
         "Upload a JSON or CSV file of songs you/your church have the rights to use.\n\n"
@@ -2071,6 +2503,12 @@ def main():
     if qp.get("display") == "projector":
         render_projector()
         return
+    if qp.get("display") == "stage":
+        render_stage_display()
+        return
+    if qp.get("display") == "remote":
+        render_remote()
+        return
 
     inject_css()
 
@@ -2112,14 +2550,17 @@ def render_login():
     )
     c1, c2, c3 = st.columns([1, 1, 1])
     with c2:
-        st.text_input("Email", key="login_email")
+        st.text_input("Username", key="login_username")
         st.text_input("Password", type="password", key="login_password")
         st.markdown('<div class="ecc-primary">', unsafe_allow_html=True)
         if st.button("Sign In", use_container_width=True):
-            st.session_state.logged_in = True
-            st.rerun()
+            if st.session_state.login_username == LOGIN_USERNAME and st.session_state.login_password == LOGIN_PASSWORD:
+                st.session_state.logged_in = True
+                st.rerun()
+            else:
+                st.error("Incorrect username or password.")
         st.markdown('</div>', unsafe_allow_html=True)
-        st.caption("Forgot password?")
+        st.caption("Forgot password? Contact your church admin.")
 
 
 if __name__ == "__main__":

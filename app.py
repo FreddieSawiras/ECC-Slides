@@ -208,6 +208,8 @@ ACCENT = "#C8A24A"          # warm gold — ECC accent
 # security — anyone with the app's URL and this password gets full access.
 LOGIN_USERNAME = "ECC"
 LOGIN_PASSWORD = "5015"
+
+_DB_INITIALIZED = False  # see main() — makes init_db() run once per process, not once per click
 BG = "#0B0C0F"               # near-black
 CARD = "#15171C"             # charcoal card
 CARD_BORDER = "#24262C"
@@ -1547,12 +1549,21 @@ def render_remote():
         si = state.get("slide_index") or 0
 
     c1, c2 = st.columns(2)
-    if c1.button("◀ PREV", use_container_width=True, key="remote_prev") and si > 0:
-        if adhoc:
-            set_state(adhoc_index=si - 1, cleared=0)
-        else:
-            set_state(slide_index=si - 1, cleared=0)
-        st.rerun()
+    if c1.button("◀ PREV", use_container_width=True, key="remote_prev"):
+        if si > 0:
+            if adhoc:
+                set_state(adhoc_index=si - 1, cleared=0)
+            else:
+                set_state(slide_index=si - 1, cleared=0)
+            st.rerun()
+        elif not adhoc and idx > 0:
+            # Was on the first slide of this item — cross back into the
+            # PREVIOUS item's last slide, mirroring what NEXT already does
+            # going forward. Without this, PREV silently did nothing the
+            # moment you crossed into a new item, which looked broken.
+            prev_slides = item_slides(items[idx - 1])
+            set_state(item_index=idx - 1, slide_index=max(0, len(prev_slides) - 1), cleared=0)
+            st.rerun()
     if c2.button("NEXT ▶", use_container_width=True, key="remote_next"):
         if si < len(slides) - 1:
             if adhoc:
@@ -1564,8 +1575,10 @@ def render_remote():
             set_state(item_index=idx + 1, slide_index=0, cleared=0)
             st.rerun()
     st.write("")
-    if st.button("⬛ BLACK SCREEN", use_container_width=True, key="remote_black"):
-        set_state(black=0 if state.get("black") else 1)
+    is_black = bool(state.get("black"))
+    black_label = "🔆 Show Display (currently Black)" if is_black else "⬛ Black Screen"
+    if st.button(black_label, use_container_width=True, key="remote_black"):
+        set_state(black=0 if is_black else 1)
         st.rerun()
     if st.button("Clear Screen", use_container_width=True, key="remote_clear"):
         set_state(cleared=1)
@@ -1588,9 +1601,9 @@ def render_display_open_widget(compact=False):
               <div style="display:flex;align-items:center;gap:0.4rem;
                           background:#15171C;color:#F4F3EF;border:1px solid #24262C;
                           border-radius:6px;padding:0.5rem 0.7rem;">
-                <a id="ecc-display-link" href="#" target="_blank" rel="noopener"
+                <a id="ecc-display-link" href="#" onclick="return eccOpenDisplayLink(event)"
                    style="flex:1;color:#C8A24A;text-decoration:underline;
-                          word-break:break-all;font-family:monospace;font-size:0.82rem;">
+                          word-break:break-all;font-family:monospace;font-size:0.82rem;cursor:pointer;">
                   computing…
                 </a>
                 <button id="ecc-copy-btn" onclick="eccCopyDisplayUrl()"
@@ -1634,6 +1647,19 @@ def render_display_open_widget(compact=False):
               document.getElementById("ecc-copy-msg").innerText = "Copied!";
               setTimeout(() => {{ document.getElementById("ecc-copy-msg").innerText = ""; }}, 1500);
             }});
+          }}
+          // The plain <a> above lives inside this sandboxed iframe, so a
+          // normal target="_blank" click can get redirected into
+          // navigating your CURRENT tab instead of opening a new one.
+          // Calling open() on window.PARENT instead runs it in the real
+          // page's own context, which reliably opens a fresh tab. The
+          // empty-string target name (rather than a reused name like
+          // "ecc_projector") guarantees a brand new tab every click,
+          // never overwriting one that's already open.
+          function eccOpenDisplayLink(e) {{
+            e.preventDefault();
+            if (displayUrl) window.parent.open(displayUrl, "_blank");
+            return false;
           }}
           // Uses the Window Management API (Chrome/Edge only, needs HTTPS
           // or localhost). It lists connected monitors, opens the display
@@ -1696,7 +1722,7 @@ def sidebar():
             if st.button(label, key=f"nav_{label}", use_container_width=True):
                 st.session_state.page = label
         st.markdown("###### LIBRARY")
-        for label in ["Song Library", "Bible", "Saved Services"]:
+        for label in ["Song Library", "Rapid Upload", "Bible", "Saved Services"]:
             if st.button(label, key=f"nav_{label}", use_container_width=True):
                 st.session_state.page = label
         st.markdown("###### SETTINGS")
@@ -1726,19 +1752,26 @@ def sidebar():
         components.html(
             """
             <div style="font-family:'Inter',sans-serif;font-size:0.82rem;display:flex;flex-direction:column;gap:0.4rem;">
-              <a id="ecc-stage-link" href="#" target="_blank" rel="noopener"
-                 style="color:#C8A24A;text-decoration:underline;">🖥 Stage Display (current + next slide, clock)</a>
-              <a id="ecc-remote-link" href="#" target="_blank" rel="noopener"
-                 style="color:#C8A24A;text-decoration:underline;">📱 Phone Remote (Next/Prev/Black)</a>
+              <a id="ecc-stage-link" href="#" onclick="return eccOpenLink(event, this)"
+                 style="color:#C8A24A;text-decoration:underline;cursor:pointer;">🖥 Stage Display (current + next slide, clock)</a>
+              <a id="ecc-remote-link" href="#" onclick="return eccOpenLink(event, this)"
+                 style="color:#C8A24A;text-decoration:underline;cursor:pointer;">📱 Phone Remote (Next/Prev/Black)</a>
             </div>
             <script>
+              // Same fix as the main projector link: these anchors live in a
+              // sandboxed iframe, so opening via window.PARENT (not a plain
+              // target="_blank" click) is what reliably opens a fresh tab
+              // instead of navigating away from the page you're on.
               try {
                 const base = window.parent.location.origin + window.parent.location.pathname;
-                const stageEl = document.getElementById("ecc-stage-link");
-                const remoteEl = document.getElementById("ecc-remote-link");
-                stageEl.href = base + "?display=stage";
-                remoteEl.href = base + "?display=remote";
+                document.getElementById("ecc-stage-link").dataset.url = base + "?display=stage";
+                document.getElementById("ecc-remote-link").dataset.url = base + "?display=remote";
               } catch (e) {}
+              function eccOpenLink(e, el) {
+                e.preventDefault();
+                if (el.dataset.url) window.parent.open(el.dataset.url, "_blank");
+                return false;
+              }
             </script>
             """,
             height=55,
@@ -2366,8 +2399,10 @@ def page_presentation():
         # could never actually open anything. This renders the real
         # clickable button (Window Management API auto-open) in its place.
         render_display_open_widget(compact=True)
-        if st.button("⬛ Black Screen", use_container_width=True):
-            set_state(black=1 if not state["black"] else 0); st.rerun()
+        is_black = bool(state["black"])
+        black_label = "🔆 Show Display (currently Black)" if is_black else "⬛ Black Screen"
+        if st.button(black_label, use_container_width=True, key="op_black_btn"):
+            set_state(black=0 if is_black else 1); st.rerun()
         if st.button("Clear Screen", use_container_width=True):
             set_state(cleared=1); st.rerun()
         if st.button("✕ Exit Presentation", use_container_width=True):
@@ -2401,7 +2436,7 @@ def page_presentation():
             </div>"""
         )
 
-    st.caption("⌨️ Shortcuts: → or Space = Next · ← = Prev · B = Black screen")
+    st.caption("⌨️ Shortcuts: Space, → or ↑ = Next · ← or ↓ = Prev · B = toggle Black screen")
     components.html(
         """
         <script>
@@ -2409,24 +2444,31 @@ def page_presentation():
             const doc = window.parent.document;
             if (doc._eccOperatorKeysBound) return;
             doc._eccOperatorKeysBound = true;
-            function eccClickButtonByText(label) {
+            // Matches by a stable SUBSTRING rather than the full label,
+            // since the Black button's text now toggles between "Black
+            // Screen" and "Show Display" depending on state — an exact
+            // match would silently stop working the moment it toggled.
+            function eccClickButtonContaining(substr) {
                 const buttons = doc.querySelectorAll('button');
                 for (const b of buttons) {
-                    if (b.innerText.trim() === label) { b.click(); return true; }
+                    if (b.innerText.trim().toLowerCase().includes(substr.toLowerCase())) { b.click(); return true; }
                 }
                 return false;
             }
             doc.addEventListener('keydown', function(e) {
                 const tag = (doc.activeElement && doc.activeElement.tagName) || '';
                 if (tag === 'INPUT' || tag === 'TEXTAREA') return;  // don't hijack typing
-                if (e.key === 'ArrowRight' || e.key === ' ') {
+                if (e.ctrlKey || e.metaKey || e.altKey) return;
+                const k = e.key;
+                if (k === 'ArrowRight' || k === 'ArrowUp' || k === ' ') {
                     e.preventDefault();
-                    eccClickButtonByText('NEXT ▶');
-                } else if (e.key === 'ArrowLeft') {
+                    eccClickButtonContaining('NEXT');
+                } else if (k === 'ArrowLeft' || k === 'ArrowDown') {
                     e.preventDefault();
-                    eccClickButtonByText('◀ PREV');
-                } else if (e.key.toLowerCase() === 'b' && !e.ctrlKey && !e.metaKey) {
-                    eccClickButtonByText('⬛ Black Screen');
+                    eccClickButtonContaining('PREV');
+                } else if (k.toLowerCase() === 'b') {
+                    e.preventDefault();
+                    eccClickButtonContaining('Black');
                 }
             });
         })();
@@ -2434,6 +2476,60 @@ def page_presentation():
         """,
         height=0,
     )
+
+
+def page_rapid_upload():
+    st.markdown("### Rapid Upload")
+    st.caption(
+        "Select several song JSON files at once — each one gets imported into your library "
+        "AND added straight onto today's active service, so you don't have to add them one by "
+        "one afterward. Each file can be a single song object, or a list of songs."
+    )
+    st.caption('Expected shape per song: `{"title":..,"artist":..,"category":..,"tags":..,"lyrics":"verse1\\n\\nverse2"}` '
+               'or with `"slides":["verse1","verse2"]` instead of `"lyrics"`.')
+
+    files = st.file_uploader("Song JSON files", type=["json"], accept_multiple_files=True, key="rapid_upload_files")
+    if files:
+        st.caption(f"{len(files)} file(s) selected.")
+        if st.button(f"⚡ Import {len(files)} file(s) → Today's Service", use_container_width=True):
+            sid = ensure_active_service()
+            service = get_service(sid) if sid else None
+            items = json.loads(service["items"]) if service else []
+            imported, errors = [], []
+            for f in files:
+                try:
+                    data = json.load(f)
+                    entries = [data] if isinstance(data, dict) else data
+                    for entry in entries:
+                        title = (entry.get("title") or "").strip()
+                        if not title:
+                            errors.append(f"{f.name}: an entry is missing a title — skipped.")
+                            continue
+                        artist = entry.get("artist", "")
+                        category = entry.get("category", "Worship")
+                        tags = entry.get("tags", "")
+                        if entry.get("slides"):
+                            lyrics_text = "\n\n".join(entry["slides"])
+                        else:
+                            lyrics_text = entry.get("lyrics", "")
+                        song_id, slides = add_song(title, artist, category, tags, lyrics_text)
+                        items.append({"type": "song", "ref_id": song_id, "title": title, "slides": slides})
+                        imported.append(title)
+                        if turso_configured():
+                            try:
+                                turso_push_song(song_id, title, artist, category, tags, json.dumps(slides))
+                            except Exception:
+                                pass  # local import still succeeded either way
+                except Exception as e:
+                    errors.append(f"{f.name}: couldn't read that file ({e}).")
+
+            if imported:
+                update_service_items(sid, items)
+                st.success(f"Imported and added to today's service: {', '.join(imported)}")
+            if errors:
+                st.warning("Some files had issues:\n" + "\n".join(f"- {e}" for e in errors))
+            if not imported and not errors:
+                st.info("Nothing to import.")
 
 
 def page_song_library():
@@ -2675,7 +2771,17 @@ def page_display_settings():
 
 def main():
     st.set_page_config(page_title="ECC Worship", page_icon="✝", layout="wide")
-    init_db()
+    # init_db() does several CREATE TABLE / ALTER TABLE / SELECT COUNT checks
+    # — cheap once, but it was previously re-run on literally every click
+    # across the whole app (Streamlit reruns main() top-to-bottom on every
+    # interaction). A module-level flag survives across reruns within the
+    # same running process, so this now only actually runs once per app
+    # start instead of once per click — a real, always-on speed win for
+    # every button everywhere, including the phone remote and Presentation.
+    global _DB_INITIALIZED
+    if not _DB_INITIALIZED:
+        init_db()
+        _DB_INITIALIZED = True
 
     qp = st.query_params
     if qp.get("display") == "projector":
@@ -2708,6 +2814,7 @@ def main():
         "Service Builder": page_service_builder,
         "Presentation": page_presentation,
         "Song Library": page_song_library,
+        "Rapid Upload": page_rapid_upload,
         "Saved Services": page_saved_services,
         "Church Settings": page_church_settings,
         "Display Settings": page_display_settings,

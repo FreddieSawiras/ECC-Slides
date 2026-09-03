@@ -1,0 +1,3 @@
+# .streamlit/secrets.toml (or your host's "Secrets" settings)
+TURSO_DATABASE_URL = "libsql://your-db-org.turso.io"
+TURSO_AUTH_TOKEN = "your-token-here"

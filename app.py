@@ -34,7 +34,20 @@ import datetime
 import csv
 import io
 import re
+import base64
 import requests
+
+try:
+    from streamlit_dnd import dnd, apply_move
+    DND_AVAILABLE = True
+except ImportError:
+    DND_AVAILABLE = False
+
+try:
+    from PIL import Image, ImageFilter, ImageEnhance
+    PIL_AVAILABLE = True
+except ImportError:
+    PIL_AVAILABLE = False
 
 # ---------------------------------------------------------------------------
 # CONFIG / CONSTANTS
@@ -113,6 +126,11 @@ TURSO_SONGS_SCHEMA = """CREATE TABLE IF NOT EXISTS songs(
     tags TEXT, slides TEXT, updated_at TEXT
 )"""
 
+TURSO_SERVICES_SCHEMA = """CREATE TABLE IF NOT EXISTS services(
+    id INTEGER PRIMARY KEY, name TEXT, service_date TEXT, service_time TEXT,
+    items TEXT, updated_at TEXT
+)"""
+
 
 def turso_push_song(song_id, title, artist, category, tags, slides_json):
     """One explicit push for one song — this is the only network call that
@@ -143,6 +161,18 @@ def turso_push_all_songs():
     return len(songs)
 
 
+def turso_push_service(service_id, name, service_date, service_time, items_json):
+    """One explicit push for one saved service — fires only when you click
+    'Save Service to Cloud', never on every add/reorder/delete while
+    you're still building it. Overwrites that service's own Turso row by
+    id, so re-saving updates it rather than duplicating it."""
+    turso_pipeline([
+        (TURSO_SERVICES_SCHEMA, None),
+        ("INSERT OR REPLACE INTO services(id, name, service_date, service_time, items, updated_at) "
+         "VALUES (?,?,?,?,?,?)", (service_id, name, service_date, service_time, items_json, now())),
+    ])
+
+
 def turso_pull_all_songs():
     """Read-only pull, used ONLY once at cold-start and only when the local
     songs table is completely empty (see init_db) — restores your library
@@ -155,6 +185,20 @@ def turso_pull_all_songs():
         vals = [cell.get("value") for cell in row]
         songs.append(dict(zip(["id", "title", "artist", "category", "tags", "slides"], vals)))
     return songs
+
+
+def turso_pull_all_services():
+    """Same idea as turso_pull_all_songs, for saved services — a single
+    read-only call, only at cold-start, only when the local services table
+    is empty."""
+    result = turso_pipeline([(TURSO_SERVICES_SCHEMA, None),
+                             ("SELECT id, name, service_date, service_time, items FROM services", None)])
+    rows = result["results"][1]["response"]["result"]["rows"]
+    services = []
+    for row in rows:
+        vals = [cell.get("value") for cell in row]
+        services.append(dict(zip(["id", "name", "service_date", "service_time", "items"], vals)))
+    return services
 
 
 ACCENT = "#C8A24A"          # warm gold — ECC accent
@@ -395,6 +439,11 @@ def init_db():
         conn.commit()
     except sqlite3.OperationalError:
         pass  # column already exists (older database)
+    try:
+        c.execute("ALTER TABLE settings ADD COLUMN custom_background_data TEXT")
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass  # column already exists (older database)
 
     if c.execute("SELECT COUNT(*) FROM settings").fetchone()[0] == 0:
         c.execute("INSERT INTO settings(id, church_name, default_theme, default_background) "
@@ -426,6 +475,22 @@ def init_db():
                 restored = 0  # Turso unreachable/misconfigured — fall through to local seed below
         if restored == 0:
             seed_songs(conn)
+    if c.execute("SELECT COUNT(*) FROM services").fetchone()[0] == 0 and turso_configured():
+        # Same one-time, one-request pattern as songs above — only checks
+        # Turso when local services are completely empty (a fresh/wiped
+        # filesystem). If you've never synced a service, this just finds
+        # nothing and moves on; no seed data needed here either way.
+        try:
+            remote_services = turso_pull_all_services()
+            for r in remote_services:
+                c.execute(
+                    "INSERT INTO services(id, name, service_date, service_time, items, created_at) "
+                    "VALUES (?,?,?,?,?,?)",
+                    (r["id"], r["name"], r["service_date"], r["service_time"], r["items"], now())
+                )
+            conn.commit()
+        except Exception:
+            pass  # Turso unreachable/misconfigured — no local services is an OK starting state
     if c.execute("SELECT COUNT(*) FROM templates").fetchone()[0] == 0:
         c.execute("INSERT INTO templates(name, structure) VALUES (?, ?)", (
             "Sunday Worship",
@@ -1184,12 +1249,46 @@ def inject_css():
     """)
 
 
+def save_custom_background(uploaded_file, blur_radius=10, dim_factor=0.55):
+    """
+    Takes an uploaded photo, resizes it down to a sane display size, blurs
+    it, and dims it — the "blurred landscape, dimmed" look — then encodes
+    it as a data: URI stored directly in settings. Baking the blur into the
+    image itself (rather than a CSS filter) means the blur can never
+    accidentally smear the slide text on top of it, since text isn't part
+    of this image at all. Returns the data URI, or None if Pillow isn't
+    installed.
+    """
+    if not PIL_AVAILABLE:
+        return None
+    img = Image.open(uploaded_file).convert("RGB")
+    max_w = 1600
+    if img.width > max_w:
+        ratio = max_w / img.width
+        img = img.resize((max_w, int(img.height * ratio)))
+    img = img.filter(ImageFilter.GaussianBlur(radius=blur_radius))
+    img = ImageEnhance.Brightness(img).enhance(dim_factor)
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=78)
+    b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+    return f"data:image/jpeg;base64,{b64}"
+
+
+CUSTOM_BACKGROUND_KEY = "Custom Photo (uploaded)"
+
+
 def projector_css(theme_name, background_key=None, font_scale=1.0):
     t = THEMES.get(theme_name, THEMES["Modern Worship"])
-    bg_def = BACKGROUNDS.get(background_key) if background_key else None
-    app_bg = bg_def["css"] if bg_def else t["bg"]
-    bg_size_rule = f"background-size: {bg_def['size']};" if bg_def else ""
-    bg_anim_rule = f"animation: {bg_def['anim']};" if bg_def and bg_def.get("anim") else ""
+    bg_size_rule, bg_anim_rule = "", ""
+    if background_key == CUSTOM_BACKGROUND_KEY:
+        data_uri = get_settings().get("custom_background_data")
+        bg_def = {"css": f"url('{data_uri}') center/cover no-repeat"} if data_uri else None
+        app_bg = bg_def["css"] if bg_def else t["bg"]
+    else:
+        bg_def = BACKGROUNDS.get(background_key) if background_key else None
+        app_bg = bg_def["css"] if bg_def else t["bg"]
+        bg_size_rule = f"background-size: {bg_def['size']};" if bg_def else ""
+        bg_anim_rule = f"animation: {bg_def['anim']};" if bg_def and bg_def.get("anim") else ""
     font_scale = font_scale or 1.0
     render_html(f"""
     <style>
@@ -1569,7 +1668,17 @@ def render_display_open_widget(compact=False):
                 ? "Only one screen detected — opened here. Connect a projector/monitor first for auto-positioning."
                 : "Opened on the second screen. Press F there if it isn't fullscreen yet.";
             }} catch (e) {{
-              msg.innerText = "Permission needed: " + e.message;
+              // getScreenDetails was blocked — almost always because the
+              // browser's "Window Management" permission was denied (or
+              // never granted) for this site. Rather than just failing,
+              // fall back to a plain new window so the button still does
+              // something useful, and explain how to actually fix it.
+              const w = window.parent.open(displayUrl, "ecc_projector");
+              if (w) {{
+                msg.innerText = "Multi-screen permission isn't granted, so this opened in a normal window instead — drag it to your projector manually. To enable auto-positioning: click the padlock/site-info icon in your browser's address bar → Site settings → allow \\"Window management\\" (or \\"Additional permissions\\") → reload this page and try again.";
+              }} else {{
+                msg.innerText = "Permission needed for auto-positioning, and the popup was also blocked. Allow popups for this site in your browser settings, or just click the link above instead.";
+              }}
             }}
           }}
         </script>
@@ -1583,11 +1692,11 @@ def sidebar():
         st.markdown('<div class="ecc-wordmark">ECC <span>Worship</span></div>', unsafe_allow_html=True)
         st.caption("Prepare. Present. Worship.")
         st.markdown("###### MAIN")
-        for label in ["Dashboard", "Today's Service", "Songs", "Bible", "Service Builder", "Presentation"]:
+        for label in ["Dashboard", "Service Builder", "Presentation"]:
             if st.button(label, key=f"nav_{label}", use_container_width=True):
                 st.session_state.page = label
         st.markdown("###### LIBRARY")
-        for label in ["Song Library", "Saved Services"]:
+        for label in ["Song Library", "Bible", "Saved Services"]:
             if st.button(label, key=f"nav_{label}", use_container_width=True):
                 st.session_state.page = label
         st.markdown("###### SETTINGS")
@@ -1680,7 +1789,7 @@ def page_dashboard():
     if c1.button("➕ Create Service", use_container_width=True):
         st.session_state.page = "Service Builder"; st.rerun()
     if c2.button("🎵 Add Song", use_container_width=True):
-        st.session_state.page = "Songs"; st.session_state.show_add_song = True; st.rerun()
+        st.session_state.page = "Song Library"; st.session_state.show_add_song = True; st.rerun()
     if c3.button("📖 Find Bible Verse", use_container_width=True):
         st.session_state.page = "Bible"; st.rerun()
     if c4.button("▶ Start Presentation", use_container_width=True):
@@ -1773,7 +1882,7 @@ def page_song_workspace():
     st.caption(f"{song['artist']} · {song['category']}")
 
     if st.button("← Back to Songs"):
-        st.session_state.page = "Songs"; st.rerun()
+        st.session_state.page = "Song Library"; st.rerun()
 
     left, center, right = st.columns([1.1, 2.4, 1])
 
@@ -2050,6 +2159,16 @@ def page_service_builder():
             conn.commit(); conn.close()
             st.rerun()
 
+    if turso_configured():
+        if st.button("☁️ Save Service to Cloud", help="Pushes this service to Turso so it survives an app restart — only runs when you click it."):
+            try:
+                turso_push_service(sid, name, date, time_, json.dumps(items))
+                st.success(f"Saved \"{name}\" to Turso.")
+            except Exception as e:
+                st.error(f"Cloud save failed: {e}")
+    else:
+        st.caption("Set up Turso (Church Settings) to make saved services survive an app restart.")
+
     st.markdown("#### Add to the service")
     a1, a2, a3, a4 = st.columns(4)
     with a1.popover("🎵 Add Song"):
@@ -2084,22 +2203,37 @@ def page_service_builder():
     st.markdown("#### Order of Service")
     if not items:
         st.caption("Nothing added yet — build the flow above.")
-    for i, item in enumerate(items):
-        icon = {"song": "🎵", "bible": "📖", "custom": "🖼", "announcement": "📣"}.get(item["type"], "•")
-        with st.container(border=True):
-            c1, c2 = st.columns([5, 2])
-            c1.markdown(f"**{i+1:02d} — {icon} {item['title']}**")
-            with c2:
-                b1, b2, b3 = st.columns(3)
-                if b1.button("↑", key=f"up_{i}") and i > 0:
-                    items[i-1], items[i] = items[i], items[i-1]
-                    update_service_items(sid, items); st.rerun()
-                if b2.button("↓", key=f"down_{i}") and i < len(items) - 1:
-                    items[i+1], items[i] = items[i], items[i+1]
-                    update_service_items(sid, items); st.rerun()
-                if b3.button("🗑", key=f"del_{i}"):
-                    items.pop(i)
-                    update_service_items(sid, items); st.rerun()
+    else:
+        if DND_AVAILABLE:
+            st.caption("Drag any card by its edge to reorder — or use the ↑/↓ buttons.")
+        else:
+            st.caption("Add `streamlit-dnd` to requirements.txt to drag-reorder — the ↑/↓ buttons work either way.")
+        with st.container(key="service_items"):
+            for i, item in enumerate(items):
+                icon = {"song": "🎵", "bible": "📖", "custom": "🖼", "announcement": "📣"}.get(item["type"], "•")
+                with st.container(border=True):
+                    c1, c2 = st.columns([5, 2])
+                    c1.markdown(f"**{i+1:02d} — {icon} {item['title']}**")
+                    with c2:
+                        b1, b2, b3 = st.columns(3)
+                        if b1.button("↑", key=f"up_{i}") and i > 0:
+                            items[i-1], items[i] = items[i], items[i-1]
+                            update_service_items(sid, items); st.rerun()
+                        if b2.button("↓", key=f"down_{i}") and i < len(items) - 1:
+                            items[i+1], items[i] = items[i], items[i+1]
+                            update_service_items(sid, items); st.rerun()
+                        if b3.button("🗑", key=f"del_{i}"):
+                            items.pop(i)
+                            update_service_items(sid, items); st.rerun()
+        if DND_AVAILABLE:
+            # Must be called AFTER the container above is drawn, so the
+            # component can find it. A drag only *proposes* a move — nothing
+            # changes until we apply it and rerun, right here.
+            dnd_event = dnd("service_items", indicator="line", color=ACCENT)
+            if dnd_event:
+                apply_move(dnd_event, {"service_items": items})
+                update_service_items(sid, items)
+                st.rerun()
 
     if items:
         st.write("")
@@ -2255,6 +2389,17 @@ def page_presentation():
             set_state(font_scale=round(min(2.0, cur_scale + 0.1), 2))
             st.rerun()
         fpct.markdown(f"<div style='text-align:center;padding-top:0.4rem;'>{int(cur_scale*100)}%</div>", unsafe_allow_html=True)
+
+        st.caption("Preview at this size (what the projector shows)")
+        preview_hidden = bool(state.get("black") or state.get("cleared"))
+        preview_text = "(hidden from projector)" if preview_hidden else (cur_text or "Nothing live")
+        render_html(
+            f"""<div style="background:{t['bg']};border-radius:10px;padding:1rem;max-height:170px;overflow:auto;
+            display:flex;align-items:center;justify-content:center;text-align:center;border:1px solid {CARD_BORDER};">
+            <div style="color:{t['fg']};font-family:{t['font']};font-weight:700;white-space:pre-line;line-height:1.35;
+            font-size:calc(1.3rem * {cur_scale});">{preview_text}</div>
+            </div>"""
+        )
 
     st.caption("⌨️ Shortcuts: → or Space = Next · ← = Prev · B = Black screen")
     components.html(
@@ -2477,6 +2622,39 @@ def page_display_settings():
                 st.rerun()
 
     st.write("")
+    st.markdown("#### Custom Photo Background")
+    st.caption(
+        "Upload your own landscape photo — it's automatically blurred and dimmed (the same "
+        "\"blurred, dim\" look as the built-in options) so slide text stays readable on top of it. "
+        "I can't source real stock photos myself, but this lets you use your own."
+    )
+    if not PIL_AVAILABLE:
+        st.warning("This needs the `Pillow` package — add `Pillow` to requirements.txt to enable it.")
+    else:
+        upcol1, upcol2 = st.columns([2, 1])
+        with upcol1:
+            photo = st.file_uploader("Landscape photo", type=["jpg", "jpeg", "png"], key="bg_photo_uploader",
+                                      label_visibility="collapsed")
+        with upcol2:
+            blur = st.slider("Blur", 0, 25, 10, key="bg_blur")
+        dim = st.slider("Dim (lower = darker)", 0.2, 1.0, 0.55, key="bg_dim")
+        if photo is not None and st.button("Process & Use as Background", use_container_width=True):
+            data_uri = save_custom_background(photo, blur_radius=blur, dim_factor=dim)
+            if data_uri:
+                set_settings(custom_background_data=data_uri, default_background=CUSTOM_BACKGROUND_KEY)
+                set_state(background=CUSTOM_BACKGROUND_KEY)
+                st.success("Uploaded, processed, and set as the live background.")
+                st.rerun()
+            else:
+                st.error("Couldn't process that image.")
+        if settings.get("custom_background_data"):
+            st.image(settings["custom_background_data"], caption="Current custom background (processed)", width=300)
+            if st.button("Use this custom photo now", key="use_custom_bg"):
+                set_settings(default_background=CUSTOM_BACKGROUND_KEY)
+                set_state(background=CUSTOM_BACKGROUND_KEY)
+                st.rerun()
+
+    st.write("")
     st.markdown("#### Preview")
     t = THEMES[theme]
     bg_def = BACKGROUNDS.get(current_bg)
@@ -2525,8 +2703,6 @@ def main():
 
     pages = {
         "Dashboard": page_dashboard,
-        "Today's Service": page_presentation,
-        "Songs": page_songs,
         "Song Workspace": page_song_workspace,
         "Bible": page_bible,
         "Service Builder": page_service_builder,

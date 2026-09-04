@@ -1603,7 +1603,7 @@ def render_html(html_str: str):
 
 def _render_splash_screen():
     """A one-time (per session) full-screen splash: a CSS-built ECC emblem
-    holds for ~2.8s, then fades out over the remaining ~1.2s (4s total),
+    holds for ~5.4s, then fades out over the remaining ~1.6s (7s total),
     while the app content underneath fades in on a matching delay — so the
     reveal feels like a cross-fade rather than a hard cut. Pure CSS/HTML, no
     image asset required, so there's nothing external to host or break."""
@@ -1612,7 +1612,7 @@ def _render_splash_screen():
     html, body {{ background:{BG} !important; }}
     @keyframes eccSplashHold {{
         0%   {{ opacity: 1; }}
-        70%  {{ opacity: 1; }}
+        77%  {{ opacity: 1; }}
         100% {{ opacity: 0; }}
     }}
     @keyframes eccLogoPulse {{
@@ -1631,7 +1631,7 @@ def _render_splash_screen():
         position: fixed; inset: 0; z-index: 999999;
         background: radial-gradient(circle at 50% 40%, #17190F 0%, {BG} 72%);
         display: flex; flex-direction: column; align-items: center; justify-content: center;
-        animation: eccSplashHold 4s ease forwards;
+        animation: eccSplashHold 7s ease forwards;
         pointer-events: none;
     }}
     #ecc-splash .ecc-splash-badge {{
@@ -1655,9 +1655,9 @@ def _render_splash_screen():
         border-radius: 2px; overflow: hidden;
     }}
     #ecc-splash .ecc-splash-bar-fill {{
-        height: 100%; background: {ACCENT}; animation: eccLoadBar 3.6s ease forwards;
+        height: 100%; background: {ACCENT}; animation: eccLoadBar 6.3s ease forwards;
     }}
-    [data-testid="stAppViewContainer"] {{ animation: eccAppReveal 1.3s ease 2.8s both; }}
+    [data-testid="stAppViewContainer"] {{ animation: eccAppReveal 1.3s ease 5.1s both; }}
     </style>
     <div id="ecc-splash">
         <div class="ecc-splash-badge">
@@ -4077,27 +4077,54 @@ def main():
 
 
 def render_login():
-    render_html(
-        f"""
-        <div style="min-height:80vh;display:flex;flex-direction:column;align-items:center;justify-content:center;">
-        <div style="font-weight:800;font-size:2.4rem;margin-bottom:0.2rem;">ECC <span style="color:{ACCENT}">Worship</span></div>
-        <div style="color:{TEXT_MUTED};margin-bottom:2rem;">Welcome to ECC — Prepare. Present. Worship.</div>
-        </div>
-        """
-    )
-    c1, c2, c3 = st.columns([1, 1, 1])
-    with c2:
-        st.text_input("Username", key="login_username")
-        st.text_input("Password", type="password", key="login_password")
-        st.markdown('<div class="ecc-primary">', unsafe_allow_html=True)
-        if st.button("Sign In", use_container_width=True):
-            if st.session_state.login_username == LOGIN_USERNAME and st.session_state.login_password == LOGIN_PASSWORD:
-                st.session_state.logged_in = True
-                st.rerun()
-            else:
-                st.error("Incorrect username or password.")
-        st.markdown('</div>', unsafe_allow_html=True)
-        st.caption("Forgot password? Contact your church admin.")
+    # The old version put the logo/tagline in its own min-height:80vh
+    # centered div, then rendered the actual username/password/button form
+    # as a SEPARATE block below it in normal document flow — so the two
+    # stacked on top of each other were taller than the viewport, which is
+    # exactly what produced the scrollbar. This locks the whole page
+    # (html/body and every Streamlit wrapper div, not just .stApp) to
+    # 100vh/overflow:hidden the same way the projector view is locked down,
+    # and centers the logo + form together as one flex column so the form
+    # is genuinely inside the centered area instead of trailing below it.
+    render_html(f"""
+    <style>
+    html, body {{ overflow: hidden !important; height: 100vh; width: 100vw; margin:0; padding:0; }}
+    [data-testid="stAppViewContainer"], [data-testid="stMain"],
+    [data-testid="stAppViewContainer"] > .main,
+    section.main, div[data-testid="stVerticalBlock"],
+    div[data-testid="stAppViewBlockContainer"] {{
+        height: 100vh !important; max-height: 100vh !important; width: 100vw !important;
+        overflow: hidden !important; margin: 0 !important;
+        display: flex !important; flex-direction: column !important; justify-content: center !important;
+    }}
+    .block-container {{
+        padding: 0 !important; margin: 0 auto !important; max-width: 420px !important;
+        height: auto !important; overflow: hidden !important;
+    }}
+    .stApp {{ background: {BG}; overflow: hidden !important; height: 100vh !important; width: 100vw !important; }}
+    #MainMenu, footer, header {{visibility: hidden;}}
+    section[data-testid="stSidebar"] {{display:none;}}
+    .ecc-login-header {{ text-align:center; margin-bottom: 1.6rem; }}
+    .ecc-login-title {{ font-weight:800; font-size:2.2rem; margin-bottom:0.2rem; color:{TEXT_PRIMARY}; }}
+    .ecc-login-title span {{ color:{ACCENT}; }}
+    .ecc-login-sub {{ color:{TEXT_MUTED}; font-size:0.9rem; }}
+    </style>
+    <div class="ecc-login-header">
+        <div class="ecc-login-title">ECC <span>Worship</span></div>
+        <div class="ecc-login-sub">Welcome to ECC — Prepare. Present. Worship.</div>
+    </div>
+    """)
+    st.text_input("Username", key="login_username")
+    st.text_input("Password", type="password", key="login_password")
+    st.markdown('<div class="ecc-primary">', unsafe_allow_html=True)
+    if st.button("Sign In", use_container_width=True):
+        if st.session_state.login_username == LOGIN_USERNAME and st.session_state.login_password == LOGIN_PASSWORD:
+            st.session_state.logged_in = True
+            st.rerun()
+        else:
+            st.error("Incorrect username or password.")
+    st.markdown('</div>', unsafe_allow_html=True)
+    st.caption("Forgot password? Contact your church admin.")
 
 
 if __name__ == "__main__":

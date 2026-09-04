@@ -38,16 +38,16 @@ import base64
 import requests
 
 try:
-    from streamlit_dnd import dnd, apply_move
-    DND_AVAILABLE = True
-except ImportError:
-    DND_AVAILABLE = False
-
-try:
     from PIL import Image, ImageFilter, ImageEnhance
     PIL_AVAILABLE = True
 except ImportError:
     PIL_AVAILABLE = False
+
+try:
+    import fitz  # PyMuPDF — used to rasterize Google Slides PDF exports into per-slide images
+    PYMUPDF_AVAILABLE = True
+except ImportError:
+    PYMUPDF_AVAILABLE = False
 
 # ---------------------------------------------------------------------------
 # CONFIG / CONSTANTS
@@ -131,6 +131,15 @@ TURSO_SERVICES_SCHEMA = """CREATE TABLE IF NOT EXISTS services(
     items TEXT, updated_at TEXT
 )"""
 
+TURSO_SETTINGS_SCHEMA = """CREATE TABLE IF NOT EXISTS settings(
+    id INTEGER PRIMARY KEY CHECK (id=1), church_name TEXT, default_theme TEXT,
+    default_background TEXT, custom_background_data TEXT, updated_at TEXT
+)"""
+
+TURSO_SLIDE_DECKS_SCHEMA = """CREATE TABLE IF NOT EXISTS slide_decks(
+    id INTEGER PRIMARY KEY, title TEXT, source TEXT, slides TEXT, updated_at TEXT
+)"""
+
 
 def turso_push_song(song_id, title, artist, category, tags, slides_json):
     """One explicit push for one song — this is the only network call that
@@ -199,6 +208,67 @@ def turso_pull_all_services():
         vals = [cell.get("value") for cell in row]
         services.append(dict(zip(["id", "name", "service_date", "service_time", "items"], vals)))
     return services
+
+
+def turso_push_background(default_theme, default_background, custom_background_data, church_name):
+    """One explicit push of the display settings/background — fires only
+    from 'Process & Use as Background' or the master sync-all button, never
+    automatically on every upload."""
+    turso_pipeline([
+        (TURSO_SETTINGS_SCHEMA, None),
+        ("INSERT OR REPLACE INTO settings(id, church_name, default_theme, default_background, "
+         "custom_background_data, updated_at) VALUES (1,?,?,?,?,?)",
+         (church_name, default_theme, default_background, custom_background_data, now())),
+    ])
+
+
+def turso_push_slide_deck(deck_id, title, source, slides_json):
+    """One explicit push for one imported slide deck — same pattern as
+    turso_push_song: fires on that deck's own Save/Sync click, and
+    INSERT OR REPLACE means re-syncing updates rather than duplicates it."""
+    turso_pipeline([
+        (TURSO_SLIDE_DECKS_SCHEMA, None),
+        ("INSERT OR REPLACE INTO slide_decks(id, title, source, slides, updated_at) "
+         "VALUES (?,?,?,?,?)", (deck_id, title, source, slides_json, now())),
+    ])
+
+
+def turso_sync_all():
+    """The single 'master sync' button: pushes every song, every saved
+    service, the current background/display settings, and every imported
+    slide deck to Turso in one pass. Still entirely explicit — only runs
+    when the user clicks it, never on a timer or on page load."""
+    n_songs = turso_push_all_songs()
+
+    services = get_services()
+    if services:
+        statements = [(TURSO_SERVICES_SCHEMA, None)]
+        for s in services:
+            statements.append((
+                "INSERT OR REPLACE INTO services(id, name, service_date, service_time, items, updated_at) "
+                "VALUES (?,?,?,?,?,?)",
+                (s["id"], s["name"], s["service_date"], s["service_time"], s["items"], now())
+            ))
+        turso_pipeline(statements, timeout=30)
+    n_services = len(services)
+
+    settings = get_settings()
+    turso_push_background(settings["default_theme"], settings.get("default_background"),
+                           settings.get("custom_background_data"), settings.get("church_name"))
+
+    decks = get_slide_decks()
+    if decks:
+        statements = [(TURSO_SLIDE_DECKS_SCHEMA, None)]
+        for d in decks:
+            statements.append((
+                "INSERT OR REPLACE INTO slide_decks(id, title, source, slides, updated_at) "
+                "VALUES (?,?,?,?,?)",
+                (d["id"], d["title"], d["source"], d["slides"], now())
+            ))
+        turso_pipeline(statements, timeout=30)
+    n_decks = len(decks)
+
+    return n_songs, n_services, n_decks
 
 
 ACCENT = "#C8A24A"          # warm gold — ECC accent
@@ -395,6 +465,10 @@ def init_db():
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         title TEXT, body TEXT, created_at TEXT
     )""")
+    c.execute("""CREATE TABLE IF NOT EXISTS slide_decks(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        title TEXT, source TEXT, slides TEXT, created_at TEXT
+    )""")
     c.execute("""CREATE TABLE IF NOT EXISTS services(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         name TEXT, service_date TEXT, service_time TEXT,
@@ -578,6 +652,83 @@ def add_song(title, artist, category, tags, lyrics):
     return song_id, slides
 
 
+def add_song_with_slides(title, artist, category, tags, slides):
+    """Like add_song, but takes already-split slides directly instead of
+    re-splitting a raw lyrics blob on blank lines — used by the paste-lyrics
+    importer, whose parser already decides where each slide breaks."""
+    slides = slides or ["(empty)"]
+    conn = get_conn()
+    cur = conn.execute(
+        "INSERT INTO songs(title, artist, category, tags, slides, favorite, last_used) VALUES (?,?,?,?,?,0,?)",
+        (title, artist, category, tags, json.dumps(slides), now())
+    )
+    song_id = cur.lastrowid
+    conn.commit()
+    conn.close()
+    return song_id, slides
+
+
+def parse_pasted_lyrics(raw, max_lines_per_slide=4):
+    """Parses the standard lyrics-site paste format:
+
+        Song Title
+        Song by Artist Name ‧ Year
+
+        Overview
+        Lyrics
+        <actual lyrics...>
+
+    Strips the title/artist/year header and the "Overview"/"Lyrics" section
+    labels, then packs the remaining lines into slides of at most
+    max_lines_per_slide lines each — starting a new slide whenever a slide
+    fills up, and never crossing a blank-line stanza break. Returns
+    (title, artist, year, slides)."""
+    lines = raw.splitlines()
+
+    while lines and not lines[0].strip():
+        lines.pop(0)
+
+    title = lines.pop(0).strip() if lines else "Untitled"
+
+    artist, year = "", ""
+    if lines and re.match(r"^song by\s+", lines[0].strip(), re.IGNORECASE):
+        m = re.match(r"^song by\s+(.*?)(?:\s*[‧·]\s*(\d{4}))?\s*$", lines[0].strip(), re.IGNORECASE)
+        if m:
+            artist = m.group(1).strip()
+            year = m.group(2) or ""
+        lines.pop(0)
+
+    # Skip blank lines and the "Overview"/"Lyrics" section labels that sit
+    # before the actual lyrics on most lyrics sites.
+    while lines and (not lines[0].strip() or lines[0].strip().lower() in ("overview", "lyrics")):
+        lines.pop(0)
+
+    body_lines = [l.rstrip() for l in lines]
+    while body_lines and not body_lines[-1].strip():
+        body_lines.pop()
+
+    stanzas, current = [], []
+    for l in body_lines:
+        if not l.strip():
+            if current:
+                stanzas.append(current)
+                current = []
+        else:
+            current.append(l)
+    if current:
+        stanzas.append(current)
+
+    slides = []
+    for stanza in stanzas:
+        for i in range(0, len(stanza), max_lines_per_slide):
+            chunk = stanza[i:i + max_lines_per_slide]
+            slides.append("\n".join(chunk))
+
+    if not slides:
+        slides = ["(empty)"]
+    return title, artist, year, slides
+
+
 def update_song_slides(song_id, slides):
     conn = get_conn()
     conn.execute("UPDATE songs SET slides=? WHERE id=?", (json.dumps(slides), song_id))
@@ -607,6 +758,45 @@ def get_custom_slides():
     rows = conn.execute("SELECT * FROM custom_slides ORDER BY created_at DESC").fetchall()
     conn.close()
     return rows
+
+
+# ---------------- Slide decks (imported Google Slides PDFs) ----------------
+
+def add_slide_deck(title, source, slide_data_uris):
+    """slide_data_uris: list of base64 data-URI strings, one per slide image."""
+    conn = get_conn()
+    conn.execute("INSERT INTO slide_decks(title, source, slides, created_at) VALUES (?,?,?,?)",
+                 (title, source, json.dumps(slide_data_uris), now()))
+    conn.commit()
+    conn.close()
+
+
+def get_slide_decks():
+    conn = get_conn()
+    rows = conn.execute("SELECT * FROM slide_decks ORDER BY created_at DESC").fetchall()
+    conn.close()
+    return rows
+
+
+def get_slide_deck(deck_id):
+    conn = get_conn()
+    row = conn.execute("SELECT * FROM slide_decks WHERE id=?", (deck_id,)).fetchone()
+    conn.close()
+    return row
+
+
+def delete_slide_deck(deck_id):
+    conn = get_conn()
+    conn.execute("DELETE FROM slide_decks WHERE id=?", (deck_id,))
+    conn.commit()
+    conn.close()
+
+
+def make_deck_item(deck_row):
+    """Turns an imported slide deck into a service item — each page becomes
+    an image slide, shown full-bleed on the projector."""
+    images = json.loads(deck_row["slides"])
+    return {"type": "imagedeck", "ref_id": deck_row["id"], "title": deck_row["title"], "images": images}
 
 
 # ---------------- Services ----------------
@@ -708,14 +898,22 @@ def set_settings(**kwargs):
 # ITEM / SLIDE HELPERS
 # ---------------------------------------------------------------------------
 
+IMG_SLIDE_PREFIX = "\x00IMG\x00"  # sentinel: marks a slide's "text" as an image data-URI, not words
+
+
 def item_slides(item):
-    """Return list of (reference_or_none, text, secondary_text_or_None) for a service item."""
+    """Return list of (reference_or_none, text, secondary_text_or_None) for a service item.
+    For imported slide decks (Google Slides PDF import), each "text" is an
+    image data-URI prefixed with IMG_SLIDE_PREFIX — renderers check for that
+    prefix and draw an <img> full-bleed instead of styled text."""
     if item["type"] == "song":
         return [(None, s, None) for s in item["slides"]]
     if item["type"] == "bible":
         return [(v["ref"], v["text"], v.get("text2")) for v in item["slides"]]
     if item["type"] in ("custom", "announcement"):
         return [(None, item["slides"][0] if item["slides"] else "", None)]
+    if item["type"] == "imagedeck":
+        return [(None, IMG_SLIDE_PREFIX + img, None) for img in item.get("images", [])]
     return [(None, "", None)]
 
 
@@ -1385,7 +1583,15 @@ def render_projector():
                     if 0 <= si < len(slides):
                         ref, text, text2 = slides[si]
 
-        if text2:
+        if text.startswith(IMG_SLIDE_PREFIX):
+            img_src = text[len(IMG_SLIDE_PREFIX):]
+            render_html(
+                f"""<div style="height:100vh;width:100vw;display:flex;align-items:center;
+                justify-content:center;background:#000;animation: eccFadeIn 0.45s ease;">
+                <img src="{img_src}" style="max-width:100%;max-height:100%;object-fit:contain;" />
+                </div>"""
+            )
+        elif text2:
             top_dir = "rtl" if _looks_arabic(text) else "ltr"
             bottom_dir = "rtl" if _looks_arabic(text2) else "ltr"
             render_html(
@@ -1486,7 +1692,12 @@ def render_stage_display():
     def _tick():
         state = get_state()
         cur_ref, cur_text, cur_text2, nxt_label, hidden = _stage_slide_info(state)
-        clock = datetime.datetime.now().strftime("%I:%M %p").lstrip("0")
+        # The clock used to be computed with datetime.datetime.now() on the
+        # SERVER — correct only if the server happens to sit in the same
+        # timezone as whoever's reading the stage display, which caused it to
+        # show a different time than the room's actual clock. A browser-side
+        # JS clock reads the viewer's own device time instead, so it's always
+        # right regardless of where the app is hosted.
         render_html(f"""
         <style>
         #MainMenu, footer, header {{visibility: hidden;}}
@@ -1503,11 +1714,26 @@ def render_stage_display():
         .stage-next {{ color:#C9CBD1; font-family:'Inter',sans-serif; font-size: clamp(1rem,2vw,1.6rem);
                       line-height:1.4; }}
         </style>
-        <div class="stage-clock">{clock}</div>
+        <div class="stage-clock" id="ecc-stage-clock">--:--</div>
         <div class="stage-label">Now</div>
         <div class="stage-current">{"(hidden from projector)" if hidden else (cur_text or "Nothing live")}</div>
         <div class="stage-label">Up Next</div>
         <div class="stage-next">{nxt_label}</div>
+        <script>
+        (function() {{
+            function eccUpdateStageClock() {{
+                const el = document.getElementById('ecc-stage-clock');
+                if (!el) return;
+                let h = new Date().getHours();
+                const m = new Date().getMinutes();
+                const ampm = h >= 12 ? 'PM' : 'AM';
+                h = h % 12; if (h === 0) h = 12;
+                el.textContent = h + ':' + String(m).padStart(2, '0') + ' ' + ampm;
+            }}
+            eccUpdateStageClock();
+            setInterval(eccUpdateStageClock, 1000);
+        }})();
+        </script>
         """)
 
     if hasattr(st, "fragment"):
@@ -1722,7 +1948,7 @@ def sidebar():
             if st.button(label, key=f"nav_{label}", use_container_width=True):
                 st.session_state.page = label
         st.markdown("###### LIBRARY")
-        for label in ["Song Library", "Rapid Upload", "Bible", "Saved Services"]:
+        for label in ["Song Library", "Import Lyrics", "Import Slides", "Rapid Upload", "Bible", "Saved Services"]:
             if st.button(label, key=f"nav_{label}", use_container_width=True):
                 st.session_state.page = label
         st.markdown("###### SETTINGS")
@@ -2237,13 +2463,10 @@ def page_service_builder():
     if not items:
         st.caption("Nothing added yet — build the flow above.")
     else:
-        if DND_AVAILABLE:
-            st.caption("Drag any card by its edge to reorder — or use the ↑/↓ buttons.")
-        else:
-            st.caption("Add `streamlit-dnd` to requirements.txt to drag-reorder — the ↑/↓ buttons work either way.")
+        st.caption("Use ↑/↓ to reorder — instant, reliable, no dragging required.")
         with st.container(key="service_items"):
             for i, item in enumerate(items):
-                icon = {"song": "🎵", "bible": "📖", "custom": "🖼", "announcement": "📣"}.get(item["type"], "•")
+                icon = {"song": "🎵", "bible": "📖", "custom": "🖼", "announcement": "📣", "imagedeck": "🖼"}.get(item["type"], "•")
                 with st.container(border=True):
                     c1, c2 = st.columns([5, 2])
                     c1.markdown(f"**{i+1:02d} — {icon} {item['title']}**")
@@ -2258,15 +2481,6 @@ def page_service_builder():
                         if b3.button("🗑", key=f"del_{i}"):
                             items.pop(i)
                             update_service_items(sid, items); st.rerun()
-        if DND_AVAILABLE:
-            # Must be called AFTER the container above is drawn, so the
-            # component can find it. A drag only *proposes* a move — nothing
-            # changes until we apply it and rerun, right here.
-            dnd_event = dnd("service_items", indicator="line", color=ACCENT)
-            if dnd_event:
-                apply_move(dnd_event, {"service_items": items})
-                update_service_items(sid, items)
-                st.rerun()
 
     if items:
         st.write("")
@@ -2304,16 +2518,37 @@ def page_presentation():
 
     with left:
         st.markdown("**Service Order**")
+        st.caption("Use ▲/▼ to reorder — the change applies immediately.")
         if adhoc:
             st.caption("Paused while presenting a verse directly.")
             if st.button("↩ Return to service", use_container_width=True, disabled=not sid):
                 exit_adhoc_present()
                 st.rerun()
         for i, item in enumerate(items):
-            icon = {"song": "🎵", "bible": "📖", "custom": "🖼", "announcement": "📣"}.get(item["type"], "•")
+            icon = {"song": "🎵", "bible": "📖", "custom": "🖼", "announcement": "📣", "imagedeck": "🖼"}.get(item["type"], "•")
             active = " active" if (not adhoc and i == state["item_index"]) else ""
-            if st.button(f"{i+1:02d} {icon} {item['title']}", key=f"go_{i}", use_container_width=True):
+            row_go, row_up, row_down = st.columns([5, 1, 1])
+            if row_go.button(f"{i+1:02d} {icon} {item['title']}", key=f"go_{i}", use_container_width=True):
                 set_state(item_index=i, slide_index=0, cleared=0, black=0, adhoc_active=0)
+                st.rerun()
+            if row_up.button("▲", key=f"pres_up_{i}", use_container_width=True, disabled=(i == 0)):
+                items[i - 1], items[i] = items[i], items[i - 1]
+                update_service_items(sid, items)
+                # Keep the currently-live item pointed at correctly if it moved.
+                if not adhoc:
+                    if state["item_index"] == i:
+                        set_state(item_index=i - 1)
+                    elif state["item_index"] == i - 1:
+                        set_state(item_index=i)
+                st.rerun()
+            if row_down.button("▼", key=f"pres_down_{i}", use_container_width=True, disabled=(i == len(items) - 1)):
+                items[i + 1], items[i] = items[i], items[i + 1]
+                update_service_items(sid, items)
+                if not adhoc:
+                    if state["item_index"] == i:
+                        set_state(item_index=i + 1)
+                    elif state["item_index"] == i + 1:
+                        set_state(item_index=i)
                 st.rerun()
 
     if adhoc:
@@ -2334,32 +2569,59 @@ def page_presentation():
         t = THEMES[theme]
         cur_ref, cur_text, cur_text2 = slides[slide_index] if slides else (None, "Nothing selected", None)
         hidden = state["black"] or state["cleared"]
-        if cur_text2 and not hidden:
+
+        # Match the real projector background — a preset gradient, a custom
+        # uploaded photo, or the flat theme color if none is set — instead of
+        # always showing flat theme color here, which didn't match what was
+        # actually live on the projector.
+        bg_key = state.get("background")
+        if bg_key == CUSTOM_BACKGROUND_KEY:
+            custom_data = get_settings().get("custom_background_data")
+            card_bg = f"center/cover no-repeat url('{custom_data}')" if custom_data else t["bg"]
+        else:
+            bg_def = BACKGROUNDS.get(bg_key) if bg_key else None
+            card_bg = bg_def["css"] if bg_def else t["bg"]
+        text_shadow = "text-shadow:0 2px 18px rgba(0,0,0,0.55);" if bg_key and bg_key != "None (theme color)" else ""
+        live_scale = state.get("font_scale") or 1.0
+
+        if cur_text.startswith(IMG_SLIDE_PREFIX) and not hidden:
+            img_src = cur_text[len(IMG_SLIDE_PREFIX):]
+            render_html(
+                f"""<div style="background:#000;border-radius:16px;overflow:hidden;
+                min-height:260px;border:1px solid {CARD_BORDER};display:flex;align-items:center;justify-content:center;">
+                <img src="{img_src}" style="max-width:100%;max-height:260px;object-fit:contain;" />
+                </div>"""
+            )
+        elif cur_text2 and not hidden:
             top_dir = "rtl" if _looks_arabic(cur_text) else "ltr"
             bottom_dir = "rtl" if _looks_arabic(cur_text2) else "ltr"
             render_html(
-                f"""<div style="background:{t['bg']};border-radius:16px;overflow:hidden;
+                f"""<div style="background:{card_bg};border-radius:16px;overflow:hidden;
                 min-height:260px;border:1px solid {CARD_BORDER};display:flex;flex-direction:column;">
                 <div dir="{top_dir}" style="flex:1;padding:1.2rem;display:flex;flex-direction:column;
                 align-items:center;justify-content:center;text-align:center;border-bottom:1px solid {CARD_BORDER};">
-                {f'<div style="color:{t["sub"]};letter-spacing:.1em;text-transform:uppercase;margin-bottom:0.6rem;font-family:{t["font"]};font-size:0.8rem;">{cur_ref}</div>' if cur_ref else ''}
-                <div style="color:{t['fg']};font-family:{t['font']};font-size:1.2rem;font-weight:700;white-space:pre-line;line-height:1.4;">{cur_text}</div>
+                {f'<div style="color:{t["sub"]};letter-spacing:.1em;text-transform:uppercase;margin-bottom:0.6rem;font-family:{t["font"]};font-size:0.8rem;{text_shadow}">{cur_ref}</div>' if cur_ref else ''}
+                <div style="color:{t['fg']};font-family:{t['font']};font-size:1.2rem;font-weight:700;white-space:pre-line;line-height:1.4;{text_shadow}">{cur_text}</div>
                 </div>
                 <div dir="{bottom_dir}" style="flex:1;padding:1.2rem;display:flex;align-items:center;justify-content:center;text-align:center;">
-                <div style="color:{t['fg']};font-family:{t['font']};font-size:1.1rem;font-weight:700;white-space:pre-line;line-height:1.4;">{cur_text2}</div>
+                <div style="color:{t['fg']};font-family:{t['font']};font-size:1.1rem;font-weight:700;white-space:pre-line;line-height:1.4;{text_shadow}">{cur_text2}</div>
                 </div>
                 </div>"""
             )
             st.caption("Bilingual split screen — top/bottom shown exactly as on the projector.")
         else:
+            display_text = "(hidden from projector)" if hidden else (
+                "(image slide)" if cur_text.startswith(IMG_SLIDE_PREFIX) else cur_text
+            )
             render_html(
-                f"""<div style="background:{t['bg']};border-radius:16px;padding:2.4rem 1.6rem;
+                f"""<div style="background:{card_bg};border-radius:16px;padding:2.4rem 1.6rem;
                 min-height:260px;display:flex;flex-direction:column;align-items:center;justify-content:center;
                 text-align:center;border:1px solid {CARD_BORDER};">
-                {f'<div style="color:{t["sub"]};letter-spacing:.1em;text-transform:uppercase;margin-bottom:1rem;font-family:{t["font"]};">{cur_ref}</div>' if cur_ref else ''}
-                <div style="color:{t['fg']};font-family:{t['font']};font-size:1.5rem;font-weight:700;white-space:pre-line;line-height:1.4;">{cur_text if not hidden else "(hidden from projector)"}</div>
+                {f'<div style="color:{t["sub"]};letter-spacing:.1em;text-transform:uppercase;margin-bottom:1rem;font-family:{t["font"]};{text_shadow}">{cur_ref}</div>' if cur_ref else ''}
+                <div style="color:{t['fg']};font-family:{t['font']};font-size:calc(1.5rem * {live_scale});font-weight:700;white-space:pre-line;line-height:1.4;{text_shadow}">{display_text}</div>
                 </div>"""
             )
+        st.caption("This mirrors the projector exactly, including the live background and font size.")
         st.markdown("**Up Next**")
         nxt_ref, nxt_text, nxt_text2 = (None, "—", None)
         if slides and slide_index + 1 < len(slides):
@@ -2369,7 +2631,8 @@ def page_presentation():
             if nslides:
                 nxt_ref, nxt_text, nxt_text2 = nslides[0]
             nxt_text = f"(Next item) {items[item_index + 1]['title']} — {nxt_text}"
-        st.markdown(f'<div class="ecc-card">{(nxt_ref + " — ") if nxt_ref else ""}{nxt_text}{(" / " + nxt_text2) if nxt_text2 else ""}</div>', unsafe_allow_html=True)
+        nxt_display = "(image slide)" if (nxt_text or "").startswith(IMG_SLIDE_PREFIX) else nxt_text
+        st.markdown(f'<div class="ecc-card">{(nxt_ref + " — ") if nxt_ref else ""}{nxt_display}{(" / " + nxt_text2) if nxt_text2 else ""}</div>', unsafe_allow_html=True)
 
     with right:
         st.markdown("**Controls**")
@@ -2405,10 +2668,6 @@ def page_presentation():
             set_state(black=0 if is_black else 1); st.rerun()
         if st.button("Clear Screen", use_container_width=True):
             set_state(cleared=1); st.rerun()
-        if st.button("✕ Exit Presentation", use_container_width=True):
-            set_state(cleared=1, live=0, adhoc_active=0)
-            st.session_state.page = "Dashboard"
-            st.rerun()
         st.write("")
         st.selectbox("Theme", list(THEMES.keys()), index=list(THEMES.keys()).index(theme), key="live_theme",
                      on_change=lambda: set_state(theme=st.session_state.live_theme))
@@ -2424,17 +2683,7 @@ def page_presentation():
             set_state(font_scale=round(min(2.0, cur_scale + 0.1), 2))
             st.rerun()
         fpct.markdown(f"<div style='text-align:center;padding-top:0.4rem;'>{int(cur_scale*100)}%</div>", unsafe_allow_html=True)
-
-        st.caption("Preview at this size (what the projector shows)")
-        preview_hidden = bool(state.get("black") or state.get("cleared"))
-        preview_text = "(hidden from projector)" if preview_hidden else (cur_text or "Nothing live")
-        render_html(
-            f"""<div style="background:{t['bg']};border-radius:10px;padding:1rem;max-height:170px;overflow:auto;
-            display:flex;align-items:center;justify-content:center;text-align:center;border:1px solid {CARD_BORDER};">
-            <div style="color:{t['fg']};font-family:{t['font']};font-weight:700;white-space:pre-line;line-height:1.35;
-            font-size:calc(1.3rem * {cur_scale});">{preview_text}</div>
-            </div>"""
-        )
+        st.caption("The \"Current\" panel in the center already mirrors the projector at this size and background — no separate preview needed.")
 
     st.caption("⌨️ Shortcuts: Space, → or ↑ = Next · ← or ↓ = Prev · B = toggle Black screen")
     components.html(
@@ -2476,6 +2725,130 @@ def page_presentation():
         """,
         height=0,
     )
+
+
+def page_import_lyrics():
+    st.markdown("### Import Lyrics")
+    st.caption(
+        "Paste lyrics copied straight from a lyrics site — title, artist, and the \"Overview / Lyrics\" "
+        "labels are detected and stripped automatically. A new slide starts every time one fills up "
+        "(4 lines), using however many slides the song needs. This is the only way to add a song here — "
+        "no file upload."
+    )
+    st.caption(
+        "Expected paste format:\n\n"
+        "```\nSong Title\nSong by Artist Name ‧ Year\n\nOverview\nLyrics\n<lyrics...>\n```"
+    )
+
+    raw = st.text_area("Paste lyrics here", height=320, key="paste_lyrics_input",
+                        placeholder="Fall On Me\nSong by NEEDTOBREATHE ‧ 2023\n\nOverview\nLyrics\nYou were there to pick me up\n...")
+
+    max_lines = st.slider("Lines per slide", 2, 8, 4, key="paste_lyrics_max_lines",
+                           help="How many lines fill a slide before a new one starts.")
+
+    category = st.selectbox("Category", ["Worship", "Hymn", "Christmas", "Youth", "Other"], key="paste_lyrics_category")
+    tags = st.text_input("Tags (optional)", key="paste_lyrics_tags")
+
+    if raw.strip():
+        title, artist, year, slides = parse_pasted_lyrics(raw, max_lines_per_slide=max_lines)
+        st.write("")
+        st.markdown(f"**{title}**" + (f" — {artist}" if artist else "") + (f" ({year})" if year else ""))
+        st.caption(f"{len(slides)} slide(s) will be created.")
+        with st.expander("Preview slides", expanded=True):
+            for i, s in enumerate(slides):
+                st.markdown(f'<div class="ecc-card"><b>Slide {i+1}</b><br>{s}</div>'.replace("\n", "<br>"), unsafe_allow_html=True)
+
+        if st.button("💾 Save Song", use_container_width=True, type="primary"):
+            song_id, saved_slides = add_song_with_slides(title, artist, category, tags, slides)
+            st.success(f"Saved \"{title}\" with {len(saved_slides)} slides to your library.")
+            if turso_configured():
+                try:
+                    turso_push_song(song_id, title, artist, category, tags, json.dumps(saved_slides))
+                    st.success("Also synced to Turso.")
+                except Exception as e:
+                    st.warning(f"Saved locally, but the Turso sync failed: {e}")
+            st.session_state.paste_lyrics_input = ""
+            st.rerun()
+    else:
+        st.info("Paste a song's lyrics above to see the slide preview.")
+
+
+def page_import_slides():
+    st.markdown("### Import Slides (Google Slides PDF)")
+    st.caption(
+        "Export your Google Slides deck as a PDF (File → Download → PDF), then upload it here — each "
+        "page becomes its own full-bleed slide, in the original slide's look, ready to add to a service."
+    )
+    if not PYMUPDF_AVAILABLE:
+        st.warning("This needs the `PyMuPDF` package — add `PyMuPDF` to requirements.txt to enable it.")
+        return
+
+    pdf_file = st.file_uploader("Google Slides PDF export", type=["pdf"], key="slides_pdf_uploader")
+    deck_title = st.text_input("Deck title", value=(pdf_file.name.rsplit(".", 1)[0] if pdf_file else ""),
+                                key="slides_pdf_title")
+
+    if pdf_file is not None:
+        if st.button("Process PDF into slides", use_container_width=True):
+            try:
+                pdf_bytes = pdf_file.read()
+                doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+                images = []
+                for page in doc:
+                    pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))  # 2x for a crisp projector image
+                    png_bytes = pix.tobytes("png")
+                    data_uri = "data:image/png;base64," + base64.b64encode(png_bytes).decode("ascii")
+                    images.append(data_uri)
+                doc.close()
+                st.session_state["pending_deck_images"] = images
+                st.session_state["pending_deck_title"] = deck_title or "Untitled Deck"
+                st.success(f"Separated into {len(images)} slide(s). Review below, then save.")
+            except Exception as e:
+                st.error(f"Couldn't process that PDF: {e}")
+
+    pending = st.session_state.get("pending_deck_images")
+    if pending:
+        st.write("")
+        st.markdown(f"**Preview — {len(pending)} slide(s)**")
+        cols = st.columns(4)
+        for i, img in enumerate(pending):
+            with cols[i % 4]:
+                st.image(img, caption=f"Slide {i+1}", use_container_width=True)
+        st.write("")
+        if st.button("💾 Save Deck to Library", use_container_width=True, type="primary"):
+            title = st.session_state.get("pending_deck_title") or "Untitled Deck"
+            add_slide_deck(title, "google_slides_pdf", pending)
+            st.success(f"Saved \"{title}\" to your library — add it to a service from Service Builder.")
+            st.session_state.pop("pending_deck_images", None)
+            st.session_state.pop("pending_deck_title", None)
+            st.rerun()
+
+    st.write("")
+    st.markdown("#### Imported decks")
+    decks = get_slide_decks()
+    if not decks:
+        st.caption("No slide decks imported yet.")
+    for d in decks:
+        images = json.loads(d["slides"])
+        with st.container(border=True):
+            st.markdown(f"**{d['title']}** — {len(images)} slide(s)")
+            b1, b2, b3 = st.columns(3)
+            if b1.button("Add to today's service", key=f"deck_add_{d['id']}", use_container_width=True):
+                sid = ensure_active_service()
+                service = get_service(sid) if sid else None
+                items = json.loads(service["items"]) if service else []
+                items.append(make_deck_item(d))
+                update_service_items(sid, items)
+                st.success(f"Added \"{d['title']}\" to today's service.")
+            if turso_configured():
+                if b2.button("☁️ Sync", key=f"deck_sync_{d['id']}", use_container_width=True):
+                    try:
+                        turso_push_slide_deck(d["id"], d["title"], d["source"], d["slides"])
+                        st.success("Synced.")
+                    except Exception as e:
+                        st.error(f"Sync failed: {e}")
+            if b3.button("🗑 Delete", key=f"deck_del_{d['id']}", use_container_width=True):
+                delete_slide_deck(d["id"])
+                st.rerun()
 
 
 def page_rapid_upload():
@@ -2734,21 +3107,57 @@ def page_display_settings():
         with upcol2:
             blur = st.slider("Blur", 0, 25, 10, key="bg_blur")
         dim = st.slider("Dim (lower = darker)", 0.2, 1.0, 0.55, key="bg_dim")
-        if photo is not None and st.button("Process & Use as Background", use_container_width=True):
+
+        # Show the raw upload immediately, before anything is saved to the
+        # database — nothing is written yet at this point, this is purely a
+        # "here's what you just picked" confirmation.
+        if photo is not None:
+            st.markdown("**Preview (not saved yet)**")
+            st.image(photo, caption="Your upload — click below to process and save it", width=300)
+
+        if photo is not None and st.button("💾 Process & Save as Background", use_container_width=True):
             data_uri = save_custom_background(photo, blur_radius=blur, dim_factor=dim)
             if data_uri:
                 set_settings(custom_background_data=data_uri, default_background=CUSTOM_BACKGROUND_KEY)
                 set_state(background=CUSTOM_BACKGROUND_KEY)
-                st.success("Uploaded, processed, and set as the live background.")
+                st.success("Saved locally and set as the live background.")
+                if turso_configured():
+                    try:
+                        settings_now = get_settings()
+                        turso_push_background(settings_now["default_theme"], CUSTOM_BACKGROUND_KEY,
+                                               data_uri, settings_now.get("church_name"))
+                        st.success("Also synced to Turso.")
+                    except Exception as e:
+                        st.warning(f"Saved locally, but the Turso sync failed: {e}")
                 st.rerun()
             else:
                 st.error("Couldn't process that image.")
+
         if settings.get("custom_background_data"):
+            st.write("")
+            st.markdown("**Saved background**")
             st.image(settings["custom_background_data"], caption="Current custom background (processed)", width=300)
             if st.button("Use this custom photo now", key="use_custom_bg"):
                 set_settings(default_background=CUSTOM_BACKGROUND_KEY)
                 set_state(background=CUSTOM_BACKGROUND_KEY)
                 st.rerun()
+
+    st.write("")
+    st.markdown("#### ☁️ Cloud Sync")
+    if not turso_configured():
+        st.caption("Set up Turso (Church Settings) to enable cloud sync and backups.")
+    else:
+        st.caption(
+            "Push everything — songs, saved services, the current background, and any imported "
+            "slide decks — to Turso in one go. Nothing syncs automatically; this button is the only "
+            "thing that triggers it."
+        )
+        if st.button("☁️ Sync All to Cloud", use_container_width=True, type="primary"):
+            try:
+                n_songs, n_services, n_decks = turso_sync_all()
+                st.success(f"Synced {n_songs} song(s), {n_services} service(s), the background, and {n_decks} slide deck(s).")
+            except Exception as e:
+                st.error(f"Sync failed: {e}")
 
     st.write("")
     st.markdown("#### Preview")
@@ -2814,6 +3223,8 @@ def main():
         "Service Builder": page_service_builder,
         "Presentation": page_presentation,
         "Song Library": page_song_library,
+        "Import Lyrics": page_import_lyrics,
+        "Import Slides": page_import_slides,
         "Rapid Upload": page_rapid_upload,
         "Saved Services": page_saved_services,
         "Church Settings": page_church_settings,

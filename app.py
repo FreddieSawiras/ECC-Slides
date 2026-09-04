@@ -140,6 +140,12 @@ TURSO_SLIDE_DECKS_SCHEMA = """CREATE TABLE IF NOT EXISTS slide_decks(
     id INTEGER PRIMARY KEY, title TEXT, source TEXT, slides TEXT, updated_at TEXT
 )"""
 
+TURSO_BIBLE_VERSES_SCHEMA = """CREATE TABLE IF NOT EXISTS bible_verses(
+    id INTEGER PRIMARY KEY, book TEXT, chapter INTEGER, verse INTEGER,
+    text TEXT, translation TEXT, book_number INTEGER,
+    UNIQUE(book, chapter, verse, translation)
+)"""
+
 
 def turso_push_song(song_id, title, artist, category, tags, slides_json):
     """One explicit push for one song — this is the only network call that
@@ -233,11 +239,38 @@ def turso_push_slide_deck(deck_id, title, source, slides_json):
     ])
 
 
+def turso_push_bible_verses():
+    """Pushes every locally-stored Bible verse (every imported translation)
+    to Turso. Batched into chunks — a full translation can be tens of
+    thousands of verses, too many to safely send as one request — but still
+    only runs when explicitly triggered, same as everything else here."""
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT book, chapter, verse, text, translation, book_number FROM bible_verses"
+    ).fetchall()
+    conn.close()
+    if not rows:
+        return 0
+    BATCH = 300
+    for i in range(0, len(rows), BATCH):
+        batch = rows[i:i + BATCH]
+        statements = [(TURSO_BIBLE_VERSES_SCHEMA, None)] if i == 0 else []
+        for r in batch:
+            statements.append((
+                "INSERT OR REPLACE INTO bible_verses(book, chapter, verse, text, translation, book_number) "
+                "VALUES (?,?,?,?,?,?)",
+                (r["book"], r["chapter"], r["verse"], r["text"], r["translation"], r["book_number"])
+            ))
+        turso_pipeline(statements, timeout=30)
+    return len(rows)
+
+
 def turso_sync_all():
     """The single 'master sync' button: pushes every song, every saved
-    service, the current background/display settings, and every imported
-    slide deck to Turso in one pass. Still entirely explicit — only runs
-    when the user clicks it, never on a timer or on page load."""
+    service, the current background/display settings, every imported slide
+    deck, and every imported Bible translation to Turso in one pass. Still
+    entirely explicit — only runs when the user clicks it, never on a timer
+    or on page load."""
     n_songs = turso_push_all_songs()
 
     services = get_services()
@@ -268,10 +301,52 @@ def turso_sync_all():
         turso_pipeline(statements, timeout=30)
     n_decks = len(decks)
 
-    return n_songs, n_services, n_decks
+    n_verses = turso_push_bible_verses()
+
+    return n_songs, n_services, n_decks, n_verses
 
 
-ACCENT = "#C8A24A"          # warm gold — ECC accent
+def _is_turso_space_error(e):
+    """True if an exception from a Turso call looks like the database ran
+    out of storage space, as opposed to a network hiccup, bad auth, etc."""
+    msg = str(e).lower()
+    return any(s in msg for s in (
+        "disk is full", "sqlite_full", "database or disk is full",
+        "no space", "quota", "storage limit", "database size limit",
+    ))
+
+
+def turso_delete_oldest_deck():
+    """Deletes the single oldest imported slide deck from Turso (by
+    created_at, ascending) to free up space — local copy is left untouched.
+    Returns the deleted deck's title, or None if there were no decks."""
+    decks = get_slide_decks()  # local rows, ordered by created_at DESC
+    if not decks:
+        return None
+    oldest = decks[-1]
+    turso_pipeline([(TURSO_SLIDE_DECKS_SCHEMA, None), ("DELETE FROM slide_decks WHERE id=?", (oldest["id"],))])
+    return oldest["title"]
+
+
+def turso_delete_oldest_service():
+    """Deletes the single oldest saved service from Turso (by service_date,
+    ascending) to free up space — local copy is left untouched. Returns the
+    deleted service's name, or None if there were no services."""
+    services = get_services()  # local rows, ordered by service_date DESC, id DESC
+    if not services:
+        return None
+    oldest = services[-1]
+    turso_pipeline([(TURSO_SERVICES_SCHEMA, None), ("DELETE FROM services WHERE id=?", (oldest["id"],))])
+    return oldest["name"]
+
+
+ACCENT = "#C8A24A"          # warm gold — ECC accent, reserved for brand/primary actions
+
+# Semantic status colors — kept separate from ACCENT so gold stays reserved
+# for brand/primary actions and doesn't double as a state indicator.
+LIVE_GREEN = "#3FAE6A"      # on air / live
+BLACK_RED = "#B0463F"       # black screen / hidden
+PAUSE_AMBER = "#D19A3D"     # paused / standby
 
 # Basic shared login. This is a single shared password (not per-user
 # accounts), so treat it as a light front-door lock rather than real
@@ -280,9 +355,9 @@ LOGIN_USERNAME = "ECC"
 LOGIN_PASSWORD = "5015"
 
 _DB_INITIALIZED = False  # see main() — makes init_db() run once per process, not once per click
-BG = "#0B0C0F"               # near-black
-CARD = "#15171C"             # charcoal card
-CARD_BORDER = "#24262C"
+BG = "#0D0C0A"               # warm near-black (cinematic warm dark vs. cold tech dark)
+CARD = "#17161A"             # charcoal card, warmed to match BG
+CARD_BORDER = "#26252A"
 TEXT_PRIMARY = "#F4F3EF"
 TEXT_MUTED = "#9A9CA3"
 
@@ -356,41 +431,11 @@ BACKGROUNDS = {
 
 SONG_CATEGORIES = ["Worship", "Praise", "Hymns", "Contemporary"]
 
-# A small public-domain (KJV) Bible sample. Real deployments should load a
-# properly licensed / public-domain translation file — see note in the
-# Bible tab. Keeping this list short is intentional (see item 23 of spec:
-# do not assume every translation may be legally bundled).
-BIBLE_SAMPLE = {
-    "John": {
-        3: {
-            16: "For God so loved the world, that he gave his only begotten Son, that whosoever believeth in him should not perish, but have everlasting life.",
-            17: "For God sent not his Son into the world to condemn the world; but that the world through him might be saved.",
-            18: "He that believeth on him is not condemned: but he that believeth not is condemned already, because he hath not believed in the name of the only begotten Son of God.",
-        }
-    },
-    "Psalm": {
-        23: {
-            1: "The LORD is my shepherd; I shall not want.",
-            2: "He maketh me to lie down in green pastures: he leadeth me beside the still waters.",
-            3: "He restoreth my soul: he leadeth me in the paths of righteousness for his name's sake.",
-            4: "Yea, though I walk through the valley of the shadow of death, I will fear no evil: for thou art with me; thy rod and thy staff they comfort me.",
-        }
-    },
-    "Romans": {
-        8: {
-            1: "There is therefore now no condemnation to them which are in Christ Jesus, who walk not after the flesh, but after the Spirit.",
-            28: "And we know that all things work together for good to them that love God, to them who are the called according to his purpose.",
-        }
-    },
-    "Philippians": {
-        4: {
-            6: "Be careful for nothing; but in every thing by prayer and supplication with thanksgiving let your requests be made known unto God.",
-            7: "And the peace of God, which passeth all understanding, shall keep your hearts and minds through Christ Jesus.",
-            13: "I can do all things through Christ which strengtheneth me.",
-        }
-    },
-}
-BIBLE_TRANSLATION_LABEL = "KJV (Public Domain)"
+# Intentionally empty — this app no longer ships any built-in sample Bible
+# text. Load a translation your church has the rights to use from Church
+# Settings → Import Bible Text.
+BIBLE_SAMPLE = {}
+BIBLE_TRANSLATION_LABEL = "KJV (Public Domain)"  # legacy label — used only to clean up old sample data below
 
 # Canonical book order (standard 66-book Protestant order) used to line up the
 # same passage across translations that name books differently (e.g. an
@@ -521,6 +566,19 @@ def init_db():
     except sqlite3.OperationalError:
         pass  # column already exists (older database)
 
+    # One-time cleanup: remove any demo songs / sample Bible verses that a
+    # previous version of this app seeded into an already-existing database.
+    # This never touches songs/verses you added or imported yourself.
+    if LEGACY_DEMO_SONG_TITLES:
+        c.execute(
+            f"DELETE FROM songs WHERE title IN ({','.join('?' for _ in LEGACY_DEMO_SONG_TITLES)}) AND artist='Traditional' "
+            f"OR (title IN ({','.join('?' for _ in LEGACY_DEMO_SONG_TITLES)}) AND artist IN "
+            f"('Chris Tomlin','Housefires','Hillsong Worship'))",
+            LEGACY_DEMO_SONG_TITLES + LEGACY_DEMO_SONG_TITLES
+        )
+    c.execute("DELETE FROM bible_verses WHERE translation=?", (BIBLE_TRANSLATION_LABEL,))
+    conn.commit()
+
     if c.execute("SELECT COUNT(*) FROM settings").fetchone()[0] == 0:
         c.execute("INSERT INTO settings(id, church_name, default_theme, default_background) "
                   "VALUES (1, 'ECC', 'Modern Worship', 'None (theme color)')")
@@ -584,19 +642,15 @@ def init_db():
     conn.close()
 
 
+# Legacy demo song titles — kept only so init_db can clean out any of these
+# that were seeded into an older local database; no longer seeded fresh.
+LEGACY_DEMO_SONG_TITLES = [
+    "Amazing Grace", "How Great Thou Art", "Holy Forever", "Build My Life", "What A Beautiful Name",
+]
+
+
 def seed_songs(conn):
-    demo = [
-        ("Amazing Grace", "Traditional", "Hymns",
-         "Amazing grace, how sweet the sound\nThat saved a wretch like me\n\nI once was lost, but now am found\nWas blind but now I see\n\n'Twas grace that taught my heart to fear\nAnd grace my fears relieved"),
-        ("How Great Thou Art", "Traditional", "Hymns",
-         "O Lord my God, when I in awesome wonder\nConsider all the worlds Thy hands have made\n\nThen sings my soul, my Savior God, to Thee\nHow great Thou art, how great Thou art"),
-        ("Holy Forever", "Chris Tomlin", "Contemporary",
-         "The sun will rise and the sun will set\nBut Your love, Your love won't run out\n\nHoly, holy, holy is the Lord\nWe worship You forever"),
-        ("Build My Life", "Housefires", "Worship",
-         "Worthy of every song we could ever sing\nWorthy of all the praise we could ever bring\n\nHoly, there is no one like You\nThere is none besides You"),
-        ("What A Beautiful Name", "Hillsong Worship", "Praise",
-         "You were the Word at the beginning\nOne with God the Lord Most High\n\nWhat a beautiful Name it is\nWhat a beautiful Name it is"),
-    ]
+    demo = []  # intentionally empty — no sample songs ship with this app anymore
     for title, artist, category, lyrics in demo:
         slides = [s.strip() for s in lyrics.split("\n\n") if s.strip()]
         conn.execute(
@@ -652,6 +706,42 @@ def add_song(title, artist, category, tags, lyrics):
     return song_id, slides
 
 
+def get_song_by_title(title):
+    """Case-insensitive exact-title lookup — used so adding a song that
+    already exists overwrites it instead of erroring or duplicating it."""
+    conn = get_conn()
+    r = conn.execute("SELECT * FROM songs WHERE LOWER(title)=LOWER(?)", (title.strip(),)).fetchone()
+    conn.close()
+    return r
+
+
+def upsert_song(title, artist, category, tags, slides):
+    """Save a song by its already-split slides. If a song with the same
+    title (case-insensitive) already exists, its slides/artist/category/tags
+    are overwritten in place instead of erroring or creating a duplicate row.
+    Returns (song_id, slides, was_overwrite)."""
+    slides = slides or ["(empty)"]
+    existing = get_song_by_title(title)
+    conn = get_conn()
+    if existing:
+        conn.execute(
+            "UPDATE songs SET artist=?, category=?, tags=?, slides=? WHERE id=?",
+            (artist, category, tags, json.dumps(slides), existing["id"])
+        )
+        song_id = existing["id"]
+        was_overwrite = True
+    else:
+        cur = conn.execute(
+            "INSERT INTO songs(title, artist, category, tags, slides, favorite, last_used) VALUES (?,?,?,?,?,0,?)",
+            (title, artist, category, tags, json.dumps(slides), now())
+        )
+        song_id = cur.lastrowid
+        was_overwrite = False
+    conn.commit()
+    conn.close()
+    return song_id, slides, was_overwrite
+
+
 def add_song_with_slides(title, artist, category, tags, slides):
     """Like add_song, but takes already-split slides directly instead of
     re-splitting a raw lyrics blob on blank lines — used by the paste-lyrics
@@ -668,7 +758,16 @@ def add_song_with_slides(title, artist, category, tags, slides):
     return song_id, slides
 
 
-def parse_pasted_lyrics(raw, max_lines_per_slide=4):
+# Max characters packed onto one slide — sized to stay comfortably readable
+# on a regular TV/projector at normal font size. Lines are packed onto a
+# slide until the NEXT line would push the slide over this budget; that line
+# starts a new slide instead. A line is never split mid-way — if a single
+# line alone is longer than the budget, it still gets its own whole slide
+# rather than being cut.
+MAX_SLIDE_CHARS = 220
+
+
+def parse_pasted_lyrics(raw, max_slide_chars=MAX_SLIDE_CHARS):
     """Parses the standard lyrics-site paste format:
 
         Song Title
@@ -679,9 +778,12 @@ def parse_pasted_lyrics(raw, max_lines_per_slide=4):
         <actual lyrics...>
 
     Strips the title/artist/year header and the "Overview"/"Lyrics" section
-    labels, then packs the remaining lines into slides of at most
-    max_lines_per_slide lines each — starting a new slide whenever a slide
-    fills up, and never crossing a blank-line stanza break. Returns
+    labels, then packs the remaining lines onto slides using a character
+    budget sized for a TV/projector (see MAX_SLIDE_CHARS) instead of a fixed
+    line count — a new slide starts whenever the next line would overflow
+    the budget, and a stanza (blank-line) break always starts a fresh slide
+    too. Lines are never split mid-line: if one line alone exceeds the
+    budget, it still becomes its own slide in full. Returns
     (title, artist, year, slides)."""
     lines = raw.splitlines()
 
@@ -720,9 +822,17 @@ def parse_pasted_lyrics(raw, max_lines_per_slide=4):
 
     slides = []
     for stanza in stanzas:
-        for i in range(0, len(stanza), max_lines_per_slide):
-            chunk = stanza[i:i + max_lines_per_slide]
-            slides.append("\n".join(chunk))
+        current_lines, current_len = [], 0
+        for line in stanza:
+            line_len = len(line) + (1 if current_lines else 0)  # +1 for the joining newline
+            if current_lines and current_len + line_len > max_slide_chars:
+                slides.append("\n".join(current_lines))
+                current_lines, current_len = [line], len(line)
+            else:
+                current_lines.append(line)
+                current_len += line_len
+        if current_lines:
+            slides.append("\n".join(current_lines))
 
     if not slides:
         slides = ["(empty)"]
@@ -900,21 +1010,61 @@ def set_settings(**kwargs):
 
 IMG_SLIDE_PREFIX = "\x00IMG\x00"  # sentinel: marks a slide's "text" as an image data-URI, not words
 
+# Lines-per-slide baseline at font_scale=1.0, tuned to stay comfortably on a
+# regular TV/projector. As the operator increases font size, this is divided
+# down so each slide holds fewer lines/words instead of overflowing and
+# forcing a scrollbar — the extra lines spill onto additional slides rather
+# than ever being cut mid-line.
+BASE_MAX_LINES_PER_SLIDE = 6
 
-def item_slides(item):
+
+def _wrap_text_lines(text, max_lines):
+    """Split `text` into chunks of at most max_lines lines each, always
+    breaking on a full line — never mid-line. Returns a list of chunk
+    strings (length 1 if it already fits)."""
+    lines = text.split("\n")
+    if len(lines) <= max_lines:
+        return [text]
+    return ["\n".join(lines[i:i + max_lines]) for i in range(0, len(lines), max_lines)]
+
+
+def item_slides(item, font_scale=1.0):
     """Return list of (reference_or_none, text, secondary_text_or_None) for a service item.
     For imported slide decks (Google Slides PDF import), each "text" is an
     image data-URI prefixed with IMG_SLIDE_PREFIX — renderers check for that
-    prefix and draw an <img> full-bleed instead of styled text."""
+    prefix and draw an <img> full-bleed instead of styled text.
+
+    font_scale reflows plain-text slides (song lyrics, custom slides,
+    announcements, single-language Bible verses) so they keep fitting on
+    screen as the live font size grows: instead of overflowing and causing a
+    scrollbar, a slide with too many lines for the current font size is
+    split into consecutive slides — a full line is always kept together,
+    never cut in half. Image slides and bilingual split-screen slides are
+    left as-is (their own layouts already handle sizing)."""
     if item["type"] == "song":
-        return [(None, s, None) for s in item["slides"]]
-    if item["type"] == "bible":
-        return [(v["ref"], v["text"], v.get("text2")) for v in item["slides"]]
-    if item["type"] in ("custom", "announcement"):
-        return [(None, item["slides"][0] if item["slides"] else "", None)]
-    if item["type"] == "imagedeck":
+        raw = [(None, s, None) for s in item["slides"]]
+    elif item["type"] == "bible":
+        raw = [(v["ref"], v["text"], v.get("text2")) for v in item["slides"]]
+    elif item["type"] in ("custom", "announcement"):
+        raw = [(None, item["slides"][0] if item["slides"] else "", None)]
+    elif item["type"] == "imagedeck":
         return [(None, IMG_SLIDE_PREFIX + img, None) for img in item.get("images", [])]
-    return [(None, "", None)]
+    else:
+        return [(None, "", None)]
+
+    font_scale = font_scale or 1.0
+    if font_scale <= 1.0:
+        return raw
+
+    max_lines = max(1, round(BASE_MAX_LINES_PER_SLIDE / font_scale))
+    expanded = []
+    for ref, text, text2 in raw:
+        if text2 or not text or text.startswith(IMG_SLIDE_PREFIX):
+            expanded.append((ref, text, text2))
+            continue
+        for chunk in _wrap_text_lines(text, max_lines):
+            expanded.append((ref, chunk, None))
+    return expanded
 
 
 def make_song_item(song_row):
@@ -1349,6 +1499,21 @@ def import_songs_csv(rows):
 # STYLES
 # ---------------------------------------------------------------------------
 
+def render_status_badge(state):
+    """
+    Small Live / Black / Paused pill for the top of the Presentation page,
+    using the semantic status colors (kept separate from ACCENT so gold
+    stays reserved for brand/primary actions).
+    """
+    if bool(state.get("black")):
+        cls, label = "ecc-status-black", "Black"
+    elif bool(state.get("cleared")):
+        cls, label = "ecc-status-paused", "Paused"
+    else:
+        cls, label = "ecc-status-live", "Live"
+    render_html(f'<span class="ecc-status {cls}">{label}</span>')
+
+
 def render_html(html_str: str):
     """
     Render a (possibly multi-line) raw HTML string with st.markdown.
@@ -1364,6 +1529,78 @@ def render_html(html_str: str):
     st.markdown("\n".join(line.lstrip() for line in html_str.split("\n")), unsafe_allow_html=True)
 
 
+def _render_splash_screen():
+    """A one-time (per session) full-screen splash: a CSS-built ECC emblem
+    holds for ~2.8s, then fades out over the remaining ~1.2s (4s total),
+    while the app content underneath fades in on a matching delay — so the
+    reveal feels like a cross-fade rather than a hard cut. Pure CSS/HTML, no
+    image asset required, so there's nothing external to host or break."""
+    render_html(f"""
+    <style>
+    html, body {{ background:{BG} !important; }}
+    @keyframes eccSplashHold {{
+        0%   {{ opacity: 1; }}
+        70%  {{ opacity: 1; }}
+        100% {{ opacity: 0; }}
+    }}
+    @keyframes eccLogoPulse {{
+        0%, 100% {{ transform: scale(1); opacity: 0.92; }}
+        50%      {{ transform: scale(1.05); opacity: 1; }}
+    }}
+    @keyframes eccLoadBar {{
+        0%   {{ width: 0%; }}
+        100% {{ width: 100%; }}
+    }}
+    @keyframes eccAppReveal {{
+        0%   {{ opacity: 0; }}
+        100% {{ opacity: 1; }}
+    }}
+    #ecc-splash {{
+        position: fixed; inset: 0; z-index: 999999;
+        background: radial-gradient(circle at 50% 40%, #17190F 0%, {BG} 72%);
+        display: flex; flex-direction: column; align-items: center; justify-content: center;
+        animation: eccSplashHold 4s ease forwards;
+        pointer-events: none;
+    }}
+    #ecc-splash .ecc-splash-badge {{
+        width: 96px; height: 96px; border-radius: 50%;
+        border: 2px solid {ACCENT}; display:flex; align-items:center; justify-content:center;
+        margin-bottom: 1.5rem; animation: eccLogoPulse 1.8s ease-in-out infinite;
+        box-shadow: 0 0 44px {ACCENT}33;
+    }}
+    #ecc-splash .ecc-splash-badge svg {{ width: 44px; height: 44px; }}
+    #ecc-splash .ecc-splash-word {{
+        font-family: 'Inter', sans-serif; font-weight: 800; font-size: 2.1rem;
+        letter-spacing: 0.14em; color: {TEXT_PRIMARY};
+    }}
+    #ecc-splash .ecc-splash-word span {{ color: {ACCENT}; }}
+    #ecc-splash .ecc-splash-tag {{
+        font-family: 'Inter', sans-serif; font-size: 0.76rem; letter-spacing: 0.3em;
+        text-transform: uppercase; color: {TEXT_MUTED}; margin-top: 0.55rem;
+    }}
+    #ecc-splash .ecc-splash-bar {{
+        width: 160px; height: 2px; background: {CARD_BORDER}; margin-top: 1.7rem;
+        border-radius: 2px; overflow: hidden;
+    }}
+    #ecc-splash .ecc-splash-bar-fill {{
+        height: 100%; background: {ACCENT}; animation: eccLoadBar 3.6s ease forwards;
+    }}
+    [data-testid="stAppViewContainer"] {{ animation: eccAppReveal 1.3s ease 2.8s both; }}
+    </style>
+    <div id="ecc-splash">
+        <div class="ecc-splash-badge">
+            <svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+                <path d="M12 2V22M4 9H20" stroke="{ACCENT}" stroke-width="1.6" stroke-linecap="round"/>
+                <circle cx="12" cy="12" r="9.3" stroke="{ACCENT}" stroke-width="1" opacity="0.4"/>
+            </svg>
+        </div>
+        <div class="ecc-splash-word">ECC <span>WORSHIP</span></div>
+        <div class="ecc-splash-tag">Prepare · Present · Worship</div>
+        <div class="ecc-splash-bar"><div class="ecc-splash-bar-fill"></div></div>
+    </div>
+    """)
+
+
 def inject_css():
     render_html(f"""
     <style>    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=Manrope:wght@400;500;700&display=swap');
@@ -1371,12 +1608,13 @@ def inject_css():
     html, body, [class*="css"]  {{
         font-family: 'Inter', -apple-system, sans-serif;
     }}
+    html, body {{ background: {BG} !important; }}
     .stApp {{
         background: {BG};
         color: {TEXT_PRIMARY};
     }}
     section[data-testid="stSidebar"] {{
-        background: #0E0F13;
+        background: linear-gradient(180deg, #101116 0%, #0A0B0E 100%);
         border-right: 1px solid {CARD_BORDER};
         min-width: 290px !important;
         max-width: 290px !important;
@@ -1397,6 +1635,52 @@ def inject_css():
         visibility: hidden !important;
     }}
 
+    /* ---- Premium console chrome: typography, scrollbars, alerts ---- */
+    h1, h2, h3 {{ letter-spacing: -0.01em; font-weight: 800 !important; color: {TEXT_PRIMARY}; }}
+    h4, h5, h6 {{ letter-spacing: 0.01em; font-weight: 700 !important; color: {TEXT_PRIMARY}; }}
+    p, span, label, .stMarkdown {{ color: {TEXT_PRIMARY}; }}
+    [data-testid="stCaptionContainer"], .stCaption {{ color: {TEXT_MUTED} !important; }}
+    ::-webkit-scrollbar {{ width: 10px; height: 10px; }}
+    ::-webkit-scrollbar-track {{ background: {BG}; }}
+    ::-webkit-scrollbar-thumb {{ background: {CARD_BORDER}; border-radius: 8px; }}
+    ::-webkit-scrollbar-thumb:hover {{ background: {ACCENT}66; }}
+    * {{ scrollbar-width: thin; scrollbar-color: {CARD_BORDER} {BG}; }}
+
+    div[data-testid="stAlert"] {{
+        background: {CARD}; border: 1px solid {CARD_BORDER}; border-radius: 12px;
+        color: {TEXT_PRIMARY};
+    }}
+
+    /* Inputs — dark fields with a gold focus ring instead of Streamlit's default red */
+    div[data-baseweb="input"], div[data-baseweb="textarea"], div[data-baseweb="select"] > div {{
+        background: {CARD} !important; border: 1px solid {CARD_BORDER} !important; border-radius: 10px !important;
+        color: {TEXT_PRIMARY} !important; transition: border-color .15s ease, box-shadow .15s ease;
+    }}
+    div[data-baseweb="input"]:focus-within, div[data-baseweb="textarea"]:focus-within,
+    div[data-baseweb="select"]:focus-within > div {{
+        border-color: {ACCENT} !important; box-shadow: 0 0 0 2px {ACCENT}22 !important;
+    }}
+    input, textarea {{ color: {TEXT_PRIMARY} !important; }}
+    input::placeholder, textarea::placeholder {{ color: {TEXT_MUTED} !important; opacity: 0.75; }}
+    div[data-baseweb="popover"] {{ background: {CARD} !important; }}
+    ul[role="listbox"] {{ background: {CARD} !important; border: 1px solid {CARD_BORDER} !important; }}
+    li[role="option"]:hover {{ background: {ACCENT}22 !important; }}
+
+    /* Tabs, expanders, popovers — flatten Streamlit's default look into the console theme */
+    button[data-baseweb="tab"] {{ color: {TEXT_MUTED} !important; font-weight: 600; }}
+    button[data-baseweb="tab"][aria-selected="true"] {{ color: {ACCENT} !important; }}
+    div[data-baseweb="tab-highlight"] {{ background-color: {ACCENT} !important; }}
+    div[data-baseweb="tab-border"] {{ background-color: {CARD_BORDER} !important; }}
+    details, div[data-testid="stExpander"] {{
+        background: {CARD}; border: 1px solid {CARD_BORDER} !important; border-radius: 14px !important;
+        overflow: hidden;
+    }}
+    summary {{ color: {TEXT_PRIMARY} !important; font-weight: 600; }}
+    [data-testid="stPopoverBody"] {{
+        background: {CARD} !important; border: 1px solid {CARD_BORDER} !important; border-radius: 14px !important;
+    }}
+    [data-testid="stCheckbox"] label, [data-testid="stRadio"] label {{ color: {TEXT_PRIMARY} !important; }}
+
     .ecc-wordmark {{
         font-weight: 800; font-size: 1.4rem; letter-spacing: 0.02em;
         color: {TEXT_PRIMARY};
@@ -1404,11 +1688,12 @@ def inject_css():
     .ecc-wordmark span {{ color: {ACCENT}; }}
 
     .ecc-card {{
-        background: {CARD};
+        background: linear-gradient(160deg, {CARD} 0%, #131217 100%);
         border: 1px solid {CARD_BORDER};
         border-radius: 16px;
         padding: 1.4rem 1.6rem;
         margin-bottom: 1rem;
+        box-shadow: 0 6px 24px rgba(0,0,0,0.25);
         transition: all .15s ease;
     }}
     .ecc-card:hover {{ border-color: {ACCENT}55; }}
@@ -1418,6 +1703,7 @@ def inject_css():
         border-radius: 20px;
         padding: 2rem 2.2rem;
         margin-bottom: 1.5rem;
+        box-shadow: 0 10px 36px rgba(0,0,0,0.35);
     }}
     .ecc-muted {{ color: {TEXT_MUTED}; font-size: 0.88rem; }}
     .ecc-label {{
@@ -1432,19 +1718,74 @@ def inject_css():
     .stButton>button {{
         border-radius: 10px; border: 1px solid {CARD_BORDER};
         background: {CARD}; color: {TEXT_PRIMARY}; font-weight: 600;
-        transition: all .12s ease;
+        transition: all .12s ease; box-shadow: 0 1px 3px rgba(0,0,0,0.2);
     }}
-    .stButton>button:hover {{ border-color: {ACCENT}; color: {ACCENT}; }}
-    .ecc-primary button {{
-        background: {ACCENT} !important; color: #1A1400 !important; border: none !important;
+    .stButton>button:hover {{ border-color: {ACCENT}; color: {ACCENT}; box-shadow: 0 0 0 3px {ACCENT}18; }}
+    .stButton>button:active {{ transform: translateY(1px); }}
+    button[kind="primary"], .ecc-primary button {{
+        background: linear-gradient(160deg, {ACCENT}, #A9803A) !important; color: #1A1400 !important; border: none !important;
+        font-weight: 700 !important; box-shadow: 0 4px 14px {ACCENT}33 !important;
     }}
-    div[data-testid="stVerticalBlockBorderWrapper"] {{ border-radius: 14px; }}
+    button[kind="primary"]:hover {{ filter: brightness(1.08); }}
+
+    /* Destructive buttons — wrap the button in
+       st.container(key="ecc-danger-...") (any key starting with
+       "ecc-danger-" or "del_wrap_") so it reads distinctly from ordinary
+       secondary buttons. Streamlit mirrors the container key onto the
+       wrapping div as a "st-key-<key>" class. */
+    div[class*="st-key-ecc-danger-"] .stButton>button,
+    div[class*="st-key-del_wrap_"] .stButton>button,
+    .ecc-danger .stButton>button {{
+        background: {BLACK_RED}18 !important; border: 1px solid {BLACK_RED}66 !important; color: {BLACK_RED} !important;
+    }}
+    div[class*="st-key-ecc-danger-"] .stButton>button:hover,
+    div[class*="st-key-del_wrap_"] .stButton>button:hover,
+    .ecc-danger .stButton>button:hover {{
+        background: {BLACK_RED}2A !important; border-color: {BLACK_RED} !important; color: #FFFFFF !important;
+        box-shadow: 0 0 0 3px {BLACK_RED}22 !important;
+    }}
+
+    /* Active nav item — sidebar() adds .ecc-nav-active to the button
+       wrapper for whichever label matches st.session_state.page. */
+    .ecc-nav-active .stButton>button {{
+        background: {ACCENT}16 !important; border-color: {ACCENT} !important; color: {ACCENT} !important;
+        font-weight: 700 !important;
+    }}
+    section[data-testid="stSidebar"] .stMarkdown h6 {{
+        letter-spacing: 0.16em; font-size: 0.68rem; color: {TEXT_MUTED} !important;
+        text-transform: uppercase; margin-top: 0.6rem;
+    }}
+
+    /* Semantic status badges — Live / Black / Paused. Apply via
+       <span class="ecc-status ecc-status-live">Live</span> etc. */
+    .ecc-status {{
+        display:inline-flex; align-items:center; gap:0.35rem; padding: 0.2rem 0.7rem;
+        border-radius: 999px; font-size: 0.72rem; font-weight: 700; letter-spacing: 0.04em;
+        text-transform: uppercase;
+    }}
+    .ecc-status::before {{ content: ""; width: 7px; height: 7px; border-radius: 50%; background: currentColor; }}
+    .ecc-status-live {{ background: {LIVE_GREEN}1E; color: {LIVE_GREEN}; border: 1px solid {LIVE_GREEN}55; }}
+    .ecc-status-black {{ background: {BLACK_RED}1E; color: {BLACK_RED}; border: 1px solid {BLACK_RED}55; }}
+    .ecc-status-paused {{ background: {PAUSE_AMBER}1E; color: {PAUSE_AMBER}; border: 1px solid {PAUSE_AMBER}55; }}
+    div[data-testid="stVerticalBlockBorderWrapper"] {{
+        border-radius: 14px !important; border-color: {CARD_BORDER} !important;
+        background: {CARD};
+    }}
     hr {{ border-color: {CARD_BORDER}; }}
     .slide-thumb {{
         border: 1px solid {CARD_BORDER}; border-radius: 10px; padding: 0.7rem;
-        background: {CARD}; margin-bottom: 0.5rem; font-size: 0.82rem; color: {TEXT_MUTED};
+        background: linear-gradient(160deg, {CARD} 0%, #101116 100%); margin-bottom: 0.35rem;
+        font-size: 0.82rem; color: {TEXT_MUTED};
+        transition: border-color .12s ease, box-shadow .12s ease;
     }}
-    .slide-thumb.active {{ border-color: {ACCENT}; color: {TEXT_PRIMARY}; background: {ACCENT}14; }}
+    .slide-thumb.active {{
+        border-color: {ACCENT}; color: {TEXT_PRIMARY}; background: {ACCENT}14;
+        box-shadow: 0 0 0 1px {ACCENT}55, 0 4px 16px {ACCENT}22;
+    }}
+    .ecc-grid-select .stButton>button {{
+        border-top-left-radius: 0 !important; border-top-right-radius: 0 !important;
+        margin-top: -0.35rem; font-size: 0.74rem; padding-top: 0.25rem; padding-bottom: 0.25rem;
+    }}
     </style>
     """)
 
@@ -1492,10 +1833,11 @@ def projector_css(theme_name, background_key=None, font_scale=1.0):
     font_scale = font_scale or 1.0
     render_html(f"""
     <style>
+    html, body {{ overflow: hidden !important; height: 100vh; width: 100vw; }}
     #MainMenu, footer, header {{visibility: hidden;}}
     section[data-testid="stSidebar"] {{display:none;}}
     .block-container {{ padding: 0 !important; max-width: 100% !important; }}
-    .stApp {{ background: {app_bg}; {bg_size_rule} {bg_anim_rule} cursor: none; }}
+    .stApp {{ background: {app_bg}; {bg_size_rule} {bg_anim_rule} cursor: none; overflow: hidden !important; }}
     @keyframes eccDrift {{
         0% {{ background-position: 0% 50%; }}
         50% {{ background-position: 100% 50%; }}
@@ -1512,7 +1854,7 @@ def projector_css(theme_name, background_key=None, font_scale=1.0):
     .proj-wrap {{
         height: 100vh; width: 100vw; display:flex; flex-direction:column;
         align-items:center; justify-content:center; text-align:center; padding: 4vw;
-        animation: eccFadeIn 0.45s ease;
+        animation: eccFadeIn 0.45s ease; overflow: hidden;
     }}
     .proj-ref {{
         font-family: {t['font']}; color: {t['sub']}; letter-spacing:0.15em;
@@ -1526,7 +1868,7 @@ def projector_css(theme_name, background_key=None, font_scale=1.0):
     }}
     .proj-split {{
         height: 100vh; width: 100vw; display:flex; flex-direction:column;
-        animation: eccFadeIn 0.45s ease;
+        animation: eccFadeIn 0.45s ease; overflow: hidden;
     }}
     .proj-half {{
         flex: 1; display:flex; flex-direction:column; align-items:center;
@@ -1578,7 +1920,7 @@ def render_projector():
                 items = json.loads(service["items"])
                 idx = state["item_index"]
                 if 0 <= idx < len(items):
-                    slides = item_slides(items[idx])
+                    slides = item_slides(items[idx], state.get("font_scale") or 1.0)
                     si = state["slide_index"]
                     if 0 <= si < len(slides):
                         ref, text, text2 = slides[si]
@@ -1671,14 +2013,14 @@ def _stage_slide_info(state):
             items = json.loads(service["items"])
             idx = state["item_index"]
             if 0 <= idx < len(items):
-                slides = item_slides(items[idx])
+                slides = item_slides(items[idx], state.get("font_scale") or 1.0)
                 si = state["slide_index"]
                 if 0 <= si < len(slides):
                     cur_ref, cur_text, cur_text2 = slides[si]
                 if si + 1 < len(slides):
                     nxt_label = slides[si + 1][0] or slides[si + 1][1][:40]
                 elif idx + 1 < len(items):
-                    nslides = item_slides(items[idx + 1])
+                    nslides = item_slides(items[idx + 1], state.get("font_scale") or 1.0)
                     nxt_label = f"(Next) {items[idx + 1]['title']}" + (f" — {nslides[0][0] or nslides[0][1][:30]}" if nslides else "")
     hidden = bool(state.get("black") or state.get("cleared") or not state.get("live"))
     return cur_ref, cur_text, cur_text2, nxt_label, hidden
@@ -1692,12 +2034,13 @@ def render_stage_display():
     def _tick():
         state = get_state()
         cur_ref, cur_text, cur_text2, nxt_label, hidden = _stage_slide_info(state)
-        # The clock used to be computed with datetime.datetime.now() on the
-        # SERVER — correct only if the server happens to sit in the same
-        # timezone as whoever's reading the stage display, which caused it to
-        # show a different time than the room's actual clock. A browser-side
-        # JS clock reads the viewer's own device time instead, so it's always
-        # right regardless of where the app is hosted.
+        # NOTE: render_html() goes through st.markdown(unsafe_allow_html=True),
+        # which injects raw HTML but does NOT execute <script> tags — so the
+        # clock script here never actually ran, no matter what it computed.
+        # The div/CSS still render fine through render_html; the clock itself
+        # is wired up separately below via components.html (a real iframe,
+        # where scripts DO execute), which reaches into the parent document
+        # to update the #ecc-stage-clock element render_html created.
         render_html(f"""
         <style>
         #MainMenu, footer, header {{visibility: hidden;}}
@@ -1719,22 +2062,30 @@ def render_stage_display():
         <div class="stage-current">{"(hidden from projector)" if hidden else (cur_text or "Nothing live")}</div>
         <div class="stage-label">Up Next</div>
         <div class="stage-next">{nxt_label}</div>
-        <script>
-        (function() {{
-            function eccUpdateStageClock() {{
-                const el = document.getElementById('ecc-stage-clock');
-                if (!el) return;
-                let h = new Date().getHours();
-                const m = new Date().getMinutes();
-                const ampm = h >= 12 ? 'PM' : 'AM';
-                h = h % 12; if (h === 0) h = 12;
-                el.textContent = h + ':' + String(m).padStart(2, '0') + ' ' + ampm;
-            }}
-            eccUpdateStageClock();
-            setInterval(eccUpdateStageClock, 1000);
-        }})();
-        </script>
         """)
+        components.html(
+            """
+            <script>
+            (function() {
+                const doc = window.parent.document;
+                function eccUpdateStageClock() {
+                    const el = doc.getElementById('ecc-stage-clock');
+                    if (!el) return;
+                    // Always show regular New Jersey / US Eastern time, regardless
+                    // of what timezone the viewing device itself is set to.
+                    const parts = new Date().toLocaleTimeString('en-US', {
+                        timeZone: 'America/New_York', hour: 'numeric', minute: '2-digit', hour12: true
+                    });
+                    el.textContent = parts + ' ET';
+                }
+                eccUpdateStageClock();
+                if (doc._eccStageClockInterval) clearInterval(doc._eccStageClockInterval);
+                doc._eccStageClockInterval = setInterval(eccUpdateStageClock, 1000);
+            })();
+            </script>
+            """,
+            height=0,
+        )
 
     if hasattr(st, "fragment"):
         st.fragment(run_every=0.5)(_tick)()
@@ -1759,6 +2110,7 @@ def render_remote():
     div[data-testid="stButton"] button { font-size: 1.3rem !important; padding: 1.2rem !important; font-weight:700 !important; }
     </style>
     """)
+    render_status_badge(state)
     st.markdown(f"**Now:** {'(hidden)' if hidden else (cur_text[:80] or 'Nothing live')}")
     st.caption(f"Up next: {nxt_label}")
     st.write("")
@@ -1771,7 +2123,7 @@ def render_remote():
         service = get_service(state["service_id"]) if state.get("service_id") else None
         items = json.loads(service["items"]) if service else []
         idx = state.get("item_index") or 0
-        slides = item_slides(items[idx]) if 0 <= idx < len(items) else []
+        slides = item_slides(items[idx], state.get("font_scale") or 1.0) if 0 <= idx < len(items) else []
         si = state.get("slide_index") or 0
 
     c1, c2 = st.columns(2)
@@ -1787,7 +2139,7 @@ def render_remote():
             # PREVIOUS item's last slide, mirroring what NEXT already does
             # going forward. Without this, PREV silently did nothing the
             # moment you crossed into a new item, which looked broken.
-            prev_slides = item_slides(items[idx - 1])
+            prev_slides = item_slides(items[idx - 1], state.get("font_scale") or 1.0)
             set_state(item_index=idx - 1, slide_index=max(0, len(prev_slides) - 1), cleared=0)
             st.rerun()
     if c2.button("NEXT ▶", use_container_width=True, key="remote_next"):
@@ -1805,9 +2157,6 @@ def render_remote():
     black_label = "🔆 Show Display (currently Black)" if is_black else "⬛ Black Screen"
     if st.button(black_label, use_container_width=True, key="remote_black"):
         set_state(black=0 if is_black else 1)
-        st.rerun()
-    if st.button("Clear Screen", use_container_width=True, key="remote_clear"):
-        set_state(cleared=1)
         st.rerun()
 
 
@@ -1943,18 +2292,25 @@ def sidebar():
     with st.sidebar:
         st.markdown('<div class="ecc-wordmark">ECC <span>Worship</span></div>', unsafe_allow_html=True)
         st.caption("Prepare. Present. Worship.")
+        current_page = st.session_state.get("page")
+
+        def nav_button(label):
+            wrapper_class = "ecc-nav-active" if label == current_page else "ecc-nav-inactive"
+            st.markdown(f'<div class="{wrapper_class}">', unsafe_allow_html=True)
+            clicked = st.button(label, key=f"nav_{label}", use_container_width=True)
+            st.markdown('</div>', unsafe_allow_html=True)
+            if clicked:
+                st.session_state.page = label
+
         st.markdown("###### MAIN")
         for label in ["Dashboard", "Service Builder", "Presentation"]:
-            if st.button(label, key=f"nav_{label}", use_container_width=True):
-                st.session_state.page = label
+            nav_button(label)
         st.markdown("###### LIBRARY")
-        for label in ["Song Library", "Import Lyrics", "Import Slides", "Rapid Upload", "Bible", "Saved Services"]:
-            if st.button(label, key=f"nav_{label}", use_container_width=True):
-                st.session_state.page = label
+        for label in ["Song Library", "Import Lyrics", "Import Slides", "Bible", "Saved Services"]:
+            nav_button(label)
         st.markdown("###### SETTINGS")
         for label in ["Church Settings", "Display Settings"]:
-            if st.button(label, key=f"nav_{label}", use_container_width=True):
-                st.session_state.page = label
+            nav_button(label)
 
         st.markdown("---")
         st.caption("Projector / extended display")
@@ -1977,11 +2333,21 @@ def sidebar():
         st.caption("Stage Display / Remote (open on another device)")
         components.html(
             """
-            <div style="font-family:'Inter',sans-serif;font-size:0.82rem;display:flex;flex-direction:column;gap:0.4rem;">
-              <a id="ecc-stage-link" href="#" onclick="return eccOpenLink(event, this)"
-                 style="color:#C8A24A;text-decoration:underline;cursor:pointer;">🖥 Stage Display (current + next slide, clock)</a>
-              <a id="ecc-remote-link" href="#" onclick="return eccOpenLink(event, this)"
-                 style="color:#C8A24A;text-decoration:underline;cursor:pointer;">📱 Phone Remote (Next/Prev/Black)</a>
+            <div style="font-family:'Inter',sans-serif;font-size:0.82rem;display:flex;flex-direction:column;gap:0.5rem;">
+              <div style="display:flex;align-items:center;gap:0.4rem;">
+                <a id="ecc-stage-link" href="#" onclick="return eccOpenLink(event, this)"
+                   style="flex:1;color:#C8A24A;text-decoration:underline;cursor:pointer;">🖥 Stage Display (current + next slide, clock)</a>
+                <button onclick="eccCopyLink('ecc-stage-link', this)"
+                        style="flex-shrink:0;background:#24262C;color:#F4F3EF;border:none;
+                               border-radius:4px;padding:0.3rem 0.6rem;font-size:0.72rem;cursor:pointer;">Copy</button>
+              </div>
+              <div style="display:flex;align-items:center;gap:0.4rem;">
+                <a id="ecc-remote-link" href="#" onclick="return eccOpenLink(event, this)"
+                   style="flex:1;color:#C8A24A;text-decoration:underline;cursor:pointer;">📱 Phone Remote (Next/Prev/Black)</a>
+                <button onclick="eccCopyLink('ecc-remote-link', this)"
+                        style="flex-shrink:0;background:#24262C;color:#F4F3EF;border:none;
+                               border-radius:4px;padding:0.3rem 0.6rem;font-size:0.72rem;cursor:pointer;">Copy</button>
+              </div>
             </div>
             <script>
               // Same fix as the main projector link: these anchors live in a
@@ -1998,9 +2364,18 @@ def sidebar():
                 if (el.dataset.url) window.parent.open(el.dataset.url, "_blank");
                 return false;
               }
+              function eccCopyLink(linkId, btn) {
+                const el = document.getElementById(linkId);
+                if (!el || !el.dataset.url) return;
+                navigator.clipboard.writeText(el.dataset.url).then(() => {
+                  const orig = btn.innerText;
+                  btn.innerText = "Copied!";
+                  setTimeout(() => { btn.innerText = orig; }, 1500);
+                });
+              }
             </script>
             """,
-            height=55,
+            height=80,
         )
 
 
@@ -2081,33 +2456,13 @@ def page_songs():
     tabs = ["All Songs", "Worship", "Praise", "Hymns", "Contemporary", "Recently Used", "Favorites"]
     cat = st.radio("Filter", tabs, horizontal=True, label_visibility="collapsed")
 
-    with st.expander("➕ Add a song manually", expanded=st.session_state.get("show_add_song", False)):
-        st.caption("Enter lyrics you or your church have the rights to use. Separate slides with a blank line.")
-        t = st.text_input("Title")
-        a = st.text_input("Artist")
-        cat_new = st.selectbox("Category", SONG_CATEGORIES)
-        tags = st.text_input("Tags (comma separated)")
-        lyrics = st.text_area("Lyrics (blank line = new slide)", height=150)
-        if st.button("Save Song"):
-            if t.strip():
-                song_id, _ = add_song(t, a, cat_new, tags, lyrics)
-                if turso_configured():
-                    try:
-                        turso_push_song(song_id, t, a, cat_new, tags, json.dumps(
-                            [s.strip() for s in lyrics.split("\n\n") if s.strip()] or ["(empty)"]))
-                        st.session_state.show_add_song = False
-                        st.success(f"Added '{t}' and saved it to Turso — it'll survive an app restart.")
-                    except Exception as e:
-                        st.session_state.show_add_song = False
-                        st.warning(f"Saved '{t}' locally, but the Turso sync failed ({e}). "
-                                   f"It's safe on this machine but won't survive a host reset until synced.")
-                else:
-                    st.session_state.show_add_song = False
-                    st.success(f"Added '{t}' (Turso isn't configured yet, so this is local-only — "
-                               f"see Church Settings to set it up).")
-                st.rerun()
-            else:
-                st.warning("Give the song a title first.")
+    with st.expander("➕ Import Songs", expanded=st.session_state.get("show_add_song", False)):
+        st.caption(
+            "Paste lyrics straight from a lyrics site — same importer as the Import Lyrics tab, right "
+            "here so you don't have to leave this page. Slides are packed to a character budget sized "
+            "for a TV screen, and a line is never cut mid-way (see Import Lyrics for the format)."
+        )
+        render_import_lyrics_form(key_prefix="songlib_import")
 
     st.write("")
     songs = get_songs(search, cat)
@@ -2128,6 +2483,16 @@ def page_songs():
                     st.rerun()
                 if st.button("☆ Favorite" if not s["favorite"] else "★ Unfavorite", key=f"fav_{s['id']}"):
                     toggle_favorite(s["id"]); st.rerun()
+                if st.button("➕ Add to Service", key=f"addtoservice_{s['id']}"):
+                    sid = ensure_active_service()
+                    if not sid:
+                        st.warning("No active service yet — create one in Service Builder first.")
+                    else:
+                        service = get_service(sid)
+                        service_items = json.loads(service["items"])
+                        service_items.append(make_song_item(s))
+                        update_service_items(sid, service_items)
+                        st.toast(f"Added '{s['title']}' to the current service.", icon="✅")
 
 
 def page_song_workspace():
@@ -2161,10 +2526,12 @@ def page_song_workspace():
         if c2.button("⧉ Duplicate") and slides:
             slides.insert(sel + 1, slides[sel])
             update_song_slides(song_id, slides); st.rerun()
+        st.markdown('<div class="ecc-danger">', unsafe_allow_html=True)
         if st.button("🗑 Delete Slide") and len(slides) > 1:
             slides.pop(sel)
             update_song_slides(song_id, max(0, min(sel, len(slides)-1)) and slides or slides)
             st.rerun()
+        st.markdown('</div>', unsafe_allow_html=True)
         c3, c4 = st.columns(2)
         if c3.button("↑ Move Up") and sel > 0:
             slides[sel-1], slides[sel] = slides[sel], slides[sel-1]
@@ -2342,7 +2709,7 @@ def page_bible():
                 st.session_state.setdefault("bible_staging", [])
                 st.session_state.bible_staging.append((book, chapter, tuple(chosen_sorted), translation, secondary_translation, combine))
                 st.session_state.bible_selected_verses = []
-                st.success("Added to staging — attach it in Service Builder.")
+                st.toast("Added to staging — attach it in Service Builder.", icon="✅")
                 st.rerun()
 
         staging = st.session_state.get("bible_staging", [])
@@ -2422,7 +2789,7 @@ def page_service_builder():
         if st.button("☁️ Save Service to Cloud", help="Pushes this service to Turso so it survives an app restart — only runs when you click it."):
             try:
                 turso_push_service(sid, name, date, time_, json.dumps(items))
-                st.success(f"Saved \"{name}\" to Turso.")
+                st.toast(f"Saved \"{name}\" to Turso.", icon="☁️")
             except Exception as e:
                 st.error(f"Cloud save failed: {e}")
     else:
@@ -2431,13 +2798,16 @@ def page_service_builder():
     st.markdown("#### Add to the service")
     a1, a2, a3, a4 = st.columns(4)
     with a1.popover("🎵 Add Song"):
-        song_options = {s["id"]: dict(s) for s in get_songs()}
+        song_search = st.text_input("Search songs", key="add_song_search", placeholder="Search by title, artist, or lyrics")
+        song_options = {s["id"]: dict(s) for s in get_songs(search=song_search)}
         if song_options:
             pick_id = st.selectbox("Song", list(song_options.keys()),
                                     format_func=lambda i: song_options[i]["title"], key="pick_song")
             if st.button("Add", key="add_song_btn"):
                 items.append(make_song_item(song_options[pick_id]))
                 update_service_items(sid, items); st.rerun()
+        elif song_search:
+            st.caption("No songs match that search.")
         else:
             st.caption("No songs yet — add one from the Songs tab.")
     with a2:
@@ -2478,9 +2848,10 @@ def page_service_builder():
                         if b2.button("↓", key=f"down_{i}") and i < len(items) - 1:
                             items[i+1], items[i] = items[i], items[i+1]
                             update_service_items(sid, items); st.rerun()
-                        if b3.button("🗑", key=f"del_{i}"):
-                            items.pop(i)
-                            update_service_items(sid, items); st.rerun()
+                        with b3.container(key=f"del_wrap_{i}"):
+                            if st.button("🗑", key=f"del_{i}"):
+                                items.pop(i)
+                                update_service_items(sid, items); st.rerun()
 
     if items:
         st.write("")
@@ -2493,198 +2864,135 @@ def page_service_builder():
         st.markdown('</div>', unsafe_allow_html=True)
 
 
-def page_presentation():
-    adhoc = bool(get_state().get("adhoc_active"))
-    sid = st.session_state.get("active_service_id") or ensure_active_service()
-    if not sid and not adhoc:
-        st.info("No active service. Build one in Service Builder first — or present a Bible verse directly from the Bible tab.")
+def _render_service_order_panel(items, state, sid, adhoc, key_prefix=""):
+    """The 'Service Order' list — factored out so it can be reused unchanged
+    in both the normal Presentation layout and the full-screen Slide Grid
+    layout (which keeps this exact panel on the left)."""
+    st.markdown("**Service Order**")
+    st.caption("Use ▲/▼ to reorder — the change applies immediately.")
+    if adhoc:
+        st.caption("Paused while presenting a verse directly.")
+        if st.button("↩ Return to service", use_container_width=True, disabled=not sid, key=f"{key_prefix}return_adhoc"):
+            exit_adhoc_present()
+            st.rerun()
+    for i, item in enumerate(items):
+        icon = {"song": "🎵", "bible": "📖", "custom": "🖼", "announcement": "📣", "imagedeck": "🖼"}.get(item["type"], "•")
+        is_current = (not adhoc and i == state["item_index"])
+        row_go, row_up, row_down = st.columns([5, 1, 1])
+        label = f"{'▶ ' if is_current else ''}{i+1:02d} {icon} {item['title']}"
+        if row_go.button(label, key=f"{key_prefix}go_{i}", use_container_width=True,
+                          type="primary" if is_current else "secondary"):
+            set_state(item_index=i, slide_index=0, cleared=0, black=0, adhoc_active=0)
+            st.rerun()
+        if row_up.button("▲", key=f"{key_prefix}pres_up_{i}", use_container_width=True, disabled=(i == 0)):
+            items[i - 1], items[i] = items[i], items[i - 1]
+            update_service_items(sid, items)
+            if not adhoc:
+                if state["item_index"] == i:
+                    set_state(item_index=i - 1)
+                elif state["item_index"] == i - 1:
+                    set_state(item_index=i)
+            st.rerun()
+        if row_down.button("▼", key=f"{key_prefix}pres_down_{i}", use_container_width=True, disabled=(i == len(items) - 1)):
+            items[i + 1], items[i] = items[i], items[i + 1]
+            update_service_items(sid, items)
+            if not adhoc:
+                if state["item_index"] == i:
+                    set_state(item_index=i + 1)
+                elif state["item_index"] == i + 1:
+                    set_state(item_index=i)
+            st.rerun()
+
+
+def _slide_grid_entries(items, adhoc, adhoc_slides, item_index, font_scale, extend=False, min_count=15, cap=60):
+    """Builds the flat list of slides to show in the ProPresenter-style
+    grid. Normally just the CURRENT item's own slides, in order. When
+    extend=True (full-screen mode), keeps pulling in whole subsequent
+    service items — never a partial item — until at least min_count slides
+    are queued up (capped at `cap` so a huge service doesn't render
+    thousands of thumbnails at once)."""
+    entries = []
+    if adhoc:
+        for i, s in enumerate(adhoc_slides or []):
+            ref, text, text2 = s[0], s[1], s[2] if len(s) > 2 else None
+            entries.append({"item_idx": None, "slide_idx": i, "ref": ref, "text": text, "text2": text2,
+                             "item_title": "Verse"})
+        return entries
+
+    if not items or not (0 <= item_index < len(items)):
+        return entries
+
+    def add_item(ix):
+        it = items[ix]
+        for j, (ref, text, text2) in enumerate(item_slides(it, font_scale)):
+            entries.append({"item_idx": ix, "slide_idx": j, "ref": ref, "text": text, "text2": text2,
+                             "item_title": it["title"]})
+
+    add_item(item_index)
+    if extend:
+        nxt = item_index + 1
+        while len(entries) < min_count and nxt < len(items) and len(entries) < cap:
+            add_item(nxt)
+            nxt += 1
+    return entries
+
+
+def _render_slide_grid(entries, adhoc, item_index, slide_index, cols_per_row=4, compact=False, key_prefix="grid"):
+    """The ProPresenter-style thumbnail grid itself. Each cell is a visual
+    'slide' card (reference/item label + a text preview of the actual slide
+    content, or an image badge for imported slide images) with a Select
+    control immediately beneath it, styled via CSS to read as one clickable
+    thumbnail unit. The currently-live slide gets a gold highlighted border
+    via the .slide-thumb.active class so it's obvious at a glance which
+    slide is on the projector right now."""
+    if not entries:
+        st.caption("No slides to show yet — pick a song or Bible passage to see its slides here.")
         return
-
-    service = get_service(sid) if sid else None
-    items = json.loads(service["items"]) if service else []
-    state = get_state()
-    if service and state["service_id"] != sid and not adhoc:
-        set_state(service_id=sid, item_index=0, slide_index=0, black=0, cleared=1, live=1)
-        state = get_state()
-
-    if adhoc:
-        st.markdown("### Presenting a verse")
-        st.caption("Presented directly from the Bible tab — not part of a saved service.")
-    elif service:
-        st.markdown(f"### {service['name']}")
-        st.caption(f"{service['service_date']} · {service['service_time'] or ''}")
-
-    left, center, right = st.columns([1.2, 2.4, 1])
-
-    with left:
-        st.markdown("**Service Order**")
-        st.caption("Use ▲/▼ to reorder — the change applies immediately.")
-        if adhoc:
-            st.caption("Paused while presenting a verse directly.")
-            if st.button("↩ Return to service", use_container_width=True, disabled=not sid):
-                exit_adhoc_present()
-                st.rerun()
-        for i, item in enumerate(items):
-            icon = {"song": "🎵", "bible": "📖", "custom": "🖼", "announcement": "📣", "imagedeck": "🖼"}.get(item["type"], "•")
-            active = " active" if (not adhoc and i == state["item_index"]) else ""
-            row_go, row_up, row_down = st.columns([5, 1, 1])
-            if row_go.button(f"{i+1:02d} {icon} {item['title']}", key=f"go_{i}", use_container_width=True):
-                set_state(item_index=i, slide_index=0, cleared=0, black=0, adhoc_active=0)
-                st.rerun()
-            if row_up.button("▲", key=f"pres_up_{i}", use_container_width=True, disabled=(i == 0)):
-                items[i - 1], items[i] = items[i], items[i - 1]
-                update_service_items(sid, items)
-                # Keep the currently-live item pointed at correctly if it moved.
-                if not adhoc:
-                    if state["item_index"] == i:
-                        set_state(item_index=i - 1)
-                    elif state["item_index"] == i - 1:
-                        set_state(item_index=i)
-                st.rerun()
-            if row_down.button("▼", key=f"pres_down_{i}", use_container_width=True, disabled=(i == len(items) - 1)):
-                items[i + 1], items[i] = items[i], items[i + 1]
-                update_service_items(sid, items)
-                if not adhoc:
-                    if state["item_index"] == i:
-                        set_state(item_index=i + 1)
-                    elif state["item_index"] == i + 1:
-                        set_state(item_index=i)
-                st.rerun()
-
-    if adhoc:
-        adhoc_slides = json.loads(state["adhoc_slides"]) if state.get("adhoc_slides") else []
-        adhoc_index = max(0, min(state.get("adhoc_index") or 0, max(len(adhoc_slides) - 1, 0)))
-        slides = adhoc_slides
-        slide_index = adhoc_index
-        item_index, item = 0, None
-    else:
-        item_index = state["item_index"]
-        item = items[item_index] if 0 <= item_index < len(items) else None
-        slides = item_slides(item) if item else []
-        slide_index = max(0, min(state["slide_index"], max(len(slides) - 1, 0)))
-
-    with center:
-        st.markdown("**Current — shown on projector**")
-        theme = state["theme"] or "Modern Worship"
-        t = THEMES[theme]
-        cur_ref, cur_text, cur_text2 = slides[slide_index] if slides else (None, "Nothing selected", None)
-        hidden = state["black"] or state["cleared"]
-
-        # Match the real projector background — a preset gradient, a custom
-        # uploaded photo, or the flat theme color if none is set — instead of
-        # always showing flat theme color here, which didn't match what was
-        # actually live on the projector.
-        bg_key = state.get("background")
-        if bg_key == CUSTOM_BACKGROUND_KEY:
-            custom_data = get_settings().get("custom_background_data")
-            card_bg = f"center/cover no-repeat url('{custom_data}')" if custom_data else t["bg"]
-        else:
-            bg_def = BACKGROUNDS.get(bg_key) if bg_key else None
-            card_bg = bg_def["css"] if bg_def else t["bg"]
-        text_shadow = "text-shadow:0 2px 18px rgba(0,0,0,0.55);" if bg_key and bg_key != "None (theme color)" else ""
-        live_scale = state.get("font_scale") or 1.0
-
-        if cur_text.startswith(IMG_SLIDE_PREFIX) and not hidden:
-            img_src = cur_text[len(IMG_SLIDE_PREFIX):]
-            render_html(
-                f"""<div style="background:#000;border-radius:16px;overflow:hidden;
-                min-height:260px;border:1px solid {CARD_BORDER};display:flex;align-items:center;justify-content:center;">
-                <img src="{img_src}" style="max-width:100%;max-height:260px;object-fit:contain;" />
-                </div>"""
+    thumb_h = "64px" if compact else "84px"
+    idx = 0
+    last_item_seen = None
+    while idx < len(entries):
+        row = entries[idx:idx + cols_per_row]
+        cols = st.columns(cols_per_row)
+        for col, entry in zip(cols, row):
+            n = idx + row.index(entry) + 1
+            is_active = (
+                (adhoc and entry["item_idx"] is None and entry["slide_idx"] == slide_index)
+                or (not adhoc and entry["item_idx"] == item_index and entry["slide_idx"] == slide_index)
             )
-        elif cur_text2 and not hidden:
-            top_dir = "rtl" if _looks_arabic(cur_text) else "ltr"
-            bottom_dir = "rtl" if _looks_arabic(cur_text2) else "ltr"
-            render_html(
-                f"""<div style="background:{card_bg};border-radius:16px;overflow:hidden;
-                min-height:260px;border:1px solid {CARD_BORDER};display:flex;flex-direction:column;">
-                <div dir="{top_dir}" style="flex:1;padding:1.2rem;display:flex;flex-direction:column;
-                align-items:center;justify-content:center;text-align:center;border-bottom:1px solid {CARD_BORDER};">
-                {f'<div style="color:{t["sub"]};letter-spacing:.1em;text-transform:uppercase;margin-bottom:0.6rem;font-family:{t["font"]};font-size:0.8rem;{text_shadow}">{cur_ref}</div>' if cur_ref else ''}
-                <div style="color:{t['fg']};font-family:{t['font']};font-size:1.2rem;font-weight:700;white-space:pre-line;line-height:1.4;{text_shadow}">{cur_text}</div>
-                </div>
-                <div dir="{bottom_dir}" style="flex:1;padding:1.2rem;display:flex;align-items:center;justify-content:center;text-align:center;">
-                <div style="color:{t['fg']};font-family:{t['font']};font-size:1.1rem;font-weight:700;white-space:pre-line;line-height:1.4;{text_shadow}">{cur_text2}</div>
-                </div>
-                </div>"""
-            )
-            st.caption("Bilingual split screen — top/bottom shown exactly as on the projector.")
-        else:
-            display_text = "(hidden from projector)" if hidden else (
-                "(image slide)" if cur_text.startswith(IMG_SLIDE_PREFIX) else cur_text
-            )
-            render_html(
-                f"""<div style="background:{card_bg};border-radius:16px;padding:2.4rem 1.6rem;
-                min-height:260px;display:flex;flex-direction:column;align-items:center;justify-content:center;
-                text-align:center;border:1px solid {CARD_BORDER};">
-                {f'<div style="color:{t["sub"]};letter-spacing:.1em;text-transform:uppercase;margin-bottom:1rem;font-family:{t["font"]};{text_shadow}">{cur_ref}</div>' if cur_ref else ''}
-                <div style="color:{t['fg']};font-family:{t['font']};font-size:calc(1.5rem * {live_scale});font-weight:700;white-space:pre-line;line-height:1.4;{text_shadow}">{display_text}</div>
-                </div>"""
-            )
-        st.caption("This mirrors the projector exactly, including the live background and font size.")
-        st.markdown("**Up Next**")
-        nxt_ref, nxt_text, nxt_text2 = (None, "—", None)
-        if slides and slide_index + 1 < len(slides):
-            nxt_ref, nxt_text, nxt_text2 = slides[slide_index + 1]
-        elif not adhoc and item_index + 1 < len(items):
-            nslides = item_slides(items[item_index + 1])
-            if nslides:
-                nxt_ref, nxt_text, nxt_text2 = nslides[0]
-            nxt_text = f"(Next item) {items[item_index + 1]['title']} — {nxt_text}"
-        nxt_display = "(image slide)" if (nxt_text or "").startswith(IMG_SLIDE_PREFIX) else nxt_text
-        st.markdown(f'<div class="ecc-card">{(nxt_ref + " — ") if nxt_ref else ""}{nxt_display}{(" / " + nxt_text2) if nxt_text2 else ""}</div>', unsafe_allow_html=True)
-
-    with right:
-        st.markdown("**Controls**")
-        st.caption(f"Slide {slide_index + 1 if slides else 0} / {len(slides)}")
-        cp, cn = st.columns(2)
-        if cp.button("◀ PREV", use_container_width=True) and slide_index > 0:
-            if adhoc:
-                set_state(adhoc_index=slide_index - 1, cleared=0)
+            text = entry["text"] or ""
+            if text.startswith(IMG_SLIDE_PREFIX):
+                preview_txt = "🖼️ Image slide"
             else:
-                set_state(slide_index=slide_index - 1, cleared=0)
-            st.rerun()
-        if cn.button("NEXT ▶", use_container_width=True):
-            if slide_index < len(slides) - 1:
-                if adhoc:
-                    set_state(adhoc_index=slide_index + 1, cleared=0)
-                else:
-                    set_state(slide_index=slide_index + 1, cleared=0)
-                st.rerun()
-            elif not adhoc and item_index + 1 < len(items):
-                set_state(item_index=item_index + 1, slide_index=0, cleared=0)
-                st.rerun()
-        st.write("")
-        if st.button("🖥 Present", use_container_width=True):
-            set_state(cleared=0, black=0, live=1); st.rerun()
-        # This used to be a plain st.button that only showed a text tip —
-        # a regular Streamlit button can't itself call browser JS, so it
-        # could never actually open anything. This renders the real
-        # clickable button (Window Management API auto-open) in its place.
-        render_display_open_widget(compact=True)
-        is_black = bool(state["black"])
-        black_label = "🔆 Show Display (currently Black)" if is_black else "⬛ Black Screen"
-        if st.button(black_label, use_container_width=True, key="op_black_btn"):
-            set_state(black=0 if is_black else 1); st.rerun()
-        if st.button("Clear Screen", use_container_width=True):
-            set_state(cleared=1); st.rerun()
-        st.write("")
-        st.selectbox("Theme", list(THEMES.keys()), index=list(THEMES.keys()).index(theme), key="live_theme",
-                     on_change=lambda: set_state(theme=st.session_state.live_theme))
+                preview_txt = text.replace("\n", "  ·  ")
+                if len(preview_txt) > (56 if compact else 78):
+                    preview_txt = preview_txt[:(56 if compact else 78)] + "…"
+                if not preview_txt.strip():
+                    preview_txt = "(blank)"
+            badge = entry["ref"] or entry["item_title"]
+            active_class = "slide-thumb active" if is_active else "slide-thumb"
+            with col:
+                render_html(
+                    f'''<div class="{active_class}" style="min-height:{thumb_h};display:flex;flex-direction:column;justify-content:space-between;">
+                    <div style="font-size:0.66rem;text-transform:uppercase;letter-spacing:.06em;opacity:0.8;margin-bottom:0.3rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">
+                    {"● LIVE · " if is_active else ""}{n:02d} · {badge}</div>
+                    <div style="font-size:{'0.72rem' if compact else '0.78rem'};line-height:1.3;">{preview_txt}</div>
+                    </div>'''
+                )
+                st.markdown('<div class="ecc-grid-select">', unsafe_allow_html=True)
+                if st.button("● Live" if is_active else "Select", key=f"{key_prefix}sel_{entry['item_idx']}_{entry['slide_idx']}_{idx}",
+                             use_container_width=True, disabled=is_active,
+                             type="primary" if is_active else "secondary"):
+                    if adhoc:
+                        set_state(adhoc_index=entry["slide_idx"], cleared=0)
+                    else:
+                        set_state(item_index=entry["item_idx"], slide_index=entry["slide_idx"], cleared=0, black=0)
+                    st.rerun()
+                st.markdown('</div>', unsafe_allow_html=True)
+        idx += cols_per_row
 
-        st.write("")
-        st.markdown("**Font Size**")
-        cur_scale = state.get("font_scale") or 1.0
-        fm, fp, fpct = st.columns([1, 1, 1.4])
-        if fm.button("➖", use_container_width=True, key="font_minus", help="Smaller text on the projector"):
-            set_state(font_scale=round(max(0.5, cur_scale - 0.1), 2))
-            st.rerun()
-        if fp.button("➕", use_container_width=True, key="font_plus", help="Bigger text on the projector"):
-            set_state(font_scale=round(min(2.0, cur_scale + 0.1), 2))
-            st.rerun()
-        fpct.markdown(f"<div style='text-align:center;padding-top:0.4rem;'>{int(cur_scale*100)}%</div>", unsafe_allow_html=True)
-        st.caption("The \"Current\" panel in the center already mirrors the projector at this size and background — no separate preview needed.")
 
+def _render_operator_keyboard_shortcuts():
     st.caption("⌨️ Shortcuts: Space, → or ↑ = Next · ← or ↓ = Prev · B = toggle Black screen")
     components.html(
         """
@@ -2727,50 +3035,300 @@ def page_presentation():
     )
 
 
+def page_presentation():
+    adhoc = bool(get_state().get("adhoc_active"))
+    sid = st.session_state.get("active_service_id") or ensure_active_service()
+    if not sid and not adhoc:
+        st.info("No active service. Build one in Service Builder first — or present a Bible verse directly from the Bible tab.")
+        return
+
+    service = get_service(sid) if sid else None
+    items = json.loads(service["items"]) if service else []
+    state = get_state()
+    if service and state["service_id"] != sid and not adhoc:
+        set_state(service_id=sid, item_index=0, slide_index=0, black=0, cleared=1, live=1)
+        state = get_state()
+
+    title_col, status_col = st.columns([4, 1])
+    with title_col:
+        if adhoc:
+            st.markdown("### Presenting a verse")
+            st.caption("Presented directly from the Bible tab — not part of a saved service.")
+        elif service:
+            st.markdown(f"### {service['name']}")
+            st.caption(f"{service['service_date']} · {service['service_time'] or ''}")
+    with status_col:
+        render_status_badge(state)
+
+    # Shared slide-position math — needed by both the normal layout and the
+    # full-screen grid layout, so it's computed once up front rather than
+    # duplicated in each branch.
+    if adhoc:
+        adhoc_slides = json.loads(state["adhoc_slides"]) if state.get("adhoc_slides") else []
+        adhoc_index = max(0, min(state.get("adhoc_index") or 0, max(len(adhoc_slides) - 1, 0)))
+        slides = adhoc_slides
+        slide_index = adhoc_index
+        item_index, item = 0, None
+    else:
+        item_index = state["item_index"]
+        item = items[item_index] if 0 <= item_index < len(items) else None
+        slides = item_slides(item, state.get("font_scale") or 1.0) if item else []
+        slide_index = max(0, min(state["slide_index"], max(len(slides) - 1, 0)))
+
+    st.session_state.setdefault("presentation_grid_fullscreen", False)
+
+    # ---------------------------------------------------------------
+    # FULL-SCREEN SLIDE GRID — Service Order stays on the left; the whole
+    # right half becomes a dense ProPresenter-style grid sized to fit at
+    # least the next 15 upcoming slides (spilling into following service
+    # items, never cutting one in half, when the current item runs short).
+    # ---------------------------------------------------------------
+    if st.session_state["presentation_grid_fullscreen"]:
+        fs_left, fs_grid = st.columns([1.1, 3.3])
+        with fs_left:
+            _render_service_order_panel(items, state, sid, adhoc, key_prefix="fs_")
+        with fs_grid:
+            top_l, top_r = st.columns([4, 1.3])
+            with top_l:
+                st.markdown("**🎬 Slide Grid — Full Screen**")
+                if slides:
+                    live_ref, live_text, _ = slides[slide_index]
+                    live_label = live_ref or (live_text[:60] + "…" if len(live_text) > 60 else live_text)
+                else:
+                    live_label = "Nothing selected"
+                st.caption(f"● Live: {live_label}")
+            with top_r:
+                if st.button("✕ Exit Full Screen", use_container_width=True, key="grid_exit_fs"):
+                    st.session_state["presentation_grid_fullscreen"] = False
+                    st.rerun()
+            fs_entries = _slide_grid_entries(items, adhoc, slides if adhoc else None, item_index,
+                                              state.get("font_scale") or 1.0, extend=True, min_count=15)
+            _render_slide_grid(fs_entries, adhoc, item_index, slide_index, cols_per_row=5,
+                                compact=True, key_prefix="fsgrid_")
+        _render_operator_keyboard_shortcuts()
+        return
+
+    # ---------------------------------------------------------------
+    # NORMAL LAYOUT — unchanged Service Order / Current / Controls panels,
+    # with the Slide Grid added as a new full-width section underneath.
+    # ---------------------------------------------------------------
+    left, center, right = st.columns([1.2, 2.4, 1])
+
+    with left:
+        _render_service_order_panel(items, state, sid, adhoc)
+
+    with center:
+        st.markdown("**Current — shown on projector**")
+        theme = state["theme"] or "Modern Worship"
+        t = THEMES[theme]
+        cur_ref, cur_text, cur_text2 = slides[slide_index] if slides else (None, "Nothing selected", None)
+        hidden = state["black"] or state["cleared"]
+
+        # Match the real projector background — a preset gradient, a custom
+        # uploaded photo, or the flat theme color if none is set — instead of
+        # always showing flat theme color here, which didn't match what was
+        # actually live on the projector.
+        bg_key = state.get("background")
+        if bg_key == CUSTOM_BACKGROUND_KEY:
+            custom_data = get_settings().get("custom_background_data")
+            card_bg = f"center/cover no-repeat url('{custom_data}')" if custom_data else t["bg"]
+        else:
+            bg_def = BACKGROUNDS.get(bg_key) if bg_key else None
+            card_bg = bg_def["css"] if bg_def else t["bg"]
+        text_shadow = "text-shadow:0 2px 18px rgba(0,0,0,0.55);" if bg_key and bg_key != "None (theme color)" else ""
+        live_scale = state.get("font_scale") or 1.0
+
+        # Locked to a fixed-size box (not a growing min-height) so the preview
+        # never resizes as font/content changes — this mirrors the real
+        # projector, which is always locked to the screen it's on and never
+        # scrolls. overflow:hidden is the hard backstop; the font-scale-aware
+        # slide splitting in item_slides() is what keeps content actually
+        # fitting inside it instead of getting clipped.
+        PREVIEW_BOX = "height:320px;overflow:hidden;"
+
+        if cur_text.startswith(IMG_SLIDE_PREFIX) and not hidden:
+            img_src = cur_text[len(IMG_SLIDE_PREFIX):]
+            render_html(
+                f"""<div style="background:#000;border-radius:16px;{PREVIEW_BOX}
+                border:1px solid {CARD_BORDER};display:flex;align-items:center;justify-content:center;">
+                <img src="{img_src}" style="max-width:100%;max-height:100%;object-fit:contain;" />
+                </div>"""
+            )
+        elif cur_text2 and not hidden:
+            top_dir = "rtl" if _looks_arabic(cur_text) else "ltr"
+            bottom_dir = "rtl" if _looks_arabic(cur_text2) else "ltr"
+            render_html(
+                f"""<div style="background:{card_bg};border-radius:16px;{PREVIEW_BOX}
+                border:1px solid {CARD_BORDER};display:flex;flex-direction:column;">
+                <div dir="{top_dir}" style="flex:1;padding:1.2rem;display:flex;flex-direction:column;overflow:hidden;
+                align-items:center;justify-content:center;text-align:center;border-bottom:1px solid {CARD_BORDER};">
+                {f'<div style="color:{t["sub"]};letter-spacing:.1em;text-transform:uppercase;margin-bottom:0.6rem;font-family:{t["font"]};font-size:0.8rem;{text_shadow}">{cur_ref}</div>' if cur_ref else ''}
+                <div style="color:{t['fg']};font-family:{t['font']};font-size:1.2rem;font-weight:700;white-space:pre-line;line-height:1.4;{text_shadow}">{cur_text}</div>
+                </div>
+                <div dir="{bottom_dir}" style="flex:1;padding:1.2rem;display:flex;align-items:center;justify-content:center;text-align:center;overflow:hidden;">
+                <div style="color:{t['fg']};font-family:{t['font']};font-size:1.1rem;font-weight:700;white-space:pre-line;line-height:1.4;{text_shadow}">{cur_text2}</div>
+                </div>
+                </div>"""
+            )
+            st.caption("Bilingual split screen — top/bottom shown exactly as on the projector.")
+        else:
+            display_text = "(hidden from projector)" if hidden else (
+                "(image slide)" if cur_text.startswith(IMG_SLIDE_PREFIX) else cur_text
+            )
+            render_html(
+                f"""<div style="background:{card_bg};border-radius:16px;padding:2.4rem 1.6rem;{PREVIEW_BOX}
+                display:flex;flex-direction:column;align-items:center;justify-content:center;
+                text-align:center;border:1px solid {CARD_BORDER};">
+                {f'<div style="color:{t["sub"]};letter-spacing:.1em;text-transform:uppercase;margin-bottom:1rem;font-family:{t["font"]};{text_shadow}">{cur_ref}</div>' if cur_ref else ''}
+                <div style="color:{t['fg']};font-family:{t['font']};font-size:calc(1.5rem * {live_scale});font-weight:700;white-space:pre-line;line-height:1.4;{text_shadow}">{display_text}</div>
+                </div>"""
+            )
+        st.caption("This mirrors the projector exactly, including the live background and font size — locked to a fixed size, never scrolls.")
+        st.markdown("**Up Next**")
+        nxt_ref, nxt_text, nxt_text2 = (None, "—", None)
+        if slides and slide_index + 1 < len(slides):
+            nxt_ref, nxt_text, nxt_text2 = slides[slide_index + 1]
+        elif not adhoc and item_index + 1 < len(items):
+            nslides = item_slides(items[item_index + 1], state.get("font_scale") or 1.0)
+            if nslides:
+                nxt_ref, nxt_text, nxt_text2 = nslides[0]
+            nxt_text = f"(Next item) {items[item_index + 1]['title']} — {nxt_text}"
+        nxt_display = "(image slide)" if (nxt_text or "").startswith(IMG_SLIDE_PREFIX) else nxt_text
+        st.markdown(f'<div class="ecc-card">{(nxt_ref + " — ") if nxt_ref else ""}{nxt_display}{(" / " + nxt_text2) if nxt_text2 else ""}</div>', unsafe_allow_html=True)
+
+    with right:
+        st.markdown("**Controls**")
+        st.caption(f"Slide {slide_index + 1 if slides else 0} / {len(slides)}")
+        cp, cn = st.columns(2)
+        if cp.button("◀ PREV", use_container_width=True) and slide_index > 0:
+            if adhoc:
+                set_state(adhoc_index=slide_index - 1, cleared=0)
+            else:
+                set_state(slide_index=slide_index - 1, cleared=0)
+            st.rerun()
+        if cn.button("NEXT ▶", use_container_width=True):
+            if slide_index < len(slides) - 1:
+                if adhoc:
+                    set_state(adhoc_index=slide_index + 1, cleared=0)
+                else:
+                    set_state(slide_index=slide_index + 1, cleared=0)
+                st.rerun()
+            elif not adhoc and item_index + 1 < len(items):
+                set_state(item_index=item_index + 1, slide_index=0, cleared=0)
+                st.rerun()
+        st.write("")
+        if st.button("🖥 Present", use_container_width=True):
+            set_state(cleared=0, black=0, live=1); st.rerun()
+        # This used to be a plain st.button that only showed a text tip —
+        # a regular Streamlit button can't itself call browser JS, so it
+        # could never actually open anything. This renders the real
+        # clickable button (Window Management API auto-open) in its place.
+        render_display_open_widget(compact=True)
+        is_black = bool(state["black"])
+        toggled_black = st.toggle("⬛ Black Screen", value=is_black, key="op_black_toggle")
+        if toggled_black != is_black:
+            set_state(black=1 if toggled_black else 0); st.rerun()
+        st.write("")
+        st.selectbox("Theme", list(THEMES.keys()), index=list(THEMES.keys()).index(theme), key="live_theme",
+                     on_change=lambda: set_state(theme=st.session_state.live_theme))
+
+        st.write("")
+        st.markdown("**Font Size**")
+        cur_scale = state.get("font_scale") or 1.0
+        fm, fp, fpct = st.columns([1, 1, 1.4])
+        if fm.button("➖", use_container_width=True, key="font_minus", help="Smaller text on the projector"):
+            set_state(font_scale=round(max(0.5, cur_scale - 0.1), 2))
+            st.rerun()
+        if fp.button("➕", use_container_width=True, key="font_plus", help="Bigger text on the projector"):
+            set_state(font_scale=round(min(2.0, cur_scale + 0.1), 2))
+            st.rerun()
+        fpct.markdown(f"<div style='text-align:center;padding-top:0.4rem;'>{int(cur_scale*100)}%</div>", unsafe_allow_html=True)
+        st.caption("The \"Current\" panel in the center already mirrors the projector at this size and background — no separate preview needed.")
+
+    st.markdown("---")
+    grid_l, grid_r = st.columns([4, 1.3])
+    with grid_l:
+        st.markdown("**🎬 Slide Grid**")
+        st.caption("ProPresenter-style — every slide of the current item, in order. Click Select on a thumbnail to jump straight to it.")
+    with grid_r:
+        if st.button("⛶ Full Screen", use_container_width=True, key="grid_enter_fs"):
+            st.session_state["presentation_grid_fullscreen"] = True
+            st.rerun()
+    grid_entries = _slide_grid_entries(items, adhoc, slides if adhoc else None, item_index,
+                                        state.get("font_scale") or 1.0, extend=False)
+    _render_slide_grid(grid_entries, adhoc, item_index, slide_index, cols_per_row=4, compact=False, key_prefix="grid_")
+
+    _render_operator_keyboard_shortcuts()
+
+
+def render_import_lyrics_form(key_prefix="lyrics"):
+    """The paste-lyrics importer: paste, click Apply to parse it into slides
+    (packed to a character budget sized for a TV screen — see
+    MAX_SLIDE_CHARS — never splitting a line mid-way), review, then Save.
+    Shared as-is by the Import Lyrics page and the Song Library's inline
+    "Import Songs" section, so there's exactly one text box and one set of
+    rules to keep in sync.
+
+    Uses a counter-suffixed widget key instead of ever writing back into
+    st.session_state[<the textarea's own key>] after the widget has been
+    instantiated — that pattern is exactly what raises
+    StreamlitWidgetAlreadyInstantiatedError. Bumping the counter after Save
+    gives the textarea a fresh key next run, which clears it safely.
+    """
+    counter_key = f"{key_prefix}_counter"
+    st.session_state.setdefault(counter_key, 0)
+    text_key = f"{key_prefix}_input_{st.session_state[counter_key]}"
+
+    raw = st.text_area("Paste lyrics here", height=320, key=text_key,
+                        placeholder="Fall On Me\nSong by NEEDTOBREATHE ‧ 2023\n\nOverview\nLyrics\nYou were there to pick me up\n...")
+
+    category = st.selectbox("Category", ["Worship", "Hymn", "Christmas", "Youth", "Other"], key=f"{key_prefix}_category")
+    tags = st.text_input("Tags (optional)", key=f"{key_prefix}_tags")
+
+    if st.button("✅ Apply", key=f"{key_prefix}_apply", use_container_width=True, disabled=not raw.strip()):
+        title, artist, year, slides = parse_pasted_lyrics(raw)
+        st.session_state[f"{key_prefix}_parsed"] = {"title": title, "artist": artist, "year": year, "slides": slides}
+
+    parsed = st.session_state.get(f"{key_prefix}_parsed")
+    if parsed:
+        st.write("")
+        st.markdown(f"**{parsed['title']}**" + (f" — {parsed['artist']}" if parsed['artist'] else "") + (f" ({parsed['year']})" if parsed['year'] else ""))
+        st.caption(f"{len(parsed['slides'])} slide(s) — packed to fit a TV screen, lines are never cut mid-way.")
+        with st.expander("Preview slides", expanded=True):
+            for i, s in enumerate(parsed["slides"]):
+                st.markdown(f'<div class="ecc-card"><b>Slide {i+1}</b><br>{s}</div>'.replace("\n", "<br>"), unsafe_allow_html=True)
+
+        if st.button("💾 Save Song", key=f"{key_prefix}_save", use_container_width=True, type="primary"):
+            song_id, saved_slides, was_overwrite = upsert_song(parsed["title"], parsed["artist"], category, tags, parsed["slides"])
+            if was_overwrite:
+                st.toast(f"\"{parsed['title']}\" was already in your library — overwritten with this version ({len(saved_slides)} slides).", icon="✅")
+            else:
+                st.toast(f"Saved \"{parsed['title']}\" with {len(saved_slides)} slides to your library.", icon="✅")
+            if turso_configured():
+                try:
+                    turso_push_song(song_id, parsed["title"], parsed["artist"], category, tags, json.dumps(saved_slides))
+                except Exception as e:
+                    st.warning(f"Saved locally, but the Turso sync failed: {e}")
+            st.session_state.pop(f"{key_prefix}_parsed", None)
+            st.session_state[counter_key] += 1
+            st.rerun()
+    else:
+        st.info("Paste lyrics above, then click Apply to see the slide preview.")
+
+
 def page_import_lyrics():
     st.markdown("### Import Lyrics")
     st.caption(
         "Paste lyrics copied straight from a lyrics site — title, artist, and the \"Overview / Lyrics\" "
-        "labels are detected and stripped automatically. A new slide starts every time one fills up "
-        "(4 lines), using however many slides the song needs. This is the only way to add a song here — "
-        "no file upload."
+        "labels are detected and stripped automatically. This is the only way to add a song here — "
+        "no file upload. If the title matches a song already in your library, saving overwrites it "
+        "instead of creating a duplicate."
     )
     st.caption(
         "Expected paste format:\n\n"
         "```\nSong Title\nSong by Artist Name ‧ Year\n\nOverview\nLyrics\n<lyrics...>\n```"
     )
-
-    raw = st.text_area("Paste lyrics here", height=320, key="paste_lyrics_input",
-                        placeholder="Fall On Me\nSong by NEEDTOBREATHE ‧ 2023\n\nOverview\nLyrics\nYou were there to pick me up\n...")
-
-    max_lines = st.slider("Lines per slide", 2, 8, 4, key="paste_lyrics_max_lines",
-                           help="How many lines fill a slide before a new one starts.")
-
-    category = st.selectbox("Category", ["Worship", "Hymn", "Christmas", "Youth", "Other"], key="paste_lyrics_category")
-    tags = st.text_input("Tags (optional)", key="paste_lyrics_tags")
-
-    if raw.strip():
-        title, artist, year, slides = parse_pasted_lyrics(raw, max_lines_per_slide=max_lines)
-        st.write("")
-        st.markdown(f"**{title}**" + (f" — {artist}" if artist else "") + (f" ({year})" if year else ""))
-        st.caption(f"{len(slides)} slide(s) will be created.")
-        with st.expander("Preview slides", expanded=True):
-            for i, s in enumerate(slides):
-                st.markdown(f'<div class="ecc-card"><b>Slide {i+1}</b><br>{s}</div>'.replace("\n", "<br>"), unsafe_allow_html=True)
-
-        if st.button("💾 Save Song", use_container_width=True, type="primary"):
-            song_id, saved_slides = add_song_with_slides(title, artist, category, tags, slides)
-            st.success(f"Saved \"{title}\" with {len(saved_slides)} slides to your library.")
-            if turso_configured():
-                try:
-                    turso_push_song(song_id, title, artist, category, tags, json.dumps(saved_slides))
-                    st.success("Also synced to Turso.")
-                except Exception as e:
-                    st.warning(f"Saved locally, but the Turso sync failed: {e}")
-            st.session_state.paste_lyrics_input = ""
-            st.rerun()
-    else:
-        st.info("Paste a song's lyrics above to see the slide preview.")
+    render_import_lyrics_form(key_prefix="paste_lyrics")
 
 
 def page_import_slides():
@@ -2801,7 +3359,7 @@ def page_import_slides():
                 doc.close()
                 st.session_state["pending_deck_images"] = images
                 st.session_state["pending_deck_title"] = deck_title or "Untitled Deck"
-                st.success(f"Separated into {len(images)} slide(s). Review below, then save.")
+                st.toast(f"Separated into {len(images)} slide(s). Review below, then save.", icon="✅")
             except Exception as e:
                 st.error(f"Couldn't process that PDF: {e}")
 
@@ -2817,7 +3375,7 @@ def page_import_slides():
         if st.button("💾 Save Deck to Library", use_container_width=True, type="primary"):
             title = st.session_state.get("pending_deck_title") or "Untitled Deck"
             add_slide_deck(title, "google_slides_pdf", pending)
-            st.success(f"Saved \"{title}\" to your library — add it to a service from Service Builder.")
+            st.toast(f"Saved \"{title}\" to your library.", icon="✅")
             st.session_state.pop("pending_deck_images", None)
             st.session_state.pop("pending_deck_title", None)
             st.rerun()
@@ -2831,6 +3389,18 @@ def page_import_slides():
         images = json.loads(d["slides"])
         with st.container(border=True):
             st.markdown(f"**{d['title']}** — {len(images)} slide(s)")
+            with st.popover("✏️ Rename"):
+                new_title = st.text_input("New title", value=d["title"], key=f"deck_rename_{d['id']}")
+                if st.button("Save name", key=f"deck_rename_save_{d['id']}") and new_title.strip():
+                    conn = get_conn()
+                    conn.execute("UPDATE slide_decks SET title=? WHERE id=?", (new_title.strip(), d["id"]))
+                    conn.commit(); conn.close()
+                    if turso_configured():
+                        try:
+                            turso_push_slide_deck(d["id"], new_title.strip(), d["source"], d["slides"])
+                        except Exception:
+                            pass
+                    st.rerun()
             b1, b2, b3 = st.columns(3)
             if b1.button("Add to today's service", key=f"deck_add_{d['id']}", use_container_width=True):
                 sid = ensure_active_service()
@@ -2838,71 +3408,18 @@ def page_import_slides():
                 items = json.loads(service["items"]) if service else []
                 items.append(make_deck_item(d))
                 update_service_items(sid, items)
-                st.success(f"Added \"{d['title']}\" to today's service.")
+                st.toast(f"Added \"{d['title']}\" to today's service.", icon="✅")
             if turso_configured():
                 if b2.button("☁️ Sync", key=f"deck_sync_{d['id']}", use_container_width=True):
                     try:
                         turso_push_slide_deck(d["id"], d["title"], d["source"], d["slides"])
-                        st.success("Synced.")
+                        st.toast("Synced.", icon="☁️")
                     except Exception as e:
                         st.error(f"Sync failed: {e}")
-            if b3.button("🗑 Delete", key=f"deck_del_{d['id']}", use_container_width=True):
-                delete_slide_deck(d["id"])
-                st.rerun()
-
-
-def page_rapid_upload():
-    st.markdown("### Rapid Upload")
-    st.caption(
-        "Select several song JSON files at once — each one gets imported into your library "
-        "AND added straight onto today's active service, so you don't have to add them one by "
-        "one afterward. Each file can be a single song object, or a list of songs."
-    )
-    st.caption('Expected shape per song: `{"title":..,"artist":..,"category":..,"tags":..,"lyrics":"verse1\\n\\nverse2"}` '
-               'or with `"slides":["verse1","verse2"]` instead of `"lyrics"`.')
-
-    files = st.file_uploader("Song JSON files", type=["json"], accept_multiple_files=True, key="rapid_upload_files")
-    if files:
-        st.caption(f"{len(files)} file(s) selected.")
-        if st.button(f"⚡ Import {len(files)} file(s) → Today's Service", use_container_width=True):
-            sid = ensure_active_service()
-            service = get_service(sid) if sid else None
-            items = json.loads(service["items"]) if service else []
-            imported, errors = [], []
-            for f in files:
-                try:
-                    data = json.load(f)
-                    entries = [data] if isinstance(data, dict) else data
-                    for entry in entries:
-                        title = (entry.get("title") or "").strip()
-                        if not title:
-                            errors.append(f"{f.name}: an entry is missing a title — skipped.")
-                            continue
-                        artist = entry.get("artist", "")
-                        category = entry.get("category", "Worship")
-                        tags = entry.get("tags", "")
-                        if entry.get("slides"):
-                            lyrics_text = "\n\n".join(entry["slides"])
-                        else:
-                            lyrics_text = entry.get("lyrics", "")
-                        song_id, slides = add_song(title, artist, category, tags, lyrics_text)
-                        items.append({"type": "song", "ref_id": song_id, "title": title, "slides": slides})
-                        imported.append(title)
-                        if turso_configured():
-                            try:
-                                turso_push_song(song_id, title, artist, category, tags, json.dumps(slides))
-                            except Exception:
-                                pass  # local import still succeeded either way
-                except Exception as e:
-                    errors.append(f"{f.name}: couldn't read that file ({e}).")
-
-            if imported:
-                update_service_items(sid, items)
-                st.success(f"Imported and added to today's service: {', '.join(imported)}")
-            if errors:
-                st.warning("Some files had issues:\n" + "\n".join(f"- {e}" for e in errors))
-            if not imported and not errors:
-                st.info("Nothing to import.")
+            with b3.container(key=f"del_wrap_deck_{d['id']}"):
+                if st.button("🗑 Delete", key=f"deck_del_{d['id']}", use_container_width=True):
+                    delete_slide_deck(d["id"])
+                    st.rerun()
 
 
 def page_song_library():
@@ -2935,7 +3452,7 @@ def page_church_settings():
     name = st.text_input("Church name", value=settings["church_name"])
     if st.button("Save"):
         set_settings(church_name=name)
-        st.success("Saved.")
+        st.toast("Saved.", icon="✅")
     st.write("")
     st.markdown("#### Bible & Song Licensing")
     st.caption(
@@ -2961,54 +3478,12 @@ def page_church_settings():
         try:
             data = json.load(bible_file)
             n = import_bible_json(data, translation_name.strip() or "Imported", replace_existing)
-            st.success(f"Imported {n} verses as '{translation_name}'. Find them in the Bible tab.")
+            st.toast(f"Imported {n} verses as '{translation_name}'.", icon="✅")
         except Exception as e:
             st.error(f"Couldn't import that file: {e}")
 
     st.write("")
-    st.markdown("#### Song Backup / Restore")
-    st.caption(
-        "Every song you add or import is saved straight to a database file on disk right away — "
-        "so on a normal restart (closing and reopening the app on this same machine, or just Streamlit "
-        "re-running) nothing is lost; you won't need to re-download it from SongSelect.\n\n"
-        "The one case this doesn't cover: if this app is deployed somewhere with an ephemeral filesystem "
-        "(e.g. a free-tier host that resets everything not checked into your Git repo whenever it redeploys "
-        "or wakes from sleep), the database file itself can get wiped even though the app's code doesn't "
-        "change. That's a hosting-platform behavior, not something fixable from inside the app — the fix "
-        "there is either a persistent volume / external database from your host, or downloading a backup "
-        "here periodically and re-importing it after a reset."
-    )
-    bkcol1, bkcol2 = st.columns(2)
-    with bkcol1:
-        all_songs = get_songs()
-        backup_payload = [
-            {
-                "title": r["title"], "artist": r["artist"], "category": r["category"],
-                "tags": r["tags"], "slides": json.loads(r["slides"]),
-            }
-            for r in all_songs
-        ]
-        st.download_button(
-            "⬇ Download song backup (.json)",
-            data=json.dumps(backup_payload, ensure_ascii=False, indent=2),
-            file_name=f"songs_backup_{now().replace(':', '-')}.json",
-            mime="application/json",
-            use_container_width=True,
-            disabled=not all_songs,
-        )
-    with bkcol2:
-        restore_file = st.file_uploader("Restore from backup", type=["json"], key="song_backup_uploader",
-                                         label_visibility="collapsed")
-        if restore_file is not None and st.button("Restore Songs", use_container_width=True):
-            try:
-                data = json.load(restore_file)
-                n = import_songs_json(data)
-                st.success(f"Restored {n} songs.")
-            except Exception as e:
-                st.error(f"Couldn't restore that file: {e}")
-
-    st.write("")
-    st.markdown("#### Turso Cloud Sync")
+    st.markdown("#### ☁️ Turso Cloud Save")
     if not turso_configured():
         st.caption(
             "Not set up yet. Add `TURSO_DATABASE_URL` and `TURSO_AUTH_TOKEN` to your "
@@ -3017,40 +3492,66 @@ def page_church_settings():
             "`turso db tokens create <name>`."
         )
     else:
+        n_songs, n_services, n_decks = len(get_songs()), len(get_services()), len(get_slide_decks())
+        _conn = get_conn()
+        n_verses = _conn.execute("SELECT COUNT(*) FROM bible_verses").fetchone()[0]
+        _conn.close()
+        total_items = n_songs + n_services + n_decks + 1 + (n_verses / 50.0)  # +1 for background/display settings; verses are cheap in bulk
+        est_seconds = max(2, round(total_items * 0.3))
         st.caption(
-            "Connected. Saving a song (the Save Song button above) automatically pushes just that "
-            "one song to Turso — nothing else runs in the background, and nothing is checked on "
-            "every page load. Use the button below only if you've bulk-imported songs and want to "
-            "push everything at once."
+            f"Pushes everything to Turso in one go — every song, every saved service, the current "
+            f"display background/theme, every imported slide deck, and every imported Bible "
+            f"translation. Right now that's {n_songs} song(s), {n_services} service(s), "
+            f"{n_decks} slide deck(s), and {n_verses} Bible verse(s) — usually about "
+            f"{est_seconds}s. Nothing syncs automatically; this button is the only thing that triggers it."
         )
-        if st.button("☁️ Sync all songs to Turso", use_container_width=True):
-            try:
-                n = turso_push_all_songs()
-                st.success(f"Synced {n} songs to Turso in one request.")
-            except Exception as e:
-                st.error(f"Sync failed: {e}")
+        if st.button("☁️ Save Everything to Turso", use_container_width=True, type="primary"):
+            with st.spinner(f"Saving everything to Turso — usually about {est_seconds}s for "
+                             f"{n_songs} songs, {n_services} services, {n_decks} slide deck(s), "
+                             f"{n_verses} Bible verse(s)…"):
+                start_time = time.time()
+                try:
+                    ns, nsv, nd, nv = turso_sync_all()
+                    elapsed = time.time() - start_time
+                    st.toast(f"Saved everything to Turso in {elapsed:.1f}s — {ns} song(s), "
+                              f"{nsv} service(s), the background, {nd} slide deck(s), and {nv} Bible verse(s).", icon="☁️")
+                except Exception as e:
+                    if _is_turso_space_error(e):
+                        freed = []
+                        deck_name = turso_delete_oldest_deck()
+                        if deck_name:
+                            freed.append(f"slide deck \"{deck_name}\"")
+                        service_name = turso_delete_oldest_service()
+                        if service_name:
+                            freed.append(f"service \"{service_name}\"")
+                        if freed:
+                            st.warning(f"Turso ran out of space — automatically deleted the oldest "
+                                       f"{' and the oldest '.join(freed)} from the cloud to free room. "
+                                       f"Click Save Everything again to finish.")
+                        else:
+                            st.error("Turso ran out of space, and there was nothing old enough in the "
+                                     "cloud to automatically remove.")
+                    else:
+                        st.error(f"Save failed: {e}")
 
-    st.write("")
-    st.markdown("#### Import Songs (bulk)")
-    st.caption(
-        "Upload a JSON or CSV file of songs you/your church have the rights to use.\n\n"
-        "**JSON:** a list of `{\"title\":..., \"artist\":..., \"category\":..., \"tags\":..., \"lyrics\":\"verse one\\n\\nverse two\"}` "
-        "objects (or `\"slides\": [...]` instead of `lyrics`).\n\n"
-        "**CSV:** columns `title, artist, category, tags, lyrics` — since commas/newlines are awkward in CSV, "
-        "separate slides inside the `lyrics` cell with `||`, e.g. `Verse line one||Verse line two||Chorus`."
+
+def _render_bg_preview(theme, current_bg, settings):
+    st.markdown("**Preview**")
+    t = THEMES[theme]
+    if current_bg == CUSTOM_BACKGROUND_KEY and settings.get("custom_background_data"):
+        preview_bg = f"center/cover no-repeat url('{settings['custom_background_data']}')"
+        preview_shadow = "text-shadow:0 2px 18px rgba(0,0,0,0.55);"
+    else:
+        bg_def = BACKGROUNDS.get(current_bg)
+        preview_bg = bg_def["css"] if bg_def else t["bg"]
+        preview_shadow = "text-shadow:0 2px 18px rgba(0,0,0,0.55);" if bg_def else ""
+    render_html(
+        f"""<div style="background:{preview_bg};border-radius:16px;padding:3rem;text-align:center;position:relative;overflow:hidden;">
+        <div style="position:absolute;inset:0;background:radial-gradient(circle, transparent 35%, rgba(0,0,0,0.45) 100%);"></div>
+        <div style="position:relative;color:{t['sub']};text-transform:uppercase;letter-spacing:.1em;margin-bottom:.8rem;font-family:{t['font']};{preview_shadow}">JOHN 3:16</div>
+        <div style="position:relative;color:{t['fg']};font-size:1.6rem;font-weight:700;font-family:{t['font']};{preview_shadow}">For God so loved the world...</div>
+        </div>"""
     )
-    song_file = st.file_uploader("Songs file (.json or .csv)", type=["json", "csv"], key="song_uploader")
-    if song_file is not None and st.button("Import Songs"):
-        try:
-            if song_file.name.lower().endswith(".json"):
-                data = json.load(song_file)
-                n = import_songs_json(data)
-            else:
-                text = io.StringIO(song_file.getvalue().decode("utf-8"))
-                n = import_songs_csv(csv.DictReader(text))
-            st.success(f"Imported {n} songs. Find them in the Songs tab.")
-        except Exception as e:
-            st.error(f"Couldn't import that file: {e}")
 
 
 def page_display_settings():
@@ -3060,7 +3561,7 @@ def page_display_settings():
                           index=list(THEMES.keys()).index(settings["default_theme"]))
     if st.button("Save Default Theme"):
         set_settings(default_theme=theme)
-        st.success("Saved.")
+        st.toast("Saved.", icon="✅")
 
     st.write("")
     st.markdown("#### Background")
@@ -3120,27 +3621,37 @@ def page_display_settings():
             if data_uri:
                 set_settings(custom_background_data=data_uri, default_background=CUSTOM_BACKGROUND_KEY)
                 set_state(background=CUSTOM_BACKGROUND_KEY)
-                st.success("Saved locally and set as the live background.")
+                st.toast("Saved locally and set as the live background.", icon="✅")
                 if turso_configured():
                     try:
                         settings_now = get_settings()
                         turso_push_background(settings_now["default_theme"], CUSTOM_BACKGROUND_KEY,
                                                data_uri, settings_now.get("church_name"))
-                        st.success("Also synced to Turso.")
+                        st.toast("Also synced to Turso.", icon="☁️")
                     except Exception as e:
                         st.warning(f"Saved locally, but the Turso sync failed: {e}")
                 st.rerun()
             else:
                 st.error("Couldn't process that image.")
 
+        if not settings.get("custom_background_data"):
+            st.write("")
+            _render_bg_preview(theme, current_bg, settings)
+
         if settings.get("custom_background_data"):
             st.write("")
             st.markdown("**Saved background**")
             st.image(settings["custom_background_data"], caption="Current custom background (processed)", width=300)
-            if st.button("Use this custom photo now", key="use_custom_bg"):
+            is_active_custom = current_bg == CUSTOM_BACKGROUND_KEY
+            if is_active_custom:
+                st.success("✅ Currently active")
+            if st.button("Use this custom photo now", key="use_custom_bg", disabled=is_active_custom):
                 set_settings(default_background=CUSTOM_BACKGROUND_KEY)
                 set_state(background=CUSTOM_BACKGROUND_KEY)
                 st.rerun()
+
+            st.write("")
+            _render_bg_preview(theme, current_bg, settings)
 
     st.write("")
     st.markdown("#### ☁️ Cloud Sync")
@@ -3148,30 +3659,17 @@ def page_display_settings():
         st.caption("Set up Turso (Church Settings) to enable cloud sync and backups.")
     else:
         st.caption(
-            "Push everything — songs, saved services, the current background, and any imported "
-            "slide decks — to Turso in one go. Nothing syncs automatically; this button is the only "
-            "thing that triggers it."
+            "Push everything — songs, saved services, the current background, any imported slide "
+            "decks, and any imported Bible translations — to Turso in one go. Nothing syncs "
+            "automatically; this button is the only thing that triggers it."
         )
         if st.button("☁️ Sync All to Cloud", use_container_width=True, type="primary"):
             try:
-                n_songs, n_services, n_decks = turso_sync_all()
-                st.success(f"Synced {n_songs} song(s), {n_services} service(s), the background, and {n_decks} slide deck(s).")
+                n_songs, n_services, n_decks, n_verses = turso_sync_all()
+                st.toast(f"Synced {n_songs} song(s), {n_services} service(s), the background, "
+                          f"{n_decks} slide deck(s), and {n_verses} Bible verse(s).", icon="☁️")
             except Exception as e:
                 st.error(f"Sync failed: {e}")
-
-    st.write("")
-    st.markdown("#### Preview")
-    t = THEMES[theme]
-    bg_def = BACKGROUNDS.get(current_bg)
-    preview_bg = bg_def["css"] if bg_def else t["bg"]
-    shadow = "text-shadow:0 2px 18px rgba(0,0,0,0.55);" if bg_def else ""
-    render_html(
-        f"""<div style="background:{preview_bg};border-radius:16px;padding:3rem;text-align:center;position:relative;overflow:hidden;">
-        <div style="position:absolute;inset:0;background:radial-gradient(circle, transparent 35%, rgba(0,0,0,0.45) 100%);"></div>
-        <div style="position:relative;color:{t['sub']};text-transform:uppercase;letter-spacing:.1em;margin-bottom:.8rem;font-family:{t['font']};{shadow}">JOHN 3:16</div>
-        <div style="position:relative;color:{t['fg']};font-size:1.6rem;font-weight:700;font-family:{t['font']};{shadow}">For God so loved the world...</div>
-        </div>"""
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -3205,6 +3703,10 @@ def main():
 
     inject_css()
 
+    if not st.session_state.get("_ecc_splash_shown"):
+        _render_splash_screen()
+        st.session_state["_ecc_splash_shown"] = True
+
     if "page" not in st.session_state:
         st.session_state.page = "Dashboard"
     if "logged_in" not in st.session_state:
@@ -3225,7 +3727,6 @@ def main():
         "Song Library": page_song_library,
         "Import Lyrics": page_import_lyrics,
         "Import Slides": page_import_slides,
-        "Rapid Upload": page_rapid_upload,
         "Saved Services": page_saved_services,
         "Church Settings": page_church_settings,
         "Display Settings": page_display_settings,
@@ -3261,4 +3762,3 @@ if __name__ == "__main__":
     main()
 
 #git status ; git add . ; git commit -m "Your commit message" ; git push
-#pip install -r requirements.txt

@@ -1603,74 +1603,111 @@ def render_html(html_str: str):
 
 def _render_splash_screen():
     """A one-time (per session) full-screen splash: a CSS-built ECC emblem
-    holds for ~5.4s, then fades out over the remaining ~1.6s (7s total),
+    holds for ~6.4s, then fades out over the remaining ~1.6s (8s total),
     while the app content underneath fades in on a matching delay — so the
     reveal feels like a cross-fade rather than a hard cut. Pure CSS/HTML, no
-    image asset required, so there's nothing external to host or break."""
-    render_html(f"""
-    <style>
-    html, body {{ background:{BG} !important; }}
-    @keyframes eccSplashHold {{
-        0%   {{ opacity: 1; }}
-        77%  {{ opacity: 1; }}
-        100% {{ opacity: 0; }}
-    }}
-    @keyframes eccLogoPulse {{
-        0%, 100% {{ transform: scale(1); opacity: 0.92; }}
-        50%      {{ transform: scale(1.05); opacity: 1; }}
-    }}
-    @keyframes eccLoadBar {{
-        0%   {{ width: 0%; }}
-        100% {{ width: 100%; }}
-    }}
-    @keyframes eccAppReveal {{
-        0%   {{ opacity: 0; }}
-        100% {{ opacity: 1; }}
-    }}
-    #ecc-splash {{
-        position: fixed; inset: 0; z-index: 999999;
-        background: radial-gradient(circle at 50% 40%, #17190F 0%, {BG} 72%);
-        display: flex; flex-direction: column; align-items: center; justify-content: center;
-        animation: eccSplashHold 7s ease forwards;
-        pointer-events: none;
-    }}
-    #ecc-splash .ecc-splash-badge {{
-        width: 96px; height: 96px; border-radius: 50%;
-        border: 2px solid {ACCENT}; display:flex; align-items:center; justify-content:center;
-        margin-bottom: 1.5rem; animation: eccLogoPulse 1.8s ease-in-out infinite;
-        box-shadow: 0 0 44px {ACCENT}33;
-    }}
-    #ecc-splash .ecc-splash-badge svg {{ width: 44px; height: 44px; }}
-    #ecc-splash .ecc-splash-word {{
-        font-family: 'Inter', sans-serif; font-weight: 800; font-size: 2.1rem;
-        letter-spacing: 0.14em; color: {TEXT_PRIMARY};
-    }}
-    #ecc-splash .ecc-splash-word span {{ color: {ACCENT}; }}
-    #ecc-splash .ecc-splash-tag {{
-        font-family: 'Inter', sans-serif; font-size: 0.76rem; letter-spacing: 0.3em;
-        text-transform: uppercase; color: {TEXT_MUTED}; margin-top: 0.55rem;
-    }}
-    #ecc-splash .ecc-splash-bar {{
-        width: 160px; height: 2px; background: {CARD_BORDER}; margin-top: 1.7rem;
-        border-radius: 2px; overflow: hidden;
-    }}
-    #ecc-splash .ecc-splash-bar-fill {{
-        height: 100%; background: {ACCENT}; animation: eccLoadBar 6.3s ease forwards;
-    }}
-    [data-testid="stAppViewContainer"] {{ animation: eccAppReveal 1.3s ease 5.1s both; }}
-    </style>
-    <div id="ecc-splash">
-        <div class="ecc-splash-badge">
-            <svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
-                <path d="M12 2V22M4 9H20" stroke="{ACCENT}" stroke-width="1.6" stroke-linecap="round"/>
-                <circle cx="12" cy="12" r="9.3" stroke="{ACCENT}" stroke-width="1" opacity="0.4"/>
-            </svg>
-        </div>
-        <div class="ecc-splash-word">ECC <span>WORSHIP</span></div>
-        <div class="ecc-splash-tag">Prepare · Present · Worship</div>
-        <div class="ecc-splash-bar"><div class="ecc-splash-bar-fill"></div></div>
-    </div>
-    """)
+    image asset required, so there's nothing external to host or break.
+
+    This renders through components.html() (its own iframe) instead of
+    render_html()/st.markdown(), and its JS immediately injects the splash
+    markup into the REAL page (window.parent.document), not just its own
+    iframe. That's not cosmetic — it's the actual fix for "black screen for
+    5+ seconds, logo only shows up at the end": st.markdown() content has to
+    wait for Streamlit to finish reconciling the ENTIRE rest of the page's
+    component tree before it commits to the DOM, so on a script this size
+    the splash was invisible for however long that reconciliation took.
+    A components.html() iframe mounts and runs independently of its
+    siblings — it doesn't wait on them — so injecting the splash from
+    inside it shows the logo essentially as soon as Streamlit can render
+    anything at all, instead of only once the whole page has caught up.
+    """
+    components.html(
+        f"""
+        <script>
+        (function() {{
+            const doc = window.parent.document;
+            if (doc.getElementById('ecc-splash')) return;  // already injected this session
+
+            const style = doc.createElement('style');
+            style.textContent = `
+                html, body {{ background:{BG} !important; }}
+                @keyframes eccSplashHold {{
+                    0%   {{ opacity: 1; }}
+                    80%  {{ opacity: 1; }}
+                    100% {{ opacity: 0; }}
+                }}
+                @keyframes eccLogoPulse {{
+                    0%, 100% {{ transform: scale(1); opacity: 0.92; }}
+                    50%      {{ transform: scale(1.05); opacity: 1; }}
+                }}
+                @keyframes eccLoadBar {{
+                    0%   {{ width: 0%; }}
+                    100% {{ width: 100%; }}
+                }}
+                @keyframes eccAppReveal {{
+                    0%   {{ opacity: 0; }}
+                    100% {{ opacity: 1; }}
+                }}
+                #ecc-splash {{
+                    position: fixed; inset: 0; z-index: 999999;
+                    background: radial-gradient(circle at 50% 40%, #17190F 0%, {BG} 72%);
+                    display: flex; flex-direction: column; align-items: center; justify-content: center;
+                    animation: eccSplashHold 8s ease forwards;
+                    pointer-events: none;
+                }}
+                #ecc-splash .ecc-splash-badge {{
+                    width: 96px; height: 96px; border-radius: 50%;
+                    border: 2px solid {ACCENT}; display:flex; align-items:center; justify-content:center;
+                    margin-bottom: 1.5rem; animation: eccLogoPulse 1.8s ease-in-out infinite;
+                    box-shadow: 0 0 44px {ACCENT}33;
+                }}
+                #ecc-splash .ecc-splash-badge svg {{ width: 44px; height: 44px; }}
+                #ecc-splash .ecc-splash-word {{
+                    font-family: 'Inter', sans-serif; font-weight: 800; font-size: 2.1rem;
+                    letter-spacing: 0.14em; color: {TEXT_PRIMARY};
+                }}
+                #ecc-splash .ecc-splash-word span {{ color: {ACCENT}; }}
+                #ecc-splash .ecc-splash-tag {{
+                    font-family: 'Inter', sans-serif; font-size: 0.76rem; letter-spacing: 0.3em;
+                    text-transform: uppercase; color: {TEXT_MUTED}; margin-top: 0.55rem;
+                }}
+                #ecc-splash .ecc-splash-bar {{
+                    width: 160px; height: 2px; background: {CARD_BORDER}; margin-top: 1.7rem;
+                    border-radius: 2px; overflow: hidden;
+                }}
+                #ecc-splash .ecc-splash-bar-fill {{
+                    height: 100%; background: {ACCENT}; animation: eccLoadBar 7.2s ease forwards;
+                }}
+                [data-testid="stAppViewContainer"] {{ animation: eccAppReveal 1.3s ease 6.1s both; }}
+            `;
+            doc.head.appendChild(style);
+
+            const splash = doc.createElement('div');
+            splash.id = 'ecc-splash';
+            splash.innerHTML = `
+                <div class="ecc-splash-badge">
+                    <svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+                        <path d="M12 2V22M4 9H20" stroke="{ACCENT}" stroke-width="1.6" stroke-linecap="round"/>
+                        <circle cx="12" cy="12" r="9.3" stroke="{ACCENT}" stroke-width="1" opacity="0.4"/>
+                    </svg>
+                </div>
+                <div class="ecc-splash-word">ECC <span>WORSHIP</span></div>
+                <div class="ecc-splash-tag">Prepare · Present · Worship</div>
+                <div class="ecc-splash-bar"><div class="ecc-splash-bar-fill"></div></div>
+            `;
+            doc.body.appendChild(splash);
+
+            // Belt-and-suspenders: also remove the element once its
+            // animation ends, in case something re-renders the page under
+            // it later in the same session and the CSS class match reruns.
+            setTimeout(function() {{
+                if (splash && splash.parentNode) splash.parentNode.removeChild(splash);
+            }}, 8200);
+        }})();
+        </script>
+        """,
+        height=0,
+    )
 
 
 def inject_css():
@@ -4021,17 +4058,6 @@ def page_display_settings():
 
 def main():
     st.set_page_config(page_title="ECC Worship", page_icon="✝", layout="wide")
-    # init_db() does several CREATE TABLE / ALTER TABLE / SELECT COUNT checks
-    # — cheap once, but it was previously re-run on literally every click
-    # across the whole app (Streamlit reruns main() top-to-bottom on every
-    # interaction). A module-level flag survives across reruns within the
-    # same running process, so this now only actually runs once per app
-    # start instead of once per click — a real, always-on speed win for
-    # every button everywhere, including the phone remote and Presentation.
-    global _DB_INITIALIZED
-    if not _DB_INITIALIZED:
-        init_db()
-        _DB_INITIALIZED = True
 
     qp = st.query_params
     if qp.get("display") == "projector":
@@ -4044,11 +4070,31 @@ def main():
         render_remote()
         return
 
-    inject_css()
-
-    if not st.session_state.get("_ecc_splash_shown"):
+    # The splash used to render AFTER init_db() and inject_css() — both real
+    # work, not instant — so the browser sat on a blank/white tab for
+    # however long that took, and the ECC logo only ever appeared already
+    # partway through its own animation, right as the real app was about to
+    # replace it. This is now the very first thing main() renders (before
+    # any DB setup or CSS injection), so the logo is the first paint the
+    # browser produces, full stop — nothing blocks it anymore.
+    show_splash = not st.session_state.get("_ecc_splash_shown")
+    if show_splash:
         _render_splash_screen()
         st.session_state["_ecc_splash_shown"] = True
+
+    # init_db() does several CREATE TABLE / ALTER TABLE / SELECT COUNT checks
+    # — cheap once, but it was previously re-run on literally every click
+    # across the whole app (Streamlit reruns main() top-to-bottom on every
+    # interaction). A module-level flag survives across reruns within the
+    # same running process, so this now only actually runs once per app
+    # start instead of once per click — a real, always-on speed win for
+    # every button everywhere, including the phone remote and Presentation.
+    global _DB_INITIALIZED
+    if not _DB_INITIALIZED:
+        init_db()
+        _DB_INITIALIZED = True
+
+    inject_css()
 
     if "page" not in st.session_state:
         st.session_state.page = "Dashboard"

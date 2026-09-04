@@ -686,6 +686,42 @@ def get_songs(search="", category="All Songs"):
     return results
 
 
+def delete_song(song_id):
+    conn = get_conn()
+    conn.execute("DELETE FROM songs WHERE id=?", (song_id,))
+    conn.commit()
+    conn.close()
+
+
+def find_duplicate_song_ids():
+    """
+    Groups songs by (title, artist) case-insensitively and returns the ids
+    of every duplicate EXCEPT the one kept per group — the newest-added
+    (highest id), since that's usually the most complete re-import.
+    """
+    conn = get_conn()
+    rows = conn.execute("SELECT id, title, artist FROM songs ORDER BY id").fetchall()
+    conn.close()
+    groups = {}
+    for r in rows:
+        key = (r["title"].strip().lower(), (r["artist"] or "").strip().lower())
+        groups.setdefault(key, []).append(r["id"])
+    to_delete = []
+    for ids in groups.values():
+        if len(ids) > 1:
+            to_delete.extend(ids[:-1])  # keep the highest id (most recent)
+    return to_delete
+
+
+def delete_songs(song_ids):
+    if not song_ids:
+        return
+    conn = get_conn()
+    conn.executemany("DELETE FROM songs WHERE id=?", [(sid,) for sid in song_ids])
+    conn.commit()
+    conn.close()
+
+
 def get_song(song_id):
     conn = get_conn()
     r = conn.execute("SELECT * FROM songs WHERE id=?", (song_id,)).fetchone()
@@ -809,6 +845,8 @@ def parse_pasted_lyrics(raw, max_slide_chars=MAX_SLIDE_CHARS):
     while body_lines and not body_lines[-1].strip():
         body_lines.pop()
 
+    body_lines = strip_musixmatch_footer(body_lines)
+
     stanzas, current = [], []
     for l in body_lines:
         if not l.strip():
@@ -837,6 +875,40 @@ def parse_pasted_lyrics(raw, max_slide_chars=MAX_SLIDE_CHARS):
     if not slides:
         slides = ["(empty)"]
     return title, artist, year, slides
+
+
+MUSIXMATCH_FOOTER_PATTERNS = [
+    re.compile(r"^\s*source\s*:\s*musixmatch\s*$", re.IGNORECASE),
+    re.compile(r"^\s*songwriters?\s*:", re.IGNORECASE),
+    re.compile(r"^\s*writers?\s*:", re.IGNORECASE),
+    re.compile(r"lyrics\s*©", re.IGNORECASE),
+    re.compile(r"^\s*©", re.IGNORECASE),
+]
+
+
+def strip_musixmatch_footer(body_lines):
+    """
+    Musixmatch (and similar lyrics-site) pastes often end with an
+    attribution block like:
+
+        Source: Musixmatch
+        Songwriters: Name One / Name Two
+        Song Title Lyrics © Publisher A, Publisher B
+
+    None of that is part of the song and it must never end up on a slide.
+    Once any footer-marker line is found, that line and everything after it
+    is dropped — the block is always trailing, never in the middle of a
+    stanza the way real lyrics repeats can be.
+    """
+    cut = len(body_lines)
+    for i, line in enumerate(body_lines):
+        if any(p.search(line) for p in MUSIXMATCH_FOOTER_PATTERNS):
+            cut = i
+            break
+    trimmed = body_lines[:cut]
+    while trimmed and not trimmed[-1].strip():
+        trimmed.pop()
+    return trimmed
 
 
 def update_song_slides(song_id, slides):
@@ -1777,14 +1849,27 @@ def inject_css():
         background: linear-gradient(160deg, {CARD} 0%, #101116 100%); margin-bottom: 0.35rem;
         font-size: 0.82rem; color: {TEXT_MUTED};
         transition: border-color .12s ease, box-shadow .12s ease;
+        position: relative; /* anchors the invisible full-card click target below */
     }}
     .slide-thumb.active {{
         border-color: {ACCENT}; color: {TEXT_PRIMARY}; background: {ACCENT}14;
         box-shadow: 0 0 0 1px {ACCENT}55, 0 4px 16px {ACCENT}22;
     }}
+    .slide-thumb:hover {{ border-color: {ACCENT}99; cursor: pointer; }}
+    .slide-thumb-img {{
+        width: 100%; height: 100%; object-fit: cover; border-radius: 6px;
+        position: absolute; inset: 0; z-index: 0;
+    }}
+    .slide-thumb-imgwrap {{ position: relative; width: 100%; height: 100%; border-radius: 6px; overflow: hidden; }}
+    /* The whole card is the click target now — one real Streamlit button,
+       stretched invisibly over the entire card via negative margin +
+       absolute positioning, instead of a separate small "Select" button
+       underneath. Clicking anywhere on the card (text, image, badge — all
+       of it) fires this same button. */
+    .ecc-grid-select {{ position: relative; margin-top: calc(-1 * var(--ecc-thumb-h, 84px) - 0.35rem); height: var(--ecc-thumb-h, 84px); margin-bottom: 0.35rem; }}
+    .ecc-grid-select .stButton {{ height: 100%; }}
     .ecc-grid-select .stButton>button {{
-        border-top-left-radius: 0 !important; border-top-right-radius: 0 !important;
-        margin-top: -0.35rem; font-size: 0.74rem; padding-top: 0.25rem; padding-bottom: 0.25rem;
+        width: 100%; height: 100%; opacity: 0; cursor: pointer;
     }}
     </style>
     """)
@@ -1833,11 +1918,26 @@ def projector_css(theme_name, background_key=None, font_scale=1.0):
     font_scale = font_scale or 1.0
     render_html(f"""
     <style>
-    html, body {{ overflow: hidden !important; height: 100vh; width: 100vw; }}
+    html, body {{ overflow: hidden !important; height: 100vh; width: 100vw; margin:0; padding:0; }}
     #MainMenu, footer, header {{visibility: hidden;}}
     section[data-testid="stSidebar"] {{display:none;}}
-    .block-container {{ padding: 0 !important; max-width: 100% !important; }}
-    .stApp {{ background: {app_bg}; {bg_size_rule} {bg_anim_rule} cursor: none; overflow: hidden !important; }}
+    /* Lock every ancestor Streamlit wraps content in to exactly the
+       viewport, not just html/body and .stApp — otherwise one of these
+       (stAppViewContainer, stMain, the vertical block, or the
+       block-container's own padding) ends up a hair taller than 100vh,
+       which is what let the projector view scroll slightly instead of
+       being truly full-screen. */
+    [data-testid="stAppViewContainer"], [data-testid="stMain"],
+    [data-testid="stAppViewContainer"] > .main,
+    section.main, div[data-testid="stVerticalBlock"],
+    div[data-testid="stAppViewBlockContainer"] {{
+        height: 100vh !important; max-height: 100vh !important; width: 100vw !important;
+        overflow: hidden !important; margin: 0 !important;
+    }}
+    .block-container {{ padding: 0 !important; margin: 0 !important; max-width: 100% !important; height: 100vh !important; overflow: hidden !important; }}
+    .stApp {{ background: {app_bg}; {bg_size_rule} {bg_anim_rule} cursor: none; overflow: hidden !important; height: 100vh !important; width: 100vw !important; }}
+    ::-webkit-scrollbar {{ display: none; width: 0; height: 0; }}
+    * {{ scrollbar-width: none; }}
     @keyframes eccDrift {{
         0% {{ background-position: 0% 50%; }}
         50% {{ background-position: 100% 50%; }}
@@ -1967,10 +2067,19 @@ def render_projector():
         time.sleep(1)
         st.rerun()
 
-    # Press "F" anywhere on this page to toggle real browser fullscreen.
-    # (The old docstring told people to "press F" but nothing was ever
-    # listening for it — F on its own does nothing in a browser by default,
-    # only F11 does. This actually wires it up.)
+    # Real browser fullscreen, two ways in:
+    #  1. Press "F" anywhere on this page (old docstring promised this but
+    #     nothing ever listened for it — F alone does nothing by default,
+    #     only F11 does natively; this wires it up).
+    #  2. The FIRST click or keypress on this page fullscreens it
+    #     automatically, with no need to know about "F" at all. This is the
+    #     fallback for when the auto-open button's cross-window
+    #     requestFullscreen() call gets silently ignored by the browser
+    #     (common — it only reliably fires when called synchronously off
+    #     the very gesture that opened the window, and a lot of browsers
+    #     just refuse it from a different window's script no matter what).
+    #     A single click anywhere the operator would naturally make once
+    #     the display is up covers that gap.
     components.html(
         """
         <script>
@@ -1978,15 +2087,34 @@ def render_projector():
             const doc = window.parent.document;
             if (doc._eccFsBound) return;
             doc._eccFsBound = true;
+
+            function toggleFs() {
+                if (!doc.fullscreenElement) {
+                    doc.documentElement.requestFullscreen().catch(() => {});
+                } else {
+                    doc.exitFullscreen().catch(() => {});
+                }
+            }
             doc.addEventListener('keydown', function(e) {
                 if (e.key.toLowerCase() === 'f' && !e.ctrlKey && !e.metaKey && !e.altKey) {
-                    if (!doc.fullscreenElement) {
-                        doc.documentElement.requestFullscreen().catch(() => {});
-                    } else {
-                        doc.exitFullscreen().catch(() => {});
-                    }
+                    toggleFs();
                 }
             });
+
+            // One-shot: the very first click or keypress (other than the
+            // "f" case above, already handled) fullscreens the display and
+            // then stops listening — doesn't fight the operator if they
+            // later exit fullscreen on purpose.
+            function firstGestureFs(e) {
+                if (e.type === 'keydown' && e.key.toLowerCase() === 'f') return;
+                if (!doc.fullscreenElement) {
+                    doc.documentElement.requestFullscreen().catch(() => {});
+                }
+                doc.removeEventListener('click', firstGestureFs);
+                doc.removeEventListener('keydown', firstGestureFs);
+            }
+            doc.addEventListener('click', firstGestureFs);
+            doc.addEventListener('keydown', firstGestureFs);
         })();
         </script>
         """,
@@ -1997,7 +2125,17 @@ def render_projector():
 def _stage_slide_info(state):
     """Shared by Stage Display and the phone Remote: figures out the current
     slide and a one-line preview of what's coming next, from whichever mode
-    is active (ad-hoc Bible verse vs. a saved service)."""
+    is active (ad-hoc Bible verse vs. a saved service).
+
+    cur_text/cur_text2 and nxt_label can each be an image slide — in which
+    case the raw value is the \\x00IMG\\x00<data-uri> sentinel form, never
+    meant to be printed as text. Every caller must check
+    IMG_SLIDE_PREFIX (via the two is_img_* / nxt_is_img flags returned
+    here) before rendering, the same way the operator's own "Current" panel
+    and the projector already do — that check used to be missing here,
+    which is what dumped raw base64 image data onto the phone remote and
+    stage display as literal garbled text.
+    """
     cur_ref, cur_text, cur_text2 = None, "", None
     nxt_label = "—"
     if state.get("adhoc_active"):
@@ -2006,7 +2144,8 @@ def _stage_slide_info(state):
         if 0 <= si < len(slides):
             cur_ref, cur_text, cur_text2 = slides[si]
         if si + 1 < len(slides):
-            nxt_label = slides[si + 1][0] or slides[si + 1][1][:40]
+            nxt_ref_or_text = slides[si + 1][1]
+            nxt_label = "🖼️ Image slide" if nxt_ref_or_text.startswith(IMG_SLIDE_PREFIX) else (slides[si + 1][0] or nxt_ref_or_text[:40])
     elif state.get("service_id"):
         service = get_service(state["service_id"])
         if service:
@@ -2018,10 +2157,16 @@ def _stage_slide_info(state):
                 if 0 <= si < len(slides):
                     cur_ref, cur_text, cur_text2 = slides[si]
                 if si + 1 < len(slides):
-                    nxt_label = slides[si + 1][0] or slides[si + 1][1][:40]
+                    nxt_ref_or_text = slides[si + 1][1]
+                    nxt_label = "🖼️ Image slide" if nxt_ref_or_text.startswith(IMG_SLIDE_PREFIX) else (slides[si + 1][0] or nxt_ref_or_text[:40])
                 elif idx + 1 < len(items):
                     nslides = item_slides(items[idx + 1], state.get("font_scale") or 1.0)
-                    nxt_label = f"(Next) {items[idx + 1]['title']}" + (f" — {nslides[0][0] or nslides[0][1][:30]}" if nslides else "")
+                    if nslides:
+                        n0 = nslides[0][1]
+                        n0_preview = "🖼️ Image slide" if n0.startswith(IMG_SLIDE_PREFIX) else (nslides[0][0] or n0[:30])
+                        nxt_label = f"(Next) {items[idx + 1]['title']} — {n0_preview}"
+                    else:
+                        nxt_label = f"(Next) {items[idx + 1]['title']}"
     hidden = bool(state.get("black") or state.get("cleared") or not state.get("live"))
     return cur_ref, cur_text, cur_text2, nxt_label, hidden
 
@@ -2034,6 +2179,8 @@ def render_stage_display():
     def _tick():
         state = get_state()
         cur_ref, cur_text, cur_text2, nxt_label, hidden = _stage_slide_info(state)
+        cur_is_img = (cur_text or "").startswith(IMG_SLIDE_PREFIX)
+        cur_img_src = cur_text[len(IMG_SLIDE_PREFIX):] if cur_is_img else ""
         # NOTE: render_html() goes through st.markdown(unsafe_allow_html=True),
         # which injects raw HTML but does NOT execute <script> tags — so the
         # clock script here never actually ran, no matter what it computed.
@@ -2041,6 +2188,10 @@ def render_stage_display():
         # is wired up separately below via components.html (a real iframe,
         # where scripts DO execute), which reaches into the parent document
         # to update the #ecc-stage-clock element render_html created.
+        current_html = (
+            f'<img src="{cur_img_src}" class="stage-current-img" />' if (cur_is_img and not hidden)
+            else ("(hidden from projector)" if hidden else (cur_text or "Nothing live"))
+        )
         render_html(f"""
         <style>
         #MainMenu, footer, header {{visibility: hidden;}}
@@ -2054,12 +2205,13 @@ def render_stage_display():
         .stage-current {{ color:#FFFFFF; font-family:'Inter',sans-serif; font-weight:700;
                           font-size: clamp(1.6rem,4vw,3.4rem); line-height:1.35; white-space:pre-line;
                           padding-bottom: 3vh; border-bottom: 1px solid #24262C; margin-bottom: 3vh; }}
+        .stage-current-img {{ max-width:100%; max-height:34vh; object-fit:contain; border-radius:8px; }}
         .stage-next {{ color:#C9CBD1; font-family:'Inter',sans-serif; font-size: clamp(1rem,2vw,1.6rem);
                       line-height:1.4; }}
         </style>
         <div class="stage-clock" id="ecc-stage-clock">--:--</div>
         <div class="stage-label">Now</div>
-        <div class="stage-current">{"(hidden from projector)" if hidden else (cur_text or "Nothing live")}</div>
+        <div class="stage-current">{current_html}</div>
         <div class="stage-label">Up Next</div>
         <div class="stage-next">{nxt_label}</div>
         """)
@@ -2098,7 +2250,14 @@ def render_stage_display():
 def render_remote():
     """A stripped-down mobile control view (open ?display=remote on a
     phone) — big Prev/Next/Black buttons so any volunteer can advance
-    slides without needing the full operator screen."""
+    slides without needing the full operator screen. Also offers a
+    full-catalog Slide Grid view (see render_remote_grid) for browsing every
+    slide in the active service without needing to pick a song/verse first."""
+    st.session_state.setdefault("remote_grid_mode", False)
+    if st.session_state["remote_grid_mode"]:
+        render_remote_grid()
+        return
+
     state = get_state()
     cur_ref, cur_text, cur_text2, nxt_label, hidden = _stage_slide_info(state)
 
@@ -2111,7 +2270,14 @@ def render_remote():
     </style>
     """)
     render_status_badge(state)
-    st.markdown(f"**Now:** {'(hidden)' if hidden else (cur_text[:80] or 'Nothing live')}")
+    cur_is_img = (cur_text or "").startswith(IMG_SLIDE_PREFIX)
+    if hidden:
+        st.markdown("**Now:** (hidden)")
+    elif cur_is_img:
+        st.markdown("**Now:**")
+        render_html(f'<img src="{cur_text[len(IMG_SLIDE_PREFIX):]}" style="max-width:100%;max-height:22vh;object-fit:contain;border-radius:8px;" />')
+    else:
+        st.markdown(f"**Now:** {cur_text[:80] or 'Nothing live'}")
     st.caption(f"Up next: {nxt_label}")
     st.write("")
 
@@ -2158,6 +2324,90 @@ def render_remote():
     if st.button(black_label, use_container_width=True, key="remote_black"):
         set_state(black=0 if is_black else 1)
         st.rerun()
+    st.write("")
+    if st.button("🎬 Slide Grid", use_container_width=True, key="remote_open_grid"):
+        st.session_state["remote_grid_mode"] = True
+        st.rerun()
+
+
+def render_remote_grid():
+    """Full-catalog slide browser for the phone remote (#10) — every slide
+    in the active service, no song/verse selection needed first. Controls
+    are packed tightly and horizontally at the top (Black Screen, Prev,
+    Next, Back) instead of the normal remote's big stacked buttons, since
+    this view is about scanning/tapping slides, not one-handed operation."""
+    state = get_state()
+    render_html("""
+    <style>
+    #MainMenu, footer, header {visibility: hidden;}
+    section[data-testid="stSidebar"] {display:none;}
+    .block-container { padding: 2vw 3vw !important; max-width: 100% !important; }
+    </style>
+    """)
+
+    service = get_service(state["service_id"]) if state.get("service_id") else None
+    items = json.loads(service["items"]) if service else []
+
+    top1, top2, top3, top4 = st.columns(4)
+    with top1:
+        is_black = bool(state.get("black"))
+        if st.button("⬛" if not is_black else "🔆", use_container_width=True, key="rgrid_black",
+                     help="Black Screen"):
+            set_state(black=0 if is_black else 1)
+            st.rerun()
+    with top2:
+        if st.button("◀", use_container_width=True, key="rgrid_prev", help="Previous slide"):
+            adhoc = bool(state.get("adhoc_active"))
+            if adhoc:
+                si = state.get("adhoc_index") or 0
+                if si > 0:
+                    set_state(adhoc_index=si - 1, cleared=0)
+            else:
+                idx = state.get("item_index") or 0
+                si = state.get("slide_index") or 0
+                if si > 0:
+                    set_state(slide_index=si - 1, cleared=0)
+                elif idx > 0:
+                    prev_slides = item_slides(items[idx - 1], state.get("font_scale") or 1.0)
+                    set_state(item_index=idx - 1, slide_index=max(0, len(prev_slides) - 1), cleared=0)
+            st.rerun()
+    with top3:
+        if st.button("▶", use_container_width=True, key="rgrid_next", help="Next slide"):
+            adhoc = bool(state.get("adhoc_active"))
+            if adhoc:
+                adhoc_slides = json.loads(state["adhoc_slides"]) if state.get("adhoc_slides") else []
+                si = state.get("adhoc_index") or 0
+                if si < len(adhoc_slides) - 1:
+                    set_state(adhoc_index=si + 1, cleared=0)
+            else:
+                idx = state.get("item_index") or 0
+                si = state.get("slide_index") or 0
+                cur_slides = item_slides(items[idx], state.get("font_scale") or 1.0) if 0 <= idx < len(items) else []
+                if si < len(cur_slides) - 1:
+                    set_state(slide_index=si + 1, cleared=0)
+                elif idx + 1 < len(items):
+                    set_state(item_index=idx + 1, slide_index=0, cleared=0)
+            st.rerun()
+    with top4:
+        if st.button("✕ Back", use_container_width=True, key="rgrid_back"):
+            st.session_state["remote_grid_mode"] = False
+            st.rerun()
+
+    st.write("")
+    if not items:
+        st.caption("No active service — nothing to browse yet.")
+        return
+
+    state = get_state()  # re-fetch: the control row above may have just changed it
+    thumb_px = st.slider("Card size", min_value=50, max_value=160, value=st.session_state.get("rgrid_thumb_px", 84),
+                          step=6, key="rgrid_thumb_px", label_visibility="collapsed")
+    theme = state.get("theme") or "Modern Worship"
+    t = THEMES.get(theme, {})
+    entries = _slide_grid_entries_all(items, state.get("font_scale") or 1.0)
+    _render_slide_grid(entries, adhoc=False, item_index=state.get("item_index") or 0,
+                        slide_index=state.get("slide_index") or 0, cols_per_row=3,
+                        compact=True, key_prefix="rgrid_", thumb_px=thumb_px,
+                        theme_bg=t.get("bg"), theme_fg=t.get("fg"))
 
 
 # ---------------------------------------------------------------------------
@@ -2264,10 +2514,21 @@ def render_display_open_widget(compact=False):
                 msg.innerText = "Popup was blocked — allow popups for this site and try again.";
                 return;
               }}
-              setTimeout(() => {{ try {{ w.document.documentElement.requestFullscreen(); }} catch (e) {{}} }}, 500);
+              // A cross-window requestFullscreen() call only has a chance of
+              // being honored if it runs synchronously off the same user
+              // gesture that opened the window — wrapping it in setTimeout()
+              // (the old code) breaks that activation chain and browsers
+              // silently ignore it, which is why the display could still
+              // end up not actually fullscreen. Calling it immediately here
+              // is the best shot from this side. As a second line of
+              // defense, the new window also arms its OWN listener (see the
+              // ?display=projector page) so the very next click or keypress
+              // inside that window fullscreens it too, with no extra step
+              // needed beyond just clicking on the projector window once.
+              try {{ w.document.documentElement.requestFullscreen(); }} catch (e) {{}}
               msg.innerText = other === current
                 ? "Only one screen detected — opened here. Connect a projector/monitor first for auto-positioning."
-                : "Opened on the second screen. Press F there if it isn't fullscreen yet.";
+                : "Opened on the second screen. If it isn't fullscreen, click anywhere on it once.";
             }} catch (e) {{
               // getScreenDetails was blocked — almost always because the
               // browser's "Window Management" permission was denied (or
@@ -2306,7 +2567,7 @@ def sidebar():
         for label in ["Dashboard", "Service Builder", "Presentation"]:
             nav_button(label)
         st.markdown("###### LIBRARY")
-        for label in ["Song Library", "Import Lyrics", "Import Slides", "Bible", "Saved Services"]:
+        for label in ["Song Library", "Import Slides", "Bible", "Saved Services"]:
             nav_button(label)
         st.markdown("###### SETTINGS")
         for label in ["Church Settings", "Display Settings"]:
@@ -2466,6 +2727,16 @@ def page_songs():
 
     st.write("")
     songs = get_songs(search, cat)
+    dupe_ids = find_duplicate_song_ids()
+    top_l, top_r = st.columns([3, 2])
+    with top_r:
+        if dupe_ids:
+            st.markdown('<div class="ecc-danger">', unsafe_allow_html=True)
+            if st.button(f"🗑 Delete Duplicates ({len(dupe_ids)})", use_container_width=True, key="delete_dupes"):
+                delete_songs(dupe_ids)
+                st.toast(f"Removed {len(dupe_ids)} duplicate song(s).", icon="✅")
+                st.rerun()
+            st.markdown('</div>', unsafe_allow_html=True)
     if not songs:
         st.caption("No songs match — try a different search or filter.")
     for s in songs:
@@ -2493,6 +2764,11 @@ def page_songs():
                         service_items.append(make_song_item(s))
                         update_service_items(sid, service_items)
                         st.toast(f"Added '{s['title']}' to the current service.", icon="✅")
+                with st.container(key=f"del_wrap_song_{s['id']}"):
+                    if st.button("🗑 Delete", key=f"delsong_{s['id']}", use_container_width=True):
+                        delete_song(s["id"])
+                        st.toast(f"Deleted \"{s['title']}\".", icon="✅")
+                        st.rerun()
 
 
 def page_song_workspace():
@@ -2801,11 +3077,19 @@ def page_service_builder():
         song_search = st.text_input("Search songs", key="add_song_search", placeholder="Search by title, artist, or lyrics")
         song_options = {s["id"]: dict(s) for s in get_songs(search=song_search)}
         if song_options:
-            pick_id = st.selectbox("Song", list(song_options.keys()),
-                                    format_func=lambda i: song_options[i]["title"], key="pick_song")
-            if st.button("Add", key="add_song_btn"):
-                items.append(make_song_item(song_options[pick_id]))
-                update_service_items(sid, items); st.rerun()
+            pick_id = st.selectbox(
+                "Song", list(song_options.keys()),
+                format_func=lambda i: f"{song_options[i]['title']} — {song_options[i]['artist']}"
+                if song_options[i]['artist'] else song_options[i]['title'],
+                key="pick_song")
+            picked = song_options[pick_id]
+            if picked.get("artist"):
+                st.caption(f"by {picked['artist']}")
+            if st.button("Add", key="add_song_btn", use_container_width=True):
+                items.append(make_song_item(picked))
+                update_service_items(sid, items)
+                st.toast(f"Added \"{picked['title']}\" — pick another or close when done.", icon="✅")
+                st.rerun()
         elif song_search:
             st.caption("No songs match that search.")
         else:
@@ -2878,7 +3162,19 @@ def _render_service_order_panel(items, state, sid, adhoc, key_prefix=""):
     for i, item in enumerate(items):
         icon = {"song": "🎵", "bible": "📖", "custom": "🖼", "announcement": "📣", "imagedeck": "🖼"}.get(item["type"], "•")
         is_current = (not adhoc and i == state["item_index"])
-        row_go, row_up, row_down = st.columns([5, 1, 1])
+        row_del, row_go, row_up, row_down = st.columns([1, 4, 1, 1])
+        with row_del.container(key=f"{key_prefix}del_wrap_order_{i}"):
+            if st.button("🗑", key=f"{key_prefix}pres_del_{i}", use_container_width=True):
+                items.pop(i)
+                update_service_items(sid, items)
+                if not adhoc:
+                    # Keep pointing at the same logical item after the list
+                    # shifts — same idea as the up/down handlers below.
+                    if state["item_index"] > i:
+                        set_state(item_index=state["item_index"] - 1)
+                    elif state["item_index"] == i:
+                        set_state(item_index=min(i, len(items) - 1) if items else 0, slide_index=0, cleared=1)
+                st.rerun()
         label = f"{'▶ ' if is_current else ''}{i+1:02d} {icon} {item['title']}"
         if row_go.button(label, key=f"{key_prefix}go_{i}", use_container_width=True,
                           type="primary" if is_current else "secondary"):
@@ -2902,6 +3198,21 @@ def _render_service_order_panel(items, state, sid, adhoc, key_prefix=""):
                 elif state["item_index"] == i + 1:
                     set_state(item_index=i)
             st.rerun()
+
+
+def _slide_grid_entries_all(items, font_scale, cap=120):
+    """Like _slide_grid_entries, but flattens EVERY item in the service into
+    one grid regardless of which one is currently selected — used by the
+    phone remote's full-catalog slide browser (#10), where there's no
+    "current song" to scope from; the whole service's slides are the point."""
+    entries = []
+    for ix, it in enumerate(items):
+        for j, (ref, text, text2) in enumerate(item_slides(it, font_scale)):
+            entries.append({"item_idx": ix, "slide_idx": j, "ref": ref, "text": text, "text2": text2,
+                             "item_title": it["title"]})
+            if len(entries) >= cap:
+                return entries
+    return entries
 
 
 def _slide_grid_entries(items, adhoc, adhoc_slides, item_index, font_scale, extend=False, min_count=15, cap=60):
@@ -2937,20 +3248,31 @@ def _slide_grid_entries(items, adhoc, adhoc_slides, item_index, font_scale, exte
     return entries
 
 
-def _render_slide_grid(entries, adhoc, item_index, slide_index, cols_per_row=4, compact=False, key_prefix="grid"):
+def _render_slide_grid(entries, adhoc, item_index, slide_index, cols_per_row=4, compact=False,
+                        key_prefix="grid", thumb_px=None, theme_bg=None, theme_fg=None):
     """The ProPresenter-style thumbnail grid itself. Each cell is a visual
-    'slide' card (reference/item label + a text preview of the actual slide
-    content, or an image badge for imported slide images) with a Select
-    control immediately beneath it, styled via CSS to read as one clickable
-    thumbnail unit. The currently-live slide gets a gold highlighted border
-    via the .slide-thumb.active class so it's obvious at a glance which
-    slide is on the projector right now."""
+    'slide' card — a real rendered image for imported PDF/image slides, or
+    the live theme's background + text color for lyric/verse slides, so the
+    grid actually looks like the projector instead of generic dark boxes.
+    Clicking anywhere on the card selects it (a real Streamlit button is
+    stretched invisibly over the whole card via CSS — see .ecc-grid-select
+    — rather than a separate small "Select" button underneath it). The
+    currently-live slide gets a gold highlighted border via .slide-thumb.active
+    so it's obvious at a glance which slide is on the projector right now.
+
+    thumb_px overrides the card height in pixels (from the size slider on
+    the caller's page); theme_bg/theme_fg are the live theme's CSS
+    background and text color, used behind text-only slides so the grid
+    matches the actual presentation display instead of always showing flat
+    dark cards regardless of the live background/theme."""
     if not entries:
         st.caption("No slides to show yet — pick a song or Bible passage to see its slides here.")
         return
-    thumb_h = "64px" if compact else "84px"
+    thumb_h_px = thumb_px or (64 if compact else 84)
+    thumb_h = f"{thumb_h_px}px"
+    card_bg = theme_bg or None
+    card_fg = theme_fg or None
     idx = 0
-    last_item_seen = None
     while idx < len(entries):
         row = entries[idx:idx + cols_per_row]
         cols = st.columns(cols_per_row)
@@ -2961,28 +3283,40 @@ def _render_slide_grid(entries, adhoc, item_index, slide_index, cols_per_row=4, 
                 or (not adhoc and entry["item_idx"] == item_index and entry["slide_idx"] == slide_index)
             )
             text = entry["text"] or ""
-            if text.startswith(IMG_SLIDE_PREFIX):
-                preview_txt = "🖼️ Image slide"
-            else:
-                preview_txt = text.replace("\n", "  ·  ")
-                if len(preview_txt) > (56 if compact else 78):
-                    preview_txt = preview_txt[:(56 if compact else 78)] + "…"
-                if not preview_txt.strip():
-                    preview_txt = "(blank)"
+            is_img = text.startswith(IMG_SLIDE_PREFIX)
             badge = entry["ref"] or entry["item_title"]
             active_class = "slide-thumb active" if is_active else "slide-thumb"
             with col:
-                render_html(
-                    f'''<div class="{active_class}" style="min-height:{thumb_h};display:flex;flex-direction:column;justify-content:space-between;">
-                    <div style="font-size:0.66rem;text-transform:uppercase;letter-spacing:.06em;opacity:0.8;margin-bottom:0.3rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">
-                    {"● LIVE · " if is_active else ""}{n:02d} · {badge}</div>
-                    <div style="font-size:{'0.72rem' if compact else '0.78rem'};line-height:1.3;">{preview_txt}</div>
-                    </div>'''
-                )
-                st.markdown('<div class="ecc-grid-select">', unsafe_allow_html=True)
-                if st.button("● Live" if is_active else "Select", key=f"{key_prefix}sel_{entry['item_idx']}_{entry['slide_idx']}_{idx}",
-                             use_container_width=True, disabled=is_active,
-                             type="primary" if is_active else "secondary"):
+                if is_img:
+                    img_src = text[len(IMG_SLIDE_PREFIX):]
+                    render_html(
+                        f'''<div class="{active_class}" style="min-height:{thumb_h};height:{thumb_h};padding:0;overflow:hidden;">
+                        <div class="slide-thumb-imgwrap">
+                        <img class="slide-thumb-img" src="{img_src}" />
+                        <div style="position:absolute;top:0;left:0;right:0;z-index:1;background:linear-gradient(180deg,rgba(0,0,0,0.65),transparent);
+                        font-size:0.62rem;text-transform:uppercase;letter-spacing:.06em;color:#fff;padding:0.3rem 0.4rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">
+                        {"● LIVE · " if is_active else ""}{n:02d} · {badge}</div>
+                        </div>
+                        </div>'''
+                    )
+                else:
+                    preview_txt = text.replace("\n", "  ·  ")
+                    if len(preview_txt) > (56 if compact else 78):
+                        preview_txt = preview_txt[:(56 if compact else 78)] + "…"
+                    if not preview_txt.strip():
+                        preview_txt = "(blank)"
+                    bg_style = f"background:{card_bg};" if card_bg and not is_active else ""
+                    fg_style = f"color:{card_fg};" if card_fg and not is_active else ""
+                    render_html(
+                        f'''<div class="{active_class}" style="min-height:{thumb_h};height:{thumb_h};{bg_style}display:flex;flex-direction:column;justify-content:space-between;">
+                        <div style="font-size:0.66rem;text-transform:uppercase;letter-spacing:.06em;opacity:0.8;margin-bottom:0.3rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;{fg_style}">
+                        {"● LIVE · " if is_active else ""}{n:02d} · {badge}</div>
+                        <div style="font-size:{'0.72rem' if compact else '0.78rem'};line-height:1.3;{fg_style}">{preview_txt}</div>
+                        </div>'''
+                    )
+                st.markdown(f'<div class="ecc-grid-select" style="--ecc-thumb-h:{thumb_h};">', unsafe_allow_html=True)
+                if st.button("select", key=f"{key_prefix}sel_{entry['item_idx']}_{entry['slide_idx']}_{idx}",
+                             use_container_width=True, disabled=is_active):
                     if adhoc:
                         set_state(adhoc_index=entry["slide_idx"], cleared=0)
                     else:
@@ -3101,10 +3435,16 @@ def page_presentation():
                 if st.button("✕ Exit Full Screen", use_container_width=True, key="grid_exit_fs"):
                     st.session_state["presentation_grid_fullscreen"] = False
                     st.rerun()
+            fs_thumb_px = st.slider("Card size", min_value=60, max_value=200,
+                                     value=st.session_state.get("fsgrid_thumb_px", 84),
+                                     step=8, key="fsgrid_thumb_px", label_visibility="collapsed")
+            fs_theme = state.get("theme") or "Modern Worship"
+            fs_t = THEMES.get(fs_theme, {})
             fs_entries = _slide_grid_entries(items, adhoc, slides if adhoc else None, item_index,
                                               state.get("font_scale") or 1.0, extend=True, min_count=15)
             _render_slide_grid(fs_entries, adhoc, item_index, slide_index, cols_per_row=5,
-                                compact=True, key_prefix="fsgrid_")
+                                compact=True, key_prefix="fsgrid_", thumb_px=fs_thumb_px,
+                                theme_bg=fs_t.get("bg"), theme_fg=fs_t.get("fg"))
         _render_operator_keyboard_shortcuts()
         return
 
@@ -3138,13 +3478,16 @@ def page_presentation():
         text_shadow = "text-shadow:0 2px 18px rgba(0,0,0,0.55);" if bg_key and bg_key != "None (theme color)" else ""
         live_scale = state.get("font_scale") or 1.0
 
-        # Locked to a fixed-size box (not a growing min-height) so the preview
-        # never resizes as font/content changes — this mirrors the real
-        # projector, which is always locked to the screen it's on and never
-        # scrolls. overflow:hidden is the hard backstop; the font-scale-aware
-        # slide splitting in item_slides() is what keeps content actually
-        # fitting inside it instead of getting clipped.
-        PREVIEW_BOX = "height:320px;overflow:hidden;"
+        # Locked to the projector's actual 16:9 aspect ratio (not just an
+        # arbitrary fixed height) so this box is genuinely the same shape as
+        # the real display, not just "some rectangle" that happened to be
+        # 320px tall — a fixed height with a flexible width drifts out of
+        # sync with 16:9 the moment the browser window is narrower or wider,
+        # which is what caused the preview to visibly not match the TV.
+        # overflow:hidden is still the hard backstop against content
+        # overflow; the font-scale-aware slide splitting in item_slides()
+        # is what keeps content actually fitting inside it.
+        PREVIEW_BOX = "aspect-ratio:16/9;width:100%;max-height:360px;overflow:hidden;"
 
         if cur_text.startswith(IMG_SLIDE_PREFIX) and not hidden:
             img_src = cur_text[len(IMG_SLIDE_PREFIX):]
@@ -3249,14 +3592,18 @@ def page_presentation():
     grid_l, grid_r = st.columns([4, 1.3])
     with grid_l:
         st.markdown("**🎬 Slide Grid**")
-        st.caption("ProPresenter-style — every slide of the current item, in order. Click Select on a thumbnail to jump straight to it.")
+        st.caption("ProPresenter-style — every slide of the current item, in order. Click a thumbnail to jump straight to it.")
     with grid_r:
         if st.button("⛶ Full Screen", use_container_width=True, key="grid_enter_fs"):
             st.session_state["presentation_grid_fullscreen"] = True
             st.rerun()
+    grid_thumb_px = st.slider("Card size", min_value=60, max_value=200,
+                               value=st.session_state.get("grid_thumb_px", 84),
+                               step=8, key="grid_thumb_px", label_visibility="collapsed")
     grid_entries = _slide_grid_entries(items, adhoc, slides if adhoc else None, item_index,
                                         state.get("font_scale") or 1.0, extend=False)
-    _render_slide_grid(grid_entries, adhoc, item_index, slide_index, cols_per_row=4, compact=False, key_prefix="grid_")
+    _render_slide_grid(grid_entries, adhoc, item_index, slide_index, cols_per_row=4, compact=False,
+                        key_prefix="grid_", thumb_px=grid_thumb_px, theme_bg=card_bg, theme_fg=t.get("fg"))
 
     _render_operator_keyboard_shortcuts()
 
@@ -3314,21 +3661,6 @@ def render_import_lyrics_form(key_prefix="lyrics"):
             st.rerun()
     else:
         st.info("Paste lyrics above, then click Apply to see the slide preview.")
-
-
-def page_import_lyrics():
-    st.markdown("### Import Lyrics")
-    st.caption(
-        "Paste lyrics copied straight from a lyrics site — title, artist, and the \"Overview / Lyrics\" "
-        "labels are detected and stripped automatically. This is the only way to add a song here — "
-        "no file upload. If the title matches a song already in your library, saving overwrites it "
-        "instead of creating a duplicate."
-    )
-    st.caption(
-        "Expected paste format:\n\n"
-        "```\nSong Title\nSong by Artist Name ‧ Year\n\nOverview\nLyrics\n<lyrics...>\n```"
-    )
-    render_import_lyrics_form(key_prefix="paste_lyrics")
 
 
 def page_import_slides():
@@ -3437,7 +3769,18 @@ def page_saved_services():
         items = json.loads(s["items"])
         with st.container(border=True):
             st.markdown(f"**{s['name']}** — {s['service_date']}")
-            st.caption(f"{sum(1 for i in items if i['type']=='song')} songs · {sum(1 for i in items if i['type']=='bible')} Bible passages")
+            n_songs = sum(1 for i in items if i["type"] == "song")
+            n_bible = sum(1 for i in items if i["type"] == "bible")
+            n_ann = sum(1 for i in items if i["type"] == "announcement")
+            n_custom = sum(1 for i in items if i["type"] == "custom")
+            n_deck = sum(1 for i in items if i["type"] == "imagedeck")
+            parts = []
+            if n_songs: parts.append(f"{n_songs} song{'s' if n_songs != 1 else ''}")
+            if n_bible: parts.append(f"{n_bible} Bible passage{'s' if n_bible != 1 else ''}")
+            if n_ann: parts.append(f"{n_ann} announcement{'s' if n_ann != 1 else ''}")
+            if n_custom: parts.append(f"{n_custom} custom slide{'s' if n_custom != 1 else ''}")
+            if n_deck: parts.append(f"{n_deck} imported deck{'s' if n_deck != 1 else ''}")
+            st.caption(" · ".join(parts) if parts else "Empty service")
             b1, b2 = st.columns(2)
             if b1.button("Open in Builder", key=f"sb_{s['id']}"):
                 st.session_state.active_service_id = s["id"]; st.session_state.page = "Service Builder"; st.rerun()
@@ -3725,7 +4068,6 @@ def main():
         "Service Builder": page_service_builder,
         "Presentation": page_presentation,
         "Song Library": page_song_library,
-        "Import Lyrics": page_import_lyrics,
         "Import Slides": page_import_slides,
         "Saved Services": page_saved_services,
         "Church Settings": page_church_settings,

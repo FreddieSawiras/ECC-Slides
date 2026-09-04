@@ -3,3 +3,4 @@ streamlit>=1.33
 Pillow
 requests
 PyMuPDF
+libsql

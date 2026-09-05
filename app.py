@@ -36,6 +36,7 @@ import io
 import re
 import base64
 import requests
+import shutil
 
 try:
     from PIL import Image, ImageFilter, ImageEnhance
@@ -227,6 +228,39 @@ def turso_pull_all_services():
         vals = [cell.get("value") for cell in row]
         services.append(dict(zip(["id", "name", "service_date", "service_time", "items"], vals)))
     return services
+
+
+def turso_pull_all_bible_verses():
+    """Same idea as turso_pull_all_songs/services, for Bible verses — but
+    paginated with LIMIT/OFFSET, since a single full translation is
+    typically ~31,000 rows and pulling that as one HTTP response risked the
+    exact same size/timeout problem already fixed on the PUSH side (see
+    turso_push_bible_verses). Only runs once at cold-start, only when the
+    local bible_verses table is completely empty — this is what was
+    MISSING before: songs and services already restored themselves from
+    Turso after a Streamlit restart wiped the local database, but Bible
+    verses had no equivalent path at all, so an imported-and-synced
+    translation would vanish on every restart even though it was safely
+    sitting in Turso the whole time."""
+    PAGE = 2000
+    offset = 0
+    all_verses = []
+    while True:
+        result = turso_pipeline([
+            (TURSO_BIBLE_VERSES_SCHEMA, None),
+            (f"SELECT book, chapter, verse, text, translation, book_number FROM bible_verses "
+             f"ORDER BY id LIMIT {PAGE} OFFSET {offset}", None)
+        ], timeout=30)
+        rows = result["results"][1]["response"]["result"]["rows"]
+        if not rows:
+            break
+        for row in rows:
+            vals = [cell.get("value") for cell in row]
+            all_verses.append(dict(zip(["book", "chapter", "verse", "text", "translation", "book_number"], vals)))
+        if len(rows) < PAGE:
+            break
+        offset += PAGE
+    return all_verses
 
 
 def turso_push_background(default_theme, default_background, custom_background_data, church_name):
@@ -762,13 +796,50 @@ def init_db():
             json.dumps(["Welcome", "Song", "Song", "Song", "Scripture Reading", "Sermon", "Closing Song"])
         ))
     if c.execute("SELECT COUNT(*) FROM bible_verses").fetchone()[0] == 0:
-        for book, chapters in BIBLE_SAMPLE.items():
-            for chapter, verses in chapters.items():
-                for verse, text in verses.items():
-                    c.execute(
-                        "INSERT OR IGNORE INTO bible_verses(book, chapter, verse, text, translation, book_number) VALUES (?,?,?,?,?,?)",
-                        (book, chapter, verse, text, BIBLE_TRANSLATION_LABEL, BIBLE_BOOK_NUMBERS.get(book))
+        # THE FIX: this used to just reseed the small built-in BIBLE_SAMPLE
+        # set unconditionally, with no attempt to restore whatever
+        # translation you'd actually imported and synced — so a full
+        # imported Bible would vanish every time Streamlit restarted the
+        # app (which wipes local disk), even though it was sitting safely
+        # in Turso the whole time. Now this checks Turso FIRST, exactly
+        # like songs and services already do, and only falls back to the
+        # tiny sample set if there's nothing to restore (Turso not
+        # configured, or genuinely never synced).
+        restored_verses = 0
+        if turso_configured():
+            try:
+                remote_verses = turso_pull_all_bible_verses()
+                if remote_verses:
+                    restore_ts = now()
+                    c.executemany(
+                        "INSERT OR IGNORE INTO bible_verses(book, chapter, verse, text, translation, book_number) "
+                        "VALUES (?,?,?,?,?,?)",
+                        [(v["book"], v["chapter"], v["verse"], v["text"], v["translation"], v["book_number"])
+                         for v in remote_verses]
                     )
+                    conn.commit()
+                    # Restored straight from Turso, so every translation
+                    # that came back is already synced — mark them so the
+                    # next "Sync All" doesn't immediately re-push everything
+                    # it just pulled down (same reasoning as songs/services
+                    # above).
+                    restored_translations = {v["translation"] for v in remote_verses}
+                    c.executemany(
+                        "INSERT OR REPLACE INTO synced_translations(translation, synced_at) VALUES (?,?)",
+                        [(t, restore_ts) for t in restored_translations]
+                    )
+                    conn.commit()
+                    restored_verses = len(remote_verses)
+            except Exception:
+                restored_verses = 0  # Turso unreachable/misconfigured — fall through to the sample seed below
+        if restored_verses == 0:
+            for book, chapters in BIBLE_SAMPLE.items():
+                for chapter, verses in chapters.items():
+                    for verse, text in verses.items():
+                        c.execute(
+                            "INSERT OR IGNORE INTO bible_verses(book, chapter, verse, text, translation, book_number) VALUES (?,?,?,?,?,?)",
+                            (book, chapter, verse, text, BIBLE_TRANSLATION_LABEL, BIBLE_BOOK_NUMBERS.get(book))
+                        )
     conn.commit()
     conn.close()
 
@@ -2366,20 +2437,29 @@ def render_projector():
 
 def _stage_slide_info(state):
     """Shared by Stage Display and the phone Remote: figures out the current
-    slide and a one-line preview of what's coming next, from whichever mode
-    is active (ad-hoc Bible verse vs. a saved service).
+    slide and a preview of what's coming next, from whichever mode is
+    active (ad-hoc Bible verse vs. a saved service).
 
-    cur_text/cur_text2 and nxt_label can each be an image slide — in which
-    case the raw value is the \\x00IMG\\x00<data-uri> sentinel form, never
-    meant to be printed as text. Every caller must check
-    IMG_SLIDE_PREFIX (via the two is_img_* / nxt_is_img flags returned
-    here) before rendering, the same way the operator's own "Current" panel
-    and the projector already do — that check used to be missing here,
-    which is what dumped raw base64 image data onto the phone remote and
-    stage display as literal garbled text.
+    cur_text/cur_text2 can be an image slide — in which case the raw value
+    is the \\x00IMG\\x00<data-uri> sentinel form, never meant to be printed
+    as text. Every caller must check IMG_SLIDE_PREFIX before rendering, the
+    same way the operator's own "Current" panel and the projector already
+    do — that check used to be missing here entirely, which is what dumped
+    raw base64 image data onto the phone remote and stage display as
+    literal garbled text.
+
+    nxt_label is always a short TEXT label (safe to print directly).
+    nxt_img is either None (next slide is text, or there is no next slide)
+    or the actual \\x00IMG\\x00<data-uri> string for the next slide's real
+    image — callers that want a real thumbnail preview of the next slide
+    (not just a "🖼️ Image slide" placeholder label) should check nxt_img
+    the same way they check cur_text, and render it as an <img> when it's
+    set. Before this, "next" only ever got a text placeholder even when the
+    current slide's own image WAS rendered properly — this is what fixed
+    that gap.
     """
     cur_ref, cur_text, cur_text2 = None, "", None
-    nxt_label = "—"
+    nxt_label, nxt_img = "—", None
     if state.get("adhoc_active"):
         slides = json.loads(state["adhoc_slides"]) if state.get("adhoc_slides") else []
         si = state.get("adhoc_index") or 0
@@ -2387,7 +2467,10 @@ def _stage_slide_info(state):
             cur_ref, cur_text, cur_text2 = slides[si]
         if si + 1 < len(slides):
             nxt_ref_or_text = slides[si + 1][1]
-            nxt_label = "🖼️ Image slide" if nxt_ref_or_text.startswith(IMG_SLIDE_PREFIX) else (slides[si + 1][0] or nxt_ref_or_text[:40])
+            if nxt_ref_or_text.startswith(IMG_SLIDE_PREFIX):
+                nxt_label, nxt_img = "Image slide", nxt_ref_or_text
+            else:
+                nxt_label = slides[si + 1][0] or nxt_ref_or_text[:40]
     elif state.get("service_id"):
         service = get_service(state["service_id"])
         if service:
@@ -2400,17 +2483,23 @@ def _stage_slide_info(state):
                     cur_ref, cur_text, cur_text2 = slides[si]
                 if si + 1 < len(slides):
                     nxt_ref_or_text = slides[si + 1][1]
-                    nxt_label = "🖼️ Image slide" if nxt_ref_or_text.startswith(IMG_SLIDE_PREFIX) else (slides[si + 1][0] or nxt_ref_or_text[:40])
+                    if nxt_ref_or_text.startswith(IMG_SLIDE_PREFIX):
+                        nxt_label, nxt_img = "Image slide", nxt_ref_or_text
+                    else:
+                        nxt_label = slides[si + 1][0] or nxt_ref_or_text[:40]
                 elif idx + 1 < len(items):
                     nslides = item_slides(items[idx + 1], state.get("font_scale") or 1.0)
                     if nslides:
                         n0 = nslides[0][1]
-                        n0_preview = "🖼️ Image slide" if n0.startswith(IMG_SLIDE_PREFIX) else (nslides[0][0] or n0[:30])
-                        nxt_label = f"(Next) {items[idx + 1]['title']} — {n0_preview}"
+                        if n0.startswith(IMG_SLIDE_PREFIX):
+                            nxt_label, nxt_img = f"(Next) {items[idx + 1]['title']}", n0
+                        else:
+                            n0_preview = n0[:30] if not nslides[0][0] else nslides[0][0]
+                            nxt_label = f"(Next) {items[idx + 1]['title']} — {n0_preview}"
                     else:
                         nxt_label = f"(Next) {items[idx + 1]['title']}"
     hidden = bool(state.get("black") or state.get("cleared") or not state.get("live"))
-    return cur_ref, cur_text, cur_text2, nxt_label, hidden
+    return cur_ref, cur_text, cur_text2, nxt_label, nxt_img, hidden
 
 
 def render_stage_display():
@@ -2420,7 +2509,7 @@ def render_stage_display():
     without needing to peek at the projector or guess."""
     def _tick():
         state = get_state()
-        cur_ref, cur_text, cur_text2, nxt_label, hidden = _stage_slide_info(state)
+        cur_ref, cur_text, cur_text2, nxt_label, nxt_img, hidden = _stage_slide_info(state)
         cur_is_img = (cur_text or "").startswith(IMG_SLIDE_PREFIX)
         cur_img_src = cur_text[len(IMG_SLIDE_PREFIX):] if cur_is_img else ""
         # NOTE: render_html() goes through st.markdown(unsafe_allow_html=True),
@@ -2433,6 +2522,16 @@ def render_stage_display():
         current_html = (
             f'<img src="{cur_img_src}" class="stage-current-img" />' if (cur_is_img and not hidden)
             else ("(hidden from projector)" if hidden else (cur_text or "Nothing live"))
+        )
+        # Same idea for "next": if the next slide is a real imported image
+        # (e.g. a Google Slides PDF page), show the ACTUAL thumbnail of that
+        # page instead of a generic "🖼️ Image slide" text placeholder —
+        # this used to only apply to the "Now" side, leaving "Up Next"
+        # showing a placeholder even for slides whose real image was
+        # readily available.
+        next_html = (
+            f'<img src="{nxt_img}" class="stage-next-img" />' if nxt_img
+            else nxt_label
         )
         render_html(f"""
         <style>
@@ -2450,12 +2549,13 @@ def render_stage_display():
         .stage-current-img {{ max-width:100%; max-height:34vh; object-fit:contain; border-radius:8px; }}
         .stage-next {{ color:#C9CBD1; font-family:'Inter',sans-serif; font-size: clamp(1rem,2vw,1.6rem);
                       line-height:1.4; }}
+        .stage-next-img {{ max-width:100%; max-height:18vh; object-fit:contain; border-radius:6px; }}
         </style>
         <div class="stage-clock" id="ecc-stage-clock">--:--</div>
         <div class="stage-label">Now</div>
         <div class="stage-current">{current_html}</div>
         <div class="stage-label">Up Next</div>
-        <div class="stage-next">{nxt_label}</div>
+        <div class="stage-next">{next_html}</div>
         """)
         components.html(
             """
@@ -2501,7 +2601,7 @@ def render_remote():
         return
 
     state = get_state()
-    cur_ref, cur_text, cur_text2, nxt_label, hidden = _stage_slide_info(state)
+    cur_ref, cur_text, cur_text2, nxt_label, nxt_img, hidden = _stage_slide_info(state)
 
     render_html("""
     <style>
@@ -2520,7 +2620,14 @@ def render_remote():
         render_html(f'<img src="{cur_text[len(IMG_SLIDE_PREFIX):]}" style="max-width:100%;max-height:22vh;object-fit:contain;border-radius:8px;" />')
     else:
         st.markdown(f"**Now:** {cur_text[:80] or 'Nothing live'}")
-    st.caption(f"Up next: {nxt_label}")
+    # Same real-thumbnail treatment for "Up Next" as "Now" above — before,
+    # an imported PDF/image slide up next only ever showed a "🖼️ Image
+    # slide" text placeholder, never the actual page.
+    if nxt_img:
+        st.caption("Up next:")
+        render_html(f'<img src="{nxt_img}" style="max-width:100%;max-height:14vh;object-fit:contain;border-radius:6px;" />')
+    else:
+        st.caption(f"Up next: {nxt_label}")
     st.write("")
 
     adhoc = bool(state.get("adhoc_active"))
@@ -2573,11 +2680,21 @@ def render_remote():
 
 
 def render_remote_grid():
-    """Full-catalog slide browser for the phone remote (#10) — every slide
-    in the active service, no song/verse selection needed first. Controls
-    are packed tightly and horizontally at the top (Black Screen, Prev,
-    Next, Back) instead of the normal remote's big stacked buttons, since
-    this view is about scanning/tapping slides, not one-handed operation."""
+    """Slide browser for the phone remote — shows the service's order of
+    events (songs, Bible passages, imported slide decks, etc.) as a picker;
+    tapping one filters the grid below to ONLY that item's slides, instead
+    of dumping every slide from the whole service into one giant grid.
+    Controls are packed tightly and horizontally at the top (Black Screen,
+    Prev, Next, Back) instead of the normal remote's big stacked buttons,
+    since this view is about scanning/tapping slides, not one-handed
+    operation.
+
+    Browsing an item here is separate from what's actually LIVE on the
+    projector — picking "Song 2" just filters what this grid shows you;
+    tapping an actual slide thumbnail is what changes the live output
+    (same as it always did). This means you can look ahead at an upcoming
+    song's slides without it affecting what the congregation currently
+    sees."""
     state = get_state()
     render_html("""
     <style>
@@ -2589,6 +2706,7 @@ def render_remote_grid():
 
     service = get_service(state["service_id"]) if state.get("service_id") else None
     items = json.loads(service["items"]) if service else []
+    adhoc = bool(state.get("adhoc_active"))
 
     top1, top2, top3, top4 = st.columns(4)
     with top1:
@@ -2599,7 +2717,6 @@ def render_remote_grid():
             st.rerun()
     with top2:
         if st.button("◀", use_container_width=True, key="rgrid_prev", help="Previous slide"):
-            adhoc = bool(state.get("adhoc_active"))
             if adhoc:
                 si = state.get("adhoc_index") or 0
                 if si > 0:
@@ -2615,7 +2732,6 @@ def render_remote_grid():
             st.rerun()
     with top3:
         if st.button("▶", use_container_width=True, key="rgrid_next", help="Next slide"):
-            adhoc = bool(state.get("adhoc_active"))
             if adhoc:
                 adhoc_slides = json.loads(state["adhoc_slides"]) if state.get("adhoc_slides") else []
                 si = state.get("adhoc_index") or 0
@@ -2636,16 +2752,53 @@ def render_remote_grid():
             st.rerun()
 
     st.write("")
+    if adhoc:
+        st.caption("Presenting a Bible verse directly — not part of a saved service.")
+        state = get_state()
+        adhoc_slides_raw = json.loads(state["adhoc_slides"]) if state.get("adhoc_slides") else []
+        entries = _slide_grid_entries([], True, adhoc_slides_raw, 0, state.get("font_scale") or 1.0)
+        theme = state.get("theme") or "Modern Worship"
+        t = THEMES.get(theme, {})
+        thumb_px = st.slider("Card size", min_value=50, max_value=160, value=st.session_state.get("rgrid_thumb_px", 84),
+                              step=6, key="rgrid_thumb_px", label_visibility="collapsed")
+        _render_slide_grid(entries, adhoc=True, item_index=0, slide_index=state.get("adhoc_index") or 0,
+                            cols_per_row=3, compact=True, key_prefix="rgrid_", thumb_px=thumb_px,
+                            theme_bg=t.get("bg"), theme_fg=t.get("fg"))
+        return
+
     if not items:
         st.caption("No active service — nothing to browse yet.")
         return
 
+    # Which item this phone is currently BROWSING — defaults to whatever's
+    # actually live, but tapping a different item in the picker below only
+    # changes what this grid shows, not what's on the projector.
+    st.session_state.setdefault("rgrid_browse_idx", state.get("item_index") or 0)
+    if st.session_state["rgrid_browse_idx"] >= len(items):
+        st.session_state["rgrid_browse_idx"] = 0
+
+    st.markdown("**Order of Service** — tap one to see its slides")
+    icon_map = {"song": "🎵", "bible": "📖", "custom": "🖼", "announcement": "📣", "imagedeck": "🖼"}
+    picker_cols = st.columns(min(4, len(items)) or 1)
+    for i, it in enumerate(items):
+        is_live_item = (not adhoc and i == (state.get("item_index") or 0))
+        is_browsing = (i == st.session_state["rgrid_browse_idx"])
+        icon = icon_map.get(it["type"], "•")
+        label = f"{'● ' if is_live_item else ''}{icon} {it['title'][:14]}"
+        with picker_cols[i % len(picker_cols)]:
+            if st.button(label, key=f"rgrid_pick_item_{i}", use_container_width=True,
+                         type="primary" if is_browsing else "secondary"):
+                st.session_state["rgrid_browse_idx"] = i
+                st.rerun()
+
+    st.write("")
     state = get_state()  # re-fetch: the control row above may have just changed it
     thumb_px = st.slider("Card size", min_value=50, max_value=160, value=st.session_state.get("rgrid_thumb_px", 84),
                           step=6, key="rgrid_thumb_px", label_visibility="collapsed")
     theme = state.get("theme") or "Modern Worship"
     t = THEMES.get(theme, {})
-    entries = _slide_grid_entries_all(items, state.get("font_scale") or 1.0)
+    browse_idx = st.session_state["rgrid_browse_idx"]
+    entries = _slide_grid_entries(items, False, None, browse_idx, state.get("font_scale") or 1.0, extend=False)
     _render_slide_grid(entries, adhoc=False, item_index=state.get("item_index") or 0,
                         slide_index=state.get("slide_index") or 0, cols_per_row=3,
                         compact=True, key_prefix="rgrid_", thumb_px=thumb_px,
@@ -2812,7 +2965,7 @@ def sidebar():
         for label in ["Song Library", "Import Slides", "Bible", "Saved Services"]:
             nav_button(label)
         st.markdown("###### SETTINGS")
-        for label in ["Church Settings", "Display Settings"]:
+        for label in ["Church Settings", "Display Settings", "Database"]:
             nav_button(label)
 
         st.markdown("---")
@@ -4428,8 +4581,108 @@ def main():
         "Saved Services": page_saved_services,
         "Church Settings": page_church_settings,
         "Display Settings": page_display_settings,
+        "Database": page_database_stats,
     }
     pages.get(st.session_state.page, page_dashboard)()
+
+
+DATABASE_TAB_PASSWORD = "2009"
+
+
+def page_database_stats():
+    """A password-locked tab (separate from the main sign-in) showing how
+    much is in the local database and how much local disk space is left.
+    The password only gates this tab for the current session — it isn't
+    tied to the login system at all, so it re-locks every time the app
+    restarts, same as everything else in session state."""
+    st.markdown("### 📊 Database")
+    if not st.session_state.get("_db_tab_unlocked"):
+        st.caption("This tab is locked.")
+        pw = st.text_input("Password", type="password", key="db_tab_password")
+        if st.button("Unlock", key="db_tab_unlock_btn"):
+            if pw == DATABASE_TAB_PASSWORD:
+                st.session_state["_db_tab_unlocked"] = True
+                st.rerun()
+            else:
+                st.error("Incorrect password.")
+        return
+
+    conn = get_conn()
+    tables = ["songs", "custom_slides", "slide_decks", "services", "templates",
+              "bible_verses", "synced_translations"]
+    counts = {}
+    for t in tables:
+        try:
+            counts[t] = conn.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
+        except sqlite3.OperationalError:
+            counts[t] = None  # table doesn't exist on this install yet
+    translations = conn.execute(
+        "SELECT translation, COUNT(*) as n FROM bible_verses GROUP BY translation ORDER BY translation"
+    ).fetchall()
+    conn.close()
+
+    st.markdown("#### What's in your library")
+    LABELS = {
+        "songs": "🎵 Songs", "custom_slides": "🖼 Custom slides", "slide_decks": "📑 Imported slide decks",
+        "services": "📅 Saved services", "templates": "🧩 Service templates",
+        "bible_verses": "📖 Bible verses (all translations combined)",
+        "synced_translations": "☁️ Translations marked synced to Turso",
+    }
+    cols = st.columns(3)
+    for i, t in enumerate(tables):
+        with cols[i % 3]:
+            n = counts[t]
+            st.metric(LABELS.get(t, t), "—" if n is None else f"{n:,}")
+
+    if translations:
+        st.markdown("#### Bible verses by translation")
+        for r in translations:
+            st.write(f"**{r['translation']}** — {r['n']:,} verses")
+
+    st.markdown("---")
+    st.markdown("#### Storage")
+    # Local disk: real numbers, straight from the filesystem the SQLite
+    # file actually lives on.
+    try:
+        db_size_bytes = os.path.getsize(DB_PATH) if os.path.exists(DB_PATH) else 0
+        total, used, free = shutil.disk_usage(os.path.dirname(DB_PATH) or ".")
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Local database file size", _format_bytes(db_size_bytes))
+        c2.metric("Free disk space", _format_bytes(free))
+        c3.metric("Total disk space", _format_bytes(total))
+        st.caption(
+            "This is the disk of whatever machine is currently running the app. On Streamlit Community "
+            "Cloud specifically, this disk is EPHEMERAL — it's wiped on every restart/redeploy, which is "
+            "why Turso sync exists at all. Free space here isn't a long-term concern the way it would be "
+            "on a normal server; what matters is whether your data is actually synced to Turso."
+        )
+    except Exception as e:
+        st.caption(f"Couldn't read local disk usage: {e}")
+
+    st.write("")
+    if turso_configured():
+        st.caption(
+            "Turso cloud storage: there's no query this app can run to ask Turso how much of your plan's "
+            "storage quota is left — that's only visible from Turso's own dashboard "
+            "(turso.tech → your database → Usage), not through the database connection itself. What this "
+            "app CAN tell you is what's synced (the counts above) versus what's still pending — check "
+            "Church Settings → Cloud Sync for that."
+        )
+    else:
+        st.caption("Turso isn't configured, so there's no cloud storage to report on — everything above is local-only.")
+
+    st.write("")
+    if st.button("Lock this tab", key="db_tab_lock_btn"):
+        st.session_state["_db_tab_unlocked"] = False
+        st.rerun()
+
+
+def _format_bytes(n):
+    for unit in ["B", "KB", "MB", "GB", "TB"]:
+        if abs(n) < 1024:
+            return f"{n:.1f} {unit}" if unit != "B" else f"{n} {unit}"
+        n /= 1024
+    return f"{n:.1f} PB"
 
 
 def render_login():

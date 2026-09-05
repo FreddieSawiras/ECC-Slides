@@ -253,15 +253,21 @@ def turso_push_slide_deck(deck_id, title, source, slides_json):
     _mark_synced("slide_decks", deck_id)
 
 
-def turso_push_bible_verses():
+def turso_push_bible_verses(progress_cb=None):
     """Pushes locally-stored Bible verses to Turso, but only for
     translations that aren't already marked synced (see
     synced_translations, checked in init_db's migration block) — a
     translation's verses don't change after import, only whole
     translations get added or removed, so "already synced" is tracked per
     translation rather than per verse. Batched into chunks — a full
-    translation can be tens of thousands of verses, too many to safely send
-    as one request."""
+    translation can be tens of thousands of verses (a complete Bible is
+    roughly 31,000), too many to safely send as one request, and each
+    batch is its own sequential HTTP round trip — this is genuinely the
+    slowest part of a sync, which is why it's the one piece that reports
+    progress: if progress_cb is given, it's called after every batch as
+    progress_cb(done, total) so the caller can show real, moving feedback
+    instead of a single spinner that gives no sign anything is happening
+    for however long this actually takes."""
     conn = get_conn()
     already_synced = {r["translation"] for r in conn.execute("SELECT translation FROM synced_translations").fetchall()}
     rows = conn.execute(
@@ -270,9 +276,12 @@ def turso_push_bible_verses():
     conn.close()
     rows = [r for r in rows if r["translation"] not in already_synced]
     if not rows:
+        if progress_cb:
+            progress_cb(0, 0)
         return 0
     BATCH = 300
-    for i in range(0, len(rows), BATCH):
+    total = len(rows)
+    for i in range(0, total, BATCH):
         batch = rows[i:i + BATCH]
         statements = [(TURSO_BIBLE_VERSES_SCHEMA, None)] if i == 0 else []
         for r in batch:
@@ -281,7 +290,16 @@ def turso_push_bible_verses():
                 "VALUES (?,?,?,?,?,?)",
                 (r["book"], r["chapter"], r["verse"], r["text"], r["translation"], r["book_number"])
             ))
+        # Note on retries: if this raises partway through (a slow/timed-out
+        # batch), NONE of this translation gets marked synced below, even
+        # though earlier batches in this same run did make it to Turso —
+        # INSERT OR REPLACE means those are safe, harmless no-ops to resend,
+        # so clicking sync again simply redoes the whole translation rather
+        # than corrupting anything. Slower than true resume-from-where-it-
+        # failed would be, but correct.
         turso_pipeline(statements, timeout=30)
+        if progress_cb:
+            progress_cb(min(i + BATCH, total), total)
     conn = get_conn()
     push_ts = now()
     newly_synced_translations = {r["translation"] for r in rows}
@@ -294,7 +312,7 @@ def turso_push_bible_verses():
     return len(rows)
 
 
-def turso_sync_all():
+def turso_sync_all(progress_cb=None):
     """The single 'master sync' button: pushes every CHANGED song, saved
     service, and imported slide deck (skipping anything already synced
     since its last edit — see _rows_needing_sync), any Bible translation
@@ -302,9 +320,24 @@ def turso_sync_all():
     (always — settings has no per-row tracking since it's a single row).
     Still entirely explicit — only runs when the user clicks it, never on a
     timer or on page load. Returns counts of what was ACTUALLY pushed, not
-    the total library size, since unchanged items are now skipped."""
+    the total library size, since unchanged items are now skipped.
+
+    progress_cb, if given, is called as progress_cb(stage_label, done, total)
+    — stage_label names which of the 5 stages is running (songs, services,
+    background, slide decks, Bible verses), done/total are only meaningful
+    within the Bible-verses stage (the one slow enough, and granular
+    enough, to report real sub-progress on a translation that can be tens
+    of thousands of rows split across many sequential Turso requests); for
+    every other stage done/total are just 0/1 so the caller can still show
+    which stage is active even though that stage itself isn't chunked."""
+    def _report(stage, done=0, total=1):
+        if progress_cb:
+            progress_cb(stage, done, total)
+
+    _report("Songs")
     n_songs = turso_push_all_songs()
 
+    _report("Saved services")
     service_rows = _rows_needing_sync("services", ["id", "name", "service_date", "service_time", "items"])
     if service_rows:
         statements = [(TURSO_SERVICES_SCHEMA, None)]
@@ -322,10 +355,12 @@ def turso_sync_all():
         conn.close()
     n_services = len(service_rows)
 
+    _report("Background/display settings")
     settings = get_settings()
     turso_push_background(settings["default_theme"], settings.get("default_background"),
                            settings.get("custom_background_data"), settings.get("church_name"))
 
+    _report("Slide decks")
     deck_rows = _rows_needing_sync("slide_decks", ["id", "title", "source", "slides"])
     if deck_rows:
         statements = [(TURSO_SLIDE_DECKS_SCHEMA, None)]
@@ -343,7 +378,10 @@ def turso_sync_all():
         conn.close()
     n_decks = len(deck_rows)
 
-    n_verses = turso_push_bible_verses()
+    _report("Bible verses", 0, 1)
+    n_verses = turso_push_bible_verses(
+        progress_cb=(lambda done, total: _report("Bible verses", done, max(total, 1))) if progress_cb else None
+    )
 
     return n_songs, n_services, n_decks, n_verses
 
@@ -4098,34 +4136,73 @@ def page_church_settings():
                 f"thing that triggers it."
             )
         if st.button("☁️ Save Everything to Turso", use_container_width=True, type="primary"):
-            with st.spinner(f"Saving changes to Turso — usually about {est_seconds}s…"):
-                start_time = time.time()
-                try:
-                    ns, nsv, nd, nv = turso_sync_all()
-                    elapsed = time.time() - start_time
-                    if ns + nsv + nd + nv == 0:
-                        st.toast(f"Already up to date in {elapsed:.1f}s — nothing new to sync.", icon="☁️")
+            progress_bar = st.progress(0.0)
+            status_line = st.empty()
+            start_time = time.time()
+            # Rough weight per stage so the bar moves at a believable pace —
+            # Bible verses is the only stage broken into real sub-steps
+            # (see turso_push_bible_verses' progress_cb), so it gets most of
+            # the bar's width; the others just tick forward stage-by-stage.
+            STAGE_WEIGHTS = {"Songs": 0.15, "Saved services": 0.15, "Background/display settings": 0.05,
+                             "Slide decks": 0.15, "Bible verses": 0.50}
+            STAGE_ORDER = list(STAGE_WEIGHTS.keys())
+
+            def on_progress(stage, done, total):
+                stage_idx = STAGE_ORDER.index(stage)
+                completed_weight = sum(STAGE_WEIGHTS[s] for s in STAGE_ORDER[:stage_idx])
+                frac_within_stage = (done / total) if total else 0
+                overall = completed_weight + STAGE_WEIGHTS[stage] * frac_within_stage
+                progress_bar.progress(min(overall, 1.0))
+                elapsed = time.time() - start_time
+                if stage == "Bible verses" and total > 1:
+                    status_line.caption(f"{stage} — {done}/{total} verses ({elapsed:.0f}s elapsed)")
+                else:
+                    status_line.caption(f"{stage}… ({elapsed:.0f}s elapsed)")
+
+            try:
+                ns, nsv, nd, nv = turso_sync_all(progress_cb=on_progress)
+                elapsed = time.time() - start_time
+                progress_bar.progress(1.0)
+                status_line.empty()
+                progress_bar.empty()
+                if ns + nsv + nd + nv == 0:
+                    st.toast(f"Already up to date in {elapsed:.1f}s — nothing new to sync.", icon="☁️")
+                else:
+                    st.toast(f"Saved changes to Turso in {elapsed:.1f}s — {ns} song(s), "
+                              f"{nsv} service(s), the background, {nd} slide deck(s), and {nv} Bible verse(s).", icon="☁️")
+            except Exception as e:
+                progress_bar.empty()
+                elapsed = time.time() - start_time
+                status_line.empty()
+                if _is_turso_space_error(e):
+                    freed = []
+                    deck_name = turso_delete_oldest_deck()
+                    if deck_name:
+                        freed.append(f"slide deck \"{deck_name}\"")
+                    service_name = turso_delete_oldest_service()
+                    if service_name:
+                        freed.append(f"service \"{service_name}\"")
+                    if freed:
+                        st.warning(f"Turso ran out of space — automatically deleted the oldest "
+                                   f"{' and the oldest '.join(freed)} from the cloud to free room. "
+                                   f"Click Save Everything again to finish.")
                     else:
-                        st.toast(f"Saved changes to Turso in {elapsed:.1f}s — {ns} song(s), "
-                                  f"{nsv} service(s), the background, {nd} slide deck(s), and {nv} Bible verse(s).", icon="☁️")
-                except Exception as e:
-                    if _is_turso_space_error(e):
-                        freed = []
-                        deck_name = turso_delete_oldest_deck()
-                        if deck_name:
-                            freed.append(f"slide deck \"{deck_name}\"")
-                        service_name = turso_delete_oldest_service()
-                        if service_name:
-                            freed.append(f"service \"{service_name}\"")
-                        if freed:
-                            st.warning(f"Turso ran out of space — automatically deleted the oldest "
-                                       f"{' and the oldest '.join(freed)} from the cloud to free room. "
-                                       f"Click Save Everything again to finish.")
-                        else:
-                            st.error("Turso ran out of space, and there was nothing old enough in the "
-                                     "cloud to automatically remove.")
-                    else:
-                        st.error(f"Save failed: {e}")
+                        st.error("Turso ran out of space, and there was nothing old enough in the "
+                                 "cloud to automatically remove.")
+                elif isinstance(e, requests.exceptions.Timeout):
+                    st.error(
+                        f"Timed out after {elapsed:.0f}s waiting on Turso — the connection to Turso itself "
+                        f"is slow or unresponsive right now (each batch of ~300 Bible verses gets 30s "
+                        f"before this happens). This is on Turso's end, not something stuck in the app — "
+                        f"try again in a bit, or check Turso's status page if it keeps happening."
+                    )
+                elif isinstance(e, requests.exceptions.ConnectionError):
+                    st.error(
+                        f"Couldn't reach Turso after {elapsed:.0f}s — check your internet connection, "
+                        f"and confirm TURSO_DATABASE_URL in your secrets is correct."
+                    )
+                else:
+                    st.error(f"Save failed after {elapsed:.0f}s: {e}")
 
 
 def _render_bg_preview(theme, current_bg, settings):

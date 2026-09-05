@@ -157,23 +157,35 @@ def turso_push_song(song_id, title, artist, category, tags, slides_json):
         ("INSERT OR REPLACE INTO songs(id, title, artist, category, tags, slides, updated_at) "
          "VALUES (?,?,?,?,?,?,?)", (song_id, title, artist, category, tags, slides_json, now())),
     ])
+    _mark_synced("songs", song_id)
 
 
 def turso_push_all_songs():
-    """Explicit bulk push (Church Settings → 'Sync all songs to Turso' button
-    only) — batches every song into ONE HTTP request via the pipeline's
-    multi-statement support, so syncing 100 songs is still a single round
-    trip rather than one request per song."""
-    songs = get_songs()
+    """Bulk push (Church Settings → 'Sync all songs to Turso', and the
+    master Sync All button) — batches every CHANGED song into ONE HTTP
+    request via the pipeline's multi-statement support. Only sends songs
+    whose updated_at is newer than their synced_at (or that have never
+    been synced) — a song that hasn't changed since its last successful
+    push is skipped, instead of being unconditionally re-sent every time
+    this runs. Returns the number actually pushed (not the total count in
+    the library)."""
+    rows = _rows_needing_sync("songs", ["id", "title", "artist", "category", "tags", "slides"])
+    if not rows:
+        return 0
     statements = [(TURSO_SONGS_SCHEMA, None)]
-    for r in songs:
+    push_ts = now()
+    for r in rows:
         statements.append((
             "INSERT OR REPLACE INTO songs(id, title, artist, category, tags, slides, updated_at) "
             "VALUES (?,?,?,?,?,?,?)",
-            (r["id"], r["title"], r["artist"], r["category"], r["tags"], r["slides"], now())
+            (r["id"], r["title"], r["artist"], r["category"], r["tags"], r["slides"], push_ts)
         ))
     turso_pipeline(statements, timeout=30)
-    return len(songs)
+    conn = get_conn()
+    conn.executemany("UPDATE songs SET synced_at=? WHERE id=?", [(push_ts, r["id"]) for r in rows])
+    conn.commit()
+    conn.close()
+    return len(rows)
 
 
 def turso_push_service(service_id, name, service_date, service_time, items_json):
@@ -186,6 +198,7 @@ def turso_push_service(service_id, name, service_date, service_time, items_json)
         ("INSERT OR REPLACE INTO services(id, name, service_date, service_time, items, updated_at) "
          "VALUES (?,?,?,?,?,?)", (service_id, name, service_date, service_time, items_json, now())),
     ])
+    _mark_synced("services", service_id)
 
 
 def turso_pull_all_songs():
@@ -237,18 +250,25 @@ def turso_push_slide_deck(deck_id, title, source, slides_json):
         ("INSERT OR REPLACE INTO slide_decks(id, title, source, slides, updated_at) "
          "VALUES (?,?,?,?,?)", (deck_id, title, source, slides_json, now())),
     ])
+    _mark_synced("slide_decks", deck_id)
 
 
 def turso_push_bible_verses():
-    """Pushes every locally-stored Bible verse (every imported translation)
-    to Turso. Batched into chunks — a full translation can be tens of
-    thousands of verses, too many to safely send as one request — but still
-    only runs when explicitly triggered, same as everything else here."""
+    """Pushes locally-stored Bible verses to Turso, but only for
+    translations that aren't already marked synced (see
+    synced_translations, checked in init_db's migration block) — a
+    translation's verses don't change after import, only whole
+    translations get added or removed, so "already synced" is tracked per
+    translation rather than per verse. Batched into chunks — a full
+    translation can be tens of thousands of verses, too many to safely send
+    as one request."""
     conn = get_conn()
+    already_synced = {r["translation"] for r in conn.execute("SELECT translation FROM synced_translations").fetchall()}
     rows = conn.execute(
         "SELECT book, chapter, verse, text, translation, book_number FROM bible_verses"
     ).fetchall()
     conn.close()
+    rows = [r for r in rows if r["translation"] not in already_synced]
     if not rows:
         return 0
     BATCH = 300
@@ -262,44 +282,66 @@ def turso_push_bible_verses():
                 (r["book"], r["chapter"], r["verse"], r["text"], r["translation"], r["book_number"])
             ))
         turso_pipeline(statements, timeout=30)
+    conn = get_conn()
+    push_ts = now()
+    newly_synced_translations = {r["translation"] for r in rows}
+    conn.executemany(
+        "INSERT OR REPLACE INTO synced_translations(translation, synced_at) VALUES (?,?)",
+        [(t, push_ts) for t in newly_synced_translations]
+    )
+    conn.commit()
+    conn.close()
     return len(rows)
 
 
 def turso_sync_all():
-    """The single 'master sync' button: pushes every song, every saved
-    service, the current background/display settings, every imported slide
-    deck, and every imported Bible translation to Turso in one pass. Still
-    entirely explicit — only runs when the user clicks it, never on a timer
-    or on page load."""
+    """The single 'master sync' button: pushes every CHANGED song, saved
+    service, and imported slide deck (skipping anything already synced
+    since its last edit — see _rows_needing_sync), any Bible translation
+    not already synced, and the current background/display settings
+    (always — settings has no per-row tracking since it's a single row).
+    Still entirely explicit — only runs when the user clicks it, never on a
+    timer or on page load. Returns counts of what was ACTUALLY pushed, not
+    the total library size, since unchanged items are now skipped."""
     n_songs = turso_push_all_songs()
 
-    services = get_services()
-    if services:
+    service_rows = _rows_needing_sync("services", ["id", "name", "service_date", "service_time", "items"])
+    if service_rows:
         statements = [(TURSO_SERVICES_SCHEMA, None)]
-        for s in services:
+        push_ts = now()
+        for s in service_rows:
             statements.append((
                 "INSERT OR REPLACE INTO services(id, name, service_date, service_time, items, updated_at) "
                 "VALUES (?,?,?,?,?,?)",
-                (s["id"], s["name"], s["service_date"], s["service_time"], s["items"], now())
+                (s["id"], s["name"], s["service_date"], s["service_time"], s["items"], push_ts)
             ))
         turso_pipeline(statements, timeout=30)
-    n_services = len(services)
+        conn = get_conn()
+        conn.executemany("UPDATE services SET synced_at=? WHERE id=?", [(push_ts, s["id"]) for s in service_rows])
+        conn.commit()
+        conn.close()
+    n_services = len(service_rows)
 
     settings = get_settings()
     turso_push_background(settings["default_theme"], settings.get("default_background"),
                            settings.get("custom_background_data"), settings.get("church_name"))
 
-    decks = get_slide_decks()
-    if decks:
+    deck_rows = _rows_needing_sync("slide_decks", ["id", "title", "source", "slides"])
+    if deck_rows:
         statements = [(TURSO_SLIDE_DECKS_SCHEMA, None)]
-        for d in decks:
+        push_ts = now()
+        for d in deck_rows:
             statements.append((
                 "INSERT OR REPLACE INTO slide_decks(id, title, source, slides, updated_at) "
                 "VALUES (?,?,?,?,?)",
-                (d["id"], d["title"], d["source"], d["slides"], now())
+                (d["id"], d["title"], d["source"], d["slides"], push_ts)
             ))
         turso_pipeline(statements, timeout=30)
-    n_decks = len(decks)
+        conn = get_conn()
+        conn.executemany("UPDATE slide_decks SET synced_at=? WHERE id=?", [(push_ts, d["id"]) for d in deck_rows])
+        conn.commit()
+        conn.close()
+    n_decks = len(deck_rows)
 
     n_verses = turso_push_bible_verses()
 
@@ -338,6 +380,14 @@ def turso_delete_oldest_service():
     oldest = services[-1]
     turso_pipeline([(TURSO_SERVICES_SCHEMA, None), ("DELETE FROM services WHERE id=?", (oldest["id"],))])
     return oldest["name"]
+
+
+def turso_delete_bible_translation(translation):
+    """Deletes every verse of one translation from Turso — local copy is
+    left untouched (call delete_bible_translation separately for that).
+    Fires only when explicitly requested from the Bible translation delete
+    button, same as every other Turso write in this app."""
+    turso_pipeline([(TURSO_BIBLE_VERSES_SCHEMA, None), ("DELETE FROM bible_verses WHERE translation=?", (translation,))])
 
 
 ACCENT = "#C8A24A"          # warm gold — ECC accent, reserved for brand/primary actions
@@ -571,6 +621,34 @@ def init_db():
     except sqlite3.OperationalError:
         pass  # column already exists (older database)
 
+    # Incremental-sync support: each of these gets an updated_at (stamped on
+    # every local write — see _touch_song/_touch_service/_touch_deck below)
+    # plus a synced_at that's set the moment that exact row is successfully
+    # pushed to Turso. "Sync All to Cloud" then only sends rows where
+    # updated_at is newer than synced_at (or synced_at is still NULL,
+    # meaning it's never been pushed) instead of unconditionally re-pushing
+    # everything every single time, which is what it did before.
+    for tbl in ("songs", "services", "slide_decks"):
+        for col in ("updated_at", "synced_at"):
+            try:
+                c.execute(f"ALTER TABLE {tbl} ADD COLUMN {col} TEXT")
+                conn.commit()
+            except sqlite3.OperationalError:
+                pass  # column already exists (older database)
+    # Bible verses have no natural per-row "last edited" moment (an
+    # imported verse's text never changes after import — only whole
+    # translations get added or removed), so tracking "already synced" per
+    # translation name is the right grain here rather than per verse.
+    c.execute("""CREATE TABLE IF NOT EXISTS synced_translations(
+        translation TEXT PRIMARY KEY, synced_at TEXT
+    )""")
+    conn.commit()
+    # Anything written before this migration existed has updated_at=NULL,
+    # which the "needs sync" check below treats as "never synced, please
+    # push it" — the correct, safe default (better to push once more than
+    # necessary than to silently skip data that's actually never made it to
+    # Turso).
+
     # One-time cleanup: remove any demo songs / sample Bible verses that a
     # previous version of this app seeded into an already-existing database.
     # This never touches songs/verses you added or imported yourself.
@@ -603,10 +681,16 @@ def init_db():
             try:
                 remote_songs = turso_pull_all_songs()
                 for r in remote_songs:
+                    # Restored straight from Turso, so it's already synced —
+                    # stamp updated_at AND synced_at to the same value so
+                    # the very next sync click doesn't immediately re-push
+                    # every song it just pulled down.
+                    restore_ts = now()
                     c.execute(
-                        "INSERT INTO songs(id, title, artist, category, tags, slides, favorite, last_used) "
-                        "VALUES (?,?,?,?,?,?,0,?)",
-                        (r["id"], r["title"], r["artist"], r["category"], r["tags"], r["slides"], now())
+                        "INSERT INTO songs(id, title, artist, category, tags, slides, favorite, last_used, "
+                        "updated_at, synced_at) VALUES (?,?,?,?,?,?,0,?,?,?)",
+                        (r["id"], r["title"], r["artist"], r["category"], r["tags"], r["slides"], now(),
+                         restore_ts, restore_ts)
                     )
                 conn.commit()
                 restored = len(remote_songs)
@@ -622,10 +706,14 @@ def init_db():
         try:
             remote_services = turso_pull_all_services()
             for r in remote_services:
+                # Same reasoning as songs above: pulled straight from
+                # Turso, so already synced — stamp both timestamps now.
+                restore_ts = now()
                 c.execute(
-                    "INSERT INTO services(id, name, service_date, service_time, items, created_at) "
-                    "VALUES (?,?,?,?,?,?)",
-                    (r["id"], r["name"], r["service_date"], r["service_time"], r["items"], now())
+                    "INSERT INTO services(id, name, service_date, service_time, items, created_at, "
+                    "updated_at, synced_at) VALUES (?,?,?,?,?,?,?,?)",
+                    (r["id"], r["name"], r["service_date"], r["service_time"], r["items"], now(),
+                     restore_ts, restore_ts)
                 )
             conn.commit()
         except Exception:
@@ -667,6 +755,60 @@ def seed_songs(conn):
 
 def now():
     return datetime.datetime.now().isoformat()
+
+
+def _touch_song(song_id):
+    """Stamps a song's updated_at to right now — call this after ANY local
+    write to that song (new song, lyric edit, slide reorder, favorite
+    toggle, etc.) so the incremental sync below can tell it's changed since
+    its last push. Deliberately separate from synced_at, which only moves
+    when the row is actually confirmed pushed to Turso."""
+    conn = get_conn()
+    conn.execute("UPDATE songs SET updated_at=? WHERE id=?", (now(), song_id))
+    conn.commit()
+    conn.close()
+
+
+def _touch_service(service_id):
+    """Same idea as _touch_song, for services — call after any items/name/
+    date/time change to that saved service."""
+    conn = get_conn()
+    conn.execute("UPDATE services SET updated_at=? WHERE id=?", (now(), service_id))
+    conn.commit()
+    conn.close()
+
+
+def _touch_deck(deck_id):
+    """Same idea as _touch_song, for imported slide decks."""
+    conn = get_conn()
+    conn.execute("UPDATE slide_decks SET updated_at=? WHERE id=?", (now(), deck_id))
+    conn.commit()
+    conn.close()
+
+
+def _mark_synced(table, row_id):
+    """Stamps a row's synced_at to right now, right after a successful push
+    of that exact row — this is what "already synced" actually checks
+    against on the next sync."""
+    conn = get_conn()
+    conn.execute(f"UPDATE {table} SET synced_at=? WHERE id=?", (now(), row_id))
+    conn.commit()
+    conn.close()
+
+
+def _rows_needing_sync(table, columns):
+    """Returns every row from `table` whose updated_at is newer than its
+    synced_at (or that has never been synced at all — synced_at IS NULL).
+    This is the actual "only sync stuff that isn't already synced" check —
+    everything else already matching is skipped instead of re-pushed."""
+    conn = get_conn()
+    col_list = ", ".join(columns)
+    rows = conn.execute(
+        f"SELECT {col_list} FROM {table} "
+        f"WHERE synced_at IS NULL OR (updated_at IS NOT NULL AND updated_at > synced_at)"
+    ).fetchall()
+    conn.close()
+    return rows
 
 
 # ---------------- Songs ----------------
@@ -738,8 +880,8 @@ def add_song(title, artist, category, tags, lyrics):
     slides = [s.strip() for s in lyrics.split("\n\n") if s.strip()] or ["(empty)"]
     conn = get_conn()
     cur = conn.execute(
-        "INSERT INTO songs(title, artist, category, tags, slides, favorite, last_used) VALUES (?,?,?,?,?,0,?)",
-        (title, artist, category, tags, json.dumps(slides), now())
+        "INSERT INTO songs(title, artist, category, tags, slides, favorite, last_used, updated_at) VALUES (?,?,?,?,?,0,?,?)",
+        (title, artist, category, tags, json.dumps(slides), now(), now())
     )
     song_id = cur.lastrowid
     conn.commit()
@@ -766,15 +908,15 @@ def upsert_song(title, artist, category, tags, slides):
     conn = get_conn()
     if existing:
         conn.execute(
-            "UPDATE songs SET artist=?, category=?, tags=?, slides=? WHERE id=?",
-            (artist, category, tags, json.dumps(slides), existing["id"])
+            "UPDATE songs SET artist=?, category=?, tags=?, slides=?, updated_at=? WHERE id=?",
+            (artist, category, tags, json.dumps(slides), now(), existing["id"])
         )
         song_id = existing["id"]
         was_overwrite = True
     else:
         cur = conn.execute(
-            "INSERT INTO songs(title, artist, category, tags, slides, favorite, last_used) VALUES (?,?,?,?,?,0,?)",
-            (title, artist, category, tags, json.dumps(slides), now())
+            "INSERT INTO songs(title, artist, category, tags, slides, favorite, last_used, updated_at) VALUES (?,?,?,?,?,0,?,?)",
+            (title, artist, category, tags, json.dumps(slides), now(), now())
         )
         song_id = cur.lastrowid
         was_overwrite = False
@@ -790,8 +932,8 @@ def add_song_with_slides(title, artist, category, tags, slides):
     slides = slides or ["(empty)"]
     conn = get_conn()
     cur = conn.execute(
-        "INSERT INTO songs(title, artist, category, tags, slides, favorite, last_used) VALUES (?,?,?,?,?,0,?)",
-        (title, artist, category, tags, json.dumps(slides), now())
+        "INSERT INTO songs(title, artist, category, tags, slides, favorite, last_used, updated_at) VALUES (?,?,?,?,?,0,?,?)",
+        (title, artist, category, tags, json.dumps(slides), now(), now())
     )
     song_id = cur.lastrowid
     conn.commit()
@@ -918,7 +1060,7 @@ def strip_musixmatch_footer(body_lines):
 
 def update_song_slides(song_id, slides):
     conn = get_conn()
-    conn.execute("UPDATE songs SET slides=? WHERE id=?", (json.dumps(slides), song_id))
+    conn.execute("UPDATE songs SET slides=?, updated_at=? WHERE id=?", (json.dumps(slides), now(), song_id))
     conn.commit()
     conn.close()
 
@@ -952,8 +1094,8 @@ def get_custom_slides():
 def add_slide_deck(title, source, slide_data_uris):
     """slide_data_uris: list of base64 data-URI strings, one per slide image."""
     conn = get_conn()
-    conn.execute("INSERT INTO slide_decks(title, source, slides, created_at) VALUES (?,?,?,?)",
-                 (title, source, json.dumps(slide_data_uris), now()))
+    conn.execute("INSERT INTO slide_decks(title, source, slides, created_at, updated_at) VALUES (?,?,?,?,?)",
+                 (title, source, json.dumps(slide_data_uris), now(), now()))
     conn.commit()
     conn.close()
 
@@ -991,8 +1133,8 @@ def make_deck_item(deck_row):
 def create_service(name, service_date, service_time, items=None):
     conn = get_conn()
     cur = conn.execute(
-        "INSERT INTO services(name, service_date, service_time, items, created_at) VALUES (?,?,?,?,?)",
-        (name, service_date, service_time, json.dumps(items or []), now())
+        "INSERT INTO services(name, service_date, service_time, items, created_at, updated_at) VALUES (?,?,?,?,?,?)",
+        (name, service_date, service_time, json.dumps(items or []), now(), now())
     )
     conn.commit()
     sid = cur.lastrowid
@@ -1016,7 +1158,7 @@ def get_service(service_id):
 
 def update_service_items(service_id, items):
     conn = get_conn()
-    conn.execute("UPDATE services SET items=? WHERE id=?", (json.dumps(items), service_id))
+    conn.execute("UPDATE services SET items=?, updated_at=? WHERE id=?", (json.dumps(items), now(), service_id))
     conn.commit()
     conn.close()
 
@@ -1226,6 +1368,21 @@ def get_bible_translations():
     rows = conn.execute("SELECT DISTINCT translation FROM bible_verses ORDER BY translation").fetchall()
     conn.close()
     return [r["translation"] for r in rows] or [BIBLE_TRANSLATION_LABEL]
+
+
+def delete_bible_translation(translation):
+    """Deletes every verse of one translation from the local database, and
+    clears its synced_translations record too — otherwise a re-import of
+    the same translation name would look "already synced" (see
+    turso_push_bible_verses) and silently never get pushed back to Turso.
+    Returns the number of verses deleted."""
+    conn = get_conn()
+    n = conn.execute("SELECT COUNT(*) FROM bible_verses WHERE translation=?", (translation,)).fetchone()[0]
+    conn.execute("DELETE FROM bible_verses WHERE translation=?", (translation,))
+    conn.execute("DELETE FROM synced_translations WHERE translation=?", (translation,))
+    conn.commit()
+    conn.close()
+    return n
 
 
 def get_bible_books(translation=None):
@@ -1535,8 +1692,8 @@ def import_songs_json(data):
         else:
             slides = [s.strip() for s in entry.get("lyrics", "").split("\n\n") if s.strip()] or ["(empty)"]
         conn.execute(
-            "INSERT INTO songs(title, artist, category, tags, slides, favorite, last_used) VALUES (?,?,?,?,?,0,?)",
-            (title, artist, category, tags, json.dumps(slides), now())
+            "INSERT INTO songs(title, artist, category, tags, slides, favorite, last_used, updated_at) VALUES (?,?,?,?,?,0,?,?)",
+            (title, artist, category, tags, json.dumps(slides), now(), now())
         )
         count += 1
     conn.commit()
@@ -1563,8 +1720,8 @@ def import_songs_csv(rows):
         lyrics = row.get("lyrics", "")
         slides = [s.strip() for s in lyrics.split("||") if s.strip()] or ["(empty)"]
         conn.execute(
-            "INSERT INTO songs(title, artist, category, tags, slides, favorite, last_used) VALUES (?,?,?,?,?,0,?)",
-            (title, artist, category, tags, json.dumps(slides), now())
+            "INSERT INTO songs(title, artist, category, tags, slides, favorite, last_used, updated_at) VALUES (?,?,?,?,?,0,?,?)",
+            (title, artist, category, tags, json.dumps(slides), now(), now())
         )
         count += 1
     conn.commit()
@@ -3104,7 +3261,7 @@ def page_service_builder():
         time_ = c3.text_input("Time", value=service["service_time"] or "")
         if st.form_submit_button("Save details"):
             conn = get_conn()
-            conn.execute("UPDATE services SET name=?, service_date=?, service_time=? WHERE id=?", (name, date, time_, sid))
+            conn.execute("UPDATE services SET name=?, service_date=?, service_time=?, updated_at=? WHERE id=?", (name, date, time_, now(), sid))
             conn.commit(); conn.close()
             st.rerun()
 
@@ -3772,7 +3929,7 @@ def page_import_slides():
                 new_title = st.text_input("New title", value=d["title"], key=f"deck_rename_{d['id']}")
                 if st.button("Save name", key=f"deck_rename_save_{d['id']}") and new_title.strip():
                     conn = get_conn()
-                    conn.execute("UPDATE slide_decks SET title=? WHERE id=?", (new_title.strip(), d["id"]))
+                    conn.execute("UPDATE slide_decks SET title=?, updated_at=? WHERE id=?", (new_title.strip(), now(), d["id"]))
                     conn.commit(); conn.close()
                     if turso_configured():
                         try:
@@ -3873,6 +4030,41 @@ def page_church_settings():
             st.error(f"Couldn't import that file: {e}")
 
     st.write("")
+    st.markdown("#### Delete a Translation")
+    existing_translations = get_bible_translations()
+    if not existing_translations:
+        st.caption("No translations imported yet.")
+    else:
+        st.caption(
+            "Removes every verse of the chosen translation from your library. Any Bible slides "
+            "already saved into a service keep their text as-is — deleting a translation here doesn't "
+            "change services you've already built."
+        )
+        del_col1, del_col2 = st.columns([2, 1])
+        translation_to_delete = del_col1.selectbox("Translation", existing_translations, key="bible_delete_pick")
+        also_delete_remote = del_col2.checkbox("Also delete from Turso", value=False, key="bible_delete_remote",
+                                                disabled=not turso_configured(),
+                                                help="Unchecked, this only removes it locally." if turso_configured()
+                                                else "Set up Turso in Church Settings to enable this.")
+        st.markdown('<div class="ecc-danger">', unsafe_allow_html=True)
+        delete_disabled = len(existing_translations) <= 1
+        if st.button(f"🗑 Delete \"{translation_to_delete}\"", key="bible_delete_btn",
+                     use_container_width=True, disabled=delete_disabled):
+            n_deleted = delete_bible_translation(translation_to_delete)
+            if also_delete_remote and turso_configured():
+                try:
+                    turso_delete_bible_translation(translation_to_delete)
+                    st.toast(f"Deleted \"{translation_to_delete}\" ({n_deleted} verses) locally and from Turso.", icon="✅")
+                except Exception as e:
+                    st.toast(f"Deleted \"{translation_to_delete}\" locally, but the Turso delete failed: {e}", icon="⚠️")
+            else:
+                st.toast(f"Deleted \"{translation_to_delete}\" ({n_deleted} verses).", icon="✅")
+            st.rerun()
+        st.markdown('</div>', unsafe_allow_html=True)
+        if delete_disabled:
+            st.caption("This is your only translation, so it can't be deleted — import another one first if you want to remove it.")
+
+    st.write("")
     st.markdown("#### ☁️ Turso Cloud Save")
     if not turso_configured():
         st.caption(
@@ -3882,29 +4074,40 @@ def page_church_settings():
             "`turso db tokens create <name>`."
         )
     else:
-        n_songs, n_services, n_decks = len(get_songs()), len(get_services()), len(get_slide_decks())
+        n_songs_pending = len(_rows_needing_sync("songs", ["id"]))
+        n_services_pending = len(_rows_needing_sync("services", ["id"]))
+        n_decks_pending = len(_rows_needing_sync("slide_decks", ["id"]))
         _conn = get_conn()
-        n_verses = _conn.execute("SELECT COUNT(*) FROM bible_verses").fetchone()[0]
+        _already_synced_translations = {r[0] for r in _conn.execute("SELECT translation FROM synced_translations").fetchall()}
+        n_verses_pending = _conn.execute(
+            "SELECT COUNT(*) FROM bible_verses WHERE translation NOT IN ({})".format(
+                ",".join("?" * len(_already_synced_translations)) or "''"
+            ), tuple(_already_synced_translations)
+        ).fetchone()[0] if _already_synced_translations else _conn.execute("SELECT COUNT(*) FROM bible_verses").fetchone()[0]
         _conn.close()
-        total_items = n_songs + n_services + n_decks + 1 + (n_verses / 50.0)  # +1 for background/display settings; verses are cheap in bulk
+        total_items = n_songs_pending + n_services_pending + n_decks_pending + 1 + (n_verses_pending / 50.0)  # +1 for background/display settings; verses are cheap in bulk
         est_seconds = max(2, round(total_items * 0.3))
-        st.caption(
-            f"Pushes everything to Turso in one go — every song, every saved service, the current "
-            f"display background/theme, every imported slide deck, and every imported Bible "
-            f"translation. Right now that's {n_songs} song(s), {n_services} service(s), "
-            f"{n_decks} slide deck(s), and {n_verses} Bible verse(s) — usually about "
-            f"{est_seconds}s. Nothing syncs automatically; this button is the only thing that triggers it."
-        )
+        if total_items <= 1:  # nothing but the always-sent background/settings row
+            st.caption("Everything is already synced — clicking will just refresh the background/display settings.")
+        else:
+            st.caption(
+                f"Pushes everything that's changed since your last sync to Turso in one go. Right now "
+                f"that's {n_songs_pending} song(s), {n_services_pending} service(s), "
+                f"{n_decks_pending} slide deck(s), and {n_verses_pending} Bible verse(s) not yet synced — "
+                f"usually about {est_seconds}s. Nothing syncs automatically; this button is the only "
+                f"thing that triggers it."
+            )
         if st.button("☁️ Save Everything to Turso", use_container_width=True, type="primary"):
-            with st.spinner(f"Saving everything to Turso — usually about {est_seconds}s for "
-                             f"{n_songs} songs, {n_services} services, {n_decks} slide deck(s), "
-                             f"{n_verses} Bible verse(s)…"):
+            with st.spinner(f"Saving changes to Turso — usually about {est_seconds}s…"):
                 start_time = time.time()
                 try:
                     ns, nsv, nd, nv = turso_sync_all()
                     elapsed = time.time() - start_time
-                    st.toast(f"Saved everything to Turso in {elapsed:.1f}s — {ns} song(s), "
-                              f"{nsv} service(s), the background, {nd} slide deck(s), and {nv} Bible verse(s).", icon="☁️")
+                    if ns + nsv + nd + nv == 0:
+                        st.toast(f"Already up to date in {elapsed:.1f}s — nothing new to sync.", icon="☁️")
+                    else:
+                        st.toast(f"Saved changes to Turso in {elapsed:.1f}s — {ns} song(s), "
+                                  f"{nsv} service(s), the background, {nd} slide deck(s), and {nv} Bible verse(s).", icon="☁️")
                 except Exception as e:
                     if _is_turso_space_error(e):
                         freed = []
@@ -4049,15 +4252,19 @@ def page_display_settings():
         st.caption("Set up Turso (Church Settings) to enable cloud sync and backups.")
     else:
         st.caption(
-            "Push everything — songs, saved services, the current background, any imported slide "
-            "decks, and any imported Bible translations — to Turso in one go. Nothing syncs "
-            "automatically; this button is the only thing that triggers it."
+            "Pushes anything changed since your last sync — songs, saved services, the current "
+            "background, any imported slide decks, and any new Bible translations — to Turso in one "
+            "go. Already-synced items are skipped. Nothing syncs automatically; this button is the "
+            "only thing that triggers it."
         )
         if st.button("☁️ Sync All to Cloud", use_container_width=True, type="primary"):
             try:
                 n_songs, n_services, n_decks, n_verses = turso_sync_all()
-                st.toast(f"Synced {n_songs} song(s), {n_services} service(s), the background, "
-                          f"{n_decks} slide deck(s), and {n_verses} Bible verse(s).", icon="☁️")
+                if n_songs + n_services + n_decks + n_verses == 0:
+                    st.toast("Already up to date — nothing new to sync.", icon="☁️")
+                else:
+                    st.toast(f"Synced {n_songs} song(s), {n_services} service(s), the background, "
+                              f"{n_decks} slide deck(s), and {n_verses} Bible verse(s).", icon="☁️")
             except Exception as e:
                 st.error(f"Sync failed: {e}")
 

@@ -2530,7 +2530,7 @@ def render_stage_display():
         # showing a placeholder even for slides whose real image was
         # readily available.
         next_html = (
-            f'<img src="{nxt_img}" class="stage-next-img" onerror="this.replaceWith(Object.assign(document.createElement(\'div\'),{{textContent:\'(image failed to load)\',style:\'color:#B0463F;font-size:0.9rem;\'}}))" />' if nxt_img
+            f'<div class="stage-next-img-wrap"><img src="{nxt_img}" class="stage-next-img" onerror="this.replaceWith(Object.assign(document.createElement(\'div\'),{{textContent:\'(image failed to load)\',style:\'color:#B0463F;font-size:0.9rem;\'}}))" /></div>' if nxt_img
             else nxt_label
         )
         render_html(f"""
@@ -2546,16 +2546,20 @@ def render_stage_display():
         .stage-current {{ color:#FFFFFF; font-family:'Inter',sans-serif; font-weight:700;
                           font-size: clamp(1.6rem,4vw,3.4rem); line-height:1.35; white-space:pre-line;
                           padding-bottom: 3vh; border-bottom: 1px solid #24262C; margin-bottom: 3vh; }}
-        .stage-current-img {{ max-width:100%; max-height:34vh; object-fit:contain; border-radius:8px; }}
+        .stage-current-img {{ display:block; width:100%; max-height:34vh; object-fit:contain; border-radius:8px; }}
         .stage-next {{ color:#C9CBD1; font-family:'Inter',sans-serif; font-size: clamp(1rem,2vw,1.6rem);
                       line-height:1.4; }}
-        .stage-next-img {{ max-width:100%; max-height:18vh; object-fit:contain; border-radius:6px; }}
+        .stage-next-img-wrap {{
+            width:100%; max-width:640px; border:1px solid #24262C; border-radius:10px;
+            padding:0.6rem; background:#111218; box-sizing:border-box;
+        }}
+        .stage-next-img {{ display:block; width:100%; max-height:18vh; object-fit:contain; border-radius:6px; }}
         </style>
         <div class="stage-clock" id="ecc-stage-clock">--:--</div>
         <div class="stage-label">Now</div>
         <div class="stage-current">{current_html}</div>
         <div class="stage-label">Up Next</div>
-        <div class="stage-next">{next_html}</div>
+        <div class="stage-next" style="width:100%;">{next_html}</div>
         """)
         components.html(
             """
@@ -2617,7 +2621,7 @@ def render_remote():
         st.markdown("**Now:** (hidden)")
     elif cur_is_img:
         st.markdown("**Now:**")
-        render_html(f'<img src="{cur_text[len(IMG_SLIDE_PREFIX):]}" style="max-width:100%;max-height:22vh;object-fit:contain;border-radius:8px;" />')
+        render_html(f'<img src="{cur_text[len(IMG_SLIDE_PREFIX):]}" style="display:block;width:100%;max-height:22vh;object-fit:contain;border-radius:8px;" />')
     else:
         st.markdown(f"**Now:** {cur_text[:80] or 'Nothing live'}")
     # Same real-thumbnail treatment for "Up Next" as "Now" above — before,
@@ -2625,7 +2629,7 @@ def render_remote():
     # slide" text placeholder, never the actual page.
     if nxt_img:
         st.caption("Up next:")
-        render_html(f'<img src="{nxt_img}" style="max-width:100%;max-height:14vh;object-fit:contain;border-radius:6px;" onerror="this.replaceWith(Object.assign(document.createElement(\'div\'),{{textContent:\'(image failed to load)\',style:\'color:#B0463F;font-size:0.85rem;\'}}))" />')
+        render_html(f'<img src="{nxt_img}" style="display:block;width:100%;max-height:14vh;object-fit:contain;border-radius:6px;" onerror="this.replaceWith(Object.assign(document.createElement(\'div\'),{{textContent:\'(image failed to load)\',style:\'color:#B0463F;font-size:0.85rem;\'}}))" />')
     else:
         st.caption(f"Up next: {nxt_label}")
     st.write("")

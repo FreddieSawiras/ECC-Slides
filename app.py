@@ -565,6 +565,11 @@ def init_db():
         conn.commit()
     except sqlite3.OperationalError:
         pass  # column already exists (older database)
+    try:
+        c.execute("ALTER TABLE settings ADD COLUMN meeting_type TEXT")
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass  # column already exists (older database)
 
     # One-time cleanup: remove any demo songs / sample Bible verses that a
     # previous version of this app seeded into an already-existing database.
@@ -1603,10 +1608,11 @@ def render_html(html_str: str):
 
 def _render_splash_screen():
     """A one-time (per session) full-screen splash: a CSS-built ECC emblem
-    holds for ~6.4s, then fades out over the remaining ~1.6s (8s total),
-    while the app content underneath fades in on a matching delay — so the
-    reveal feels like a cross-fade rather than a hard cut. Pure CSS/HTML, no
-    image asset required, so there's nothing external to host or break.
+    holds for ~1.75s, then fades out over the remaining ~0.75s (2.5s total
+    on-screen, once it actually appears), while the app content underneath
+    fades in on a matching delay — so the reveal feels like a cross-fade
+    rather than a hard cut. Pure CSS/HTML, no image asset required, so
+    there's nothing external to host or break.
 
     This renders through components.html() (its own iframe) instead of
     render_html()/st.markdown(), and its JS immediately injects the splash
@@ -1620,6 +1626,10 @@ def _render_splash_screen():
     siblings — it doesn't wait on them — so injecting the splash from
     inside it shows the logo essentially as soon as Streamlit can render
     anything at all, instead of only once the whole page has caught up.
+    The 2.5s duration here is purely the ON-SCREEN hold+fade time — it
+    starts counting from whenever this component actually mounts, not from
+    page load, so it doesn't include (and can't control) whatever gap
+    Streamlit's own boot takes before that.
     """
     components.html(
         f"""
@@ -1633,7 +1643,7 @@ def _render_splash_screen():
                 html, body {{ background:{BG} !important; }}
                 @keyframes eccSplashHold {{
                     0%   {{ opacity: 1; }}
-                    80%  {{ opacity: 1; }}
+                    70%  {{ opacity: 1; }}
                     100% {{ opacity: 0; }}
                 }}
                 @keyframes eccLogoPulse {{
@@ -1652,7 +1662,7 @@ def _render_splash_screen():
                     position: fixed; inset: 0; z-index: 999999;
                     background: radial-gradient(circle at 50% 40%, #17190F 0%, {BG} 72%);
                     display: flex; flex-direction: column; align-items: center; justify-content: center;
-                    animation: eccSplashHold 8s ease forwards;
+                    animation: eccSplashHold 2.5s ease forwards;
                     pointer-events: none;
                 }}
                 #ecc-splash .ecc-splash-badge {{
@@ -1676,9 +1686,9 @@ def _render_splash_screen():
                     border-radius: 2px; overflow: hidden;
                 }}
                 #ecc-splash .ecc-splash-bar-fill {{
-                    height: 100%; background: {ACCENT}; animation: eccLoadBar 7.2s ease forwards;
+                    height: 100%; background: {ACCENT}; animation: eccLoadBar 2.2s ease forwards;
                 }}
-                [data-testid="stAppViewContainer"] {{ animation: eccAppReveal 1.3s ease 6.1s both; }}
+                [data-testid="stAppViewContainer"] {{ animation: eccAppReveal 0.9s ease 1.75s both; }}
             `;
             doc.head.appendChild(style);
 
@@ -1702,7 +1712,7 @@ def _render_splash_screen():
             // it later in the same session and the CSS class match reruns.
             setTimeout(function() {{
                 if (splash && splash.parentNode) splash.parentNode.removeChild(splash);
-            }}, 8200);
+            }}, 2700);
         }})();
         </script>
         """,
@@ -4105,6 +4115,22 @@ def main():
         render_login()
         return
 
+    # After sign-in, the meeting-select screen takes over the whole page
+    # (its own centered layout, same as the login page) until a meeting is
+    # picked — the dashboard doesn't render underneath it at all yet, since
+    # there's nothing meeting-specific loaded before that choice is made.
+    if st.session_state.get("_ecc_meeting_select_pending"):
+        render_meeting_select()
+        return
+
+    # Fires exactly once, right after a meeting is picked (the flag is set
+    # in render_meeting_select() and cleared here immediately) — never
+    # again for the rest of the session, so navigating between pages
+    # afterward doesn't keep re-showing the expand transition.
+    if st.session_state.get("_ecc_meeting_transition_pending"):
+        _render_meeting_transition(st.session_state.get("_ecc_meeting_transition_name") or "")
+        st.session_state["_ecc_meeting_transition_pending"] = False
+
     sidebar()
 
     pages = {
@@ -4166,11 +4192,170 @@ def render_login():
     if st.button("Sign In", use_container_width=True):
         if st.session_state.login_username == LOGIN_USERNAME and st.session_state.login_password == LOGIN_PASSWORD:
             st.session_state.logged_in = True
+            # Ask which meeting this is right after sign-in, instead of a
+            # generic "Welcome, <name>" — this app has one shared
+            # church-wide login (not individual accounts), so greeting by
+            # whatever was typed into Username just said "Welcome, ECC"
+            # every time, which wasn't useful. Greeting by meeting instead
+            # gives every sign-in a real, meaningful answer, and doubles as
+            # the place meeting-specific preferences (set later) attach to.
+            st.session_state["_ecc_meeting_select_pending"] = True
             st.rerun()
         else:
             st.error("Incorrect username or password.")
     st.markdown('</div>', unsafe_allow_html=True)
     st.caption("Forgot password? Contact your church admin.")
+
+
+MEETING_OPTIONS = ["Sunday", "Saturday", "Sanctuary Arabic", "Sanctuary English"]
+
+
+def render_meeting_select():
+    """Shown once, right after a successful sign-in and before the
+    dashboard: asks which of the four regular meetings this session is for.
+    The choice is saved to settings.meeting_type (so it persists as the
+    church's current default across sign-ins/devices, same as the other
+    settings columns) AND to session state (so the rest of THIS session can
+    read it immediately without a DB round-trip). Meeting-specific behavior
+    beyond just remembering the choice — different themes, defaults, etc.
+    per meeting — isn't wired up yet; that comes later once it's decided
+    what each meeting should actually change."""
+    render_html(f"""
+    <style>
+    html, body {{ overflow: hidden !important; height: 100vh; width: 100vw; margin:0; padding:0; }}
+    [data-testid="stAppViewContainer"], [data-testid="stMain"],
+    [data-testid="stAppViewContainer"] > .main,
+    section.main, div[data-testid="stVerticalBlock"],
+    div[data-testid="stAppViewBlockContainer"] {{
+        height: 100vh !important; max-height: 100vh !important; width: 100vw !important;
+        overflow: hidden !important; margin: 0 !important;
+        display: flex !important; flex-direction: column !important; justify-content: center !important;
+    }}
+    .block-container {{
+        padding: 0 !important; margin: 0 auto !important; max-width: 460px !important;
+        height: auto !important; overflow: hidden !important;
+    }}
+    .stApp {{ background: {BG}; overflow: hidden !important; height: 100vh !important; width: 100vw !important; }}
+    #MainMenu, footer, header {{visibility: hidden;}}
+    section[data-testid="stSidebar"] {{display:none;}}
+    .ecc-meeting-header {{ text-align:center; margin-bottom: 1.8rem; }}
+    .ecc-meeting-title {{ font-weight:800; font-size:1.7rem; margin-bottom:0.3rem; color:{TEXT_PRIMARY}; }}
+    .ecc-meeting-sub {{ color:{TEXT_MUTED}; font-size:0.85rem; }}
+    /* Premium-gold meeting buttons — deliberately heavier than the app's
+       normal primary-gold button (see .ecc-primary/button[kind="primary"]
+       in inject_css()): a richer gradient, a soft gold glow at rest (not
+       just on hover), and a slightly taller tap target, since these are
+       the very first real choice in the whole app rather than an
+       in-context action. */
+    .ecc-meeting-btn .stButton>button {{
+        background: linear-gradient(160deg, #E8C878 0%, {ACCENT} 45%, #9C7A32 100%) !important;
+        color: #1A1400 !important; border: 1px solid #F0D48E !important; font-weight: 800 !important;
+        font-size: 1.02rem !important; padding: 0.9rem !important; border-radius: 12px !important;
+        box-shadow: 0 4px 18px {ACCENT}4D, inset 0 1px 0 #FFF6DD88 !important;
+        transition: transform .12s ease, box-shadow .12s ease !important;
+    }}
+    .ecc-meeting-btn .stButton>button:hover {{
+        transform: translateY(-1px) scale(1.01) !important;
+        box-shadow: 0 6px 24px {ACCENT}66, inset 0 1px 0 #FFF6DD !important;
+    }}
+    </style>
+    <div class="ecc-meeting-header">
+        <div class="ecc-meeting-title">Which meeting is this?</div>
+        <div class="ecc-meeting-sub">Your choice is saved as the default for next time.</div>
+    </div>
+    """)
+    for meeting in MEETING_OPTIONS:
+        st.markdown('<div class="ecc-meeting-btn">', unsafe_allow_html=True)
+        if st.button(meeting, use_container_width=True, key=f"meeting_pick_{meeting}"):
+            set_settings(meeting_type=meeting)
+            st.session_state["meeting_type"] = meeting
+            st.session_state["_ecc_meeting_select_pending"] = False
+            st.session_state["_ecc_meeting_transition_pending"] = True
+            st.session_state["_ecc_meeting_transition_name"] = meeting
+            st.rerun()
+        st.markdown('</div>', unsafe_allow_html=True)
+        st.write("")
+
+
+def _render_meeting_transition(meeting_name):
+    """The "expand and take over the screen" transition after picking a
+    meeting on render_meeting_select(): a rounded, premium-gold panel starts
+    small and centered (matching the button that was just pressed) and
+    rapidly scales up to cover the entire screen — rounded corners
+    unrounding as it grows, per the "overlay the whole screen with rounded
+    edges" + "expand quick" ask — holds briefly showing the meeting name,
+    then fades out to reveal the dashboard underneath. Same components.html()
+    injection technique as _render_splash_screen/_render_welcome_screen (see
+    that docstring for why: it paints immediately instead of waiting on the
+    rest of the page's component tree to reconcile) — this one is one-time
+    per sign-in, not per session, since it should replay every time a
+    meeting is (re)selected."""
+    safe_name = meeting_name.replace("`", "").replace("</", "<\\/")
+    components.html(
+        f"""
+        <script>
+        (function() {{
+            const doc = window.parent.document;
+            if (doc.getElementById('ecc-meeting-transition')) return;
+
+            const style = doc.createElement('style');
+            style.textContent = `
+                @keyframes eccMeetingExpand {{
+                    0%   {{ width: 220px; height: 64px; border-radius: 14px; opacity: 1; }}
+                    55%  {{ width: 100vw; height: 100vh; border-radius: 0px; opacity: 1; }}
+                    100% {{ width: 100vw; height: 100vh; border-radius: 0px; opacity: 1; }}
+                }}
+                @keyframes eccMeetingFade {{
+                    0%   {{ opacity: 1; }}
+                    100% {{ opacity: 0; }}
+                }}
+                @keyframes eccMeetingTextIn {{
+                    0%   {{ opacity: 0; transform: scale(0.9); }}
+                    100% {{ opacity: 1; transform: scale(1); }}
+                }}
+                @keyframes eccMeetingAppReveal {{
+                    0%   {{ opacity: 0; }}
+                    100% {{ opacity: 1; }}
+                }}
+                #ecc-meeting-transition {{
+                    position: fixed; inset: 0; z-index: 999999;
+                    display: flex; align-items: center; justify-content: center;
+                    pointer-events: none;
+                }}
+                #ecc-meeting-panel {{
+                    background: linear-gradient(160deg, #E8C878 0%, {ACCENT} 45%, #9C7A32 100%);
+                    box-shadow: 0 8px 40px {ACCENT}66, inset 0 1px 0 #FFF6DD88;
+                    display: flex; align-items: center; justify-content: center;
+                    animation: eccMeetingExpand 0.45s cubic-bezier(0.22, 1, 0.36, 1) forwards,
+                               eccMeetingFade 0.6s ease 1.3s forwards;
+                }}
+                #ecc-meeting-panel .ecc-meeting-transition-text {{
+                    font-family: 'Inter', sans-serif; font-weight: 800; font-size: 1.9rem;
+                    color: #1A1400; text-align: center; padding: 0 1.5rem;
+                    opacity: 0; animation: eccMeetingTextIn 0.4s ease 0.4s forwards;
+                    white-space: nowrap;
+                }}
+                [data-testid="stAppViewContainer"] {{ animation: eccMeetingAppReveal 0.7s ease 1.35s both; }}
+            `;
+            doc.head.appendChild(style);
+
+            const wrap = doc.createElement('div');
+            wrap.id = 'ecc-meeting-transition';
+            wrap.innerHTML = `
+                <div id="ecc-meeting-panel">
+                    <div class="ecc-meeting-transition-text">{safe_name}</div>
+                </div>
+            `;
+            doc.body.appendChild(wrap);
+
+            setTimeout(function() {{
+                if (wrap && wrap.parentNode) wrap.parentNode.removeChild(wrap);
+            }}, 2100);
+        }})();
+        </script>
+        """,
+        height=0,
+    )
 
 
 if __name__ == "__main__":

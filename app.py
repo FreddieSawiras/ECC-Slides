@@ -2530,7 +2530,7 @@ def render_stage_display():
         # showing a placeholder even for slides whose real image was
         # readily available.
         next_html = (
-            f'<img src="{nxt_img}" class="stage-next-img" />' if nxt_img
+            f'<img src="{nxt_img}" class="stage-next-img" onerror="this.replaceWith(Object.assign(document.createElement(\'div\'),{{textContent:\'(image failed to load)\',style:\'color:#B0463F;font-size:0.9rem;\'}}))" />' if nxt_img
             else nxt_label
         )
         render_html(f"""
@@ -2625,7 +2625,7 @@ def render_remote():
     # slide" text placeholder, never the actual page.
     if nxt_img:
         st.caption("Up next:")
-        render_html(f'<img src="{nxt_img}" style="max-width:100%;max-height:14vh;object-fit:contain;border-radius:6px;" />')
+        render_html(f'<img src="{nxt_img}" style="max-width:100%;max-height:14vh;object-fit:contain;border-radius:6px;" onerror="this.replaceWith(Object.assign(document.createElement(\'div\'),{{textContent:\'(image failed to load)\',style:\'color:#B0463F;font-size:0.85rem;\'}}))" />')
     else:
         st.caption(f"Up next: {nxt_label}")
     st.write("")
@@ -3924,15 +3924,31 @@ def page_presentation():
         st.caption("This mirrors the projector exactly, including the live background and font size — locked to a fixed size, never scrolls.")
         st.markdown("**Up Next**")
         nxt_ref, nxt_text, nxt_text2 = (None, "—", None)
+        nxt_item_title = None
         if slides and slide_index + 1 < len(slides):
             nxt_ref, nxt_text, nxt_text2 = slides[slide_index + 1]
         elif not adhoc and item_index + 1 < len(items):
             nslides = item_slides(items[item_index + 1], state.get("font_scale") or 1.0)
             if nslides:
                 nxt_ref, nxt_text, nxt_text2 = nslides[0]
-            nxt_text = f"(Next item) {items[item_index + 1]['title']} — {nxt_text}"
-        nxt_display = "(image slide)" if (nxt_text or "").startswith(IMG_SLIDE_PREFIX) else nxt_text
-        st.markdown(f'<div class="ecc-card">{(nxt_ref + " — ") if nxt_ref else ""}{nxt_display}{(" / " + nxt_text2) if nxt_text2 else ""}</div>', unsafe_allow_html=True)
+            nxt_item_title = items[item_index + 1]['title']
+        nxt_is_img = (nxt_text or "").startswith(IMG_SLIDE_PREFIX)
+        if nxt_is_img:
+            # Real thumbnail of the actual next slide (an imported PDF/Google
+            # Slides page, etc.) instead of a "(image slide)" text
+            # placeholder — this mirrors the fix already applied to the
+            # Stage Display and phone Remote's own "Up Next" sections.
+            prefix_label = f'<div style="color:{t["sub"]};font-size:0.8rem;margin-bottom:0.5rem;">{"(Next item) " + nxt_item_title if nxt_item_title else ""}</div>' if nxt_item_title else ""
+            st.markdown(
+                f'<div class="ecc-card" style="padding:0.6rem;">{prefix_label}'
+                f'<img src="{nxt_text[len(IMG_SLIDE_PREFIX):]}" style="width:100%;max-height:160px;object-fit:contain;border-radius:8px;" onerror="this.replaceWith(Object.assign(document.createElement(&quot;div&quot;),{{textContent:&quot;(image failed to load)&quot;,style:&quot;color:#B0463F;font-size:0.85rem;&quot;}}))" /></div>',
+                unsafe_allow_html=True
+            )
+        else:
+            nxt_display = nxt_text
+            if nxt_item_title:
+                nxt_display = f"(Next item) {nxt_item_title} — {nxt_text}"
+            st.markdown(f'<div class="ecc-card">{(nxt_ref + " — ") if nxt_ref else ""}{nxt_display}{(" / " + nxt_text2) if nxt_text2 else ""}</div>', unsafe_allow_html=True)
 
     with right:
         st.markdown("**Controls**")

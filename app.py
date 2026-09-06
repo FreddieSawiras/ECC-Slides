@@ -2608,7 +2608,14 @@ def _stage_slide_info(state):
         if si + 1 < len(slides):
             nxt_ref, nxt_text, nxt_text2 = slides[si + 1]
             if nxt_text.startswith(IMG_SLIDE_PREFIX):
-                nxt_label, nxt_img = "Image slide", nxt_text
+                # Strip the sentinel here so nxt_img is always a clean,
+                # directly-usable <img src="..."> value — this used to be
+                # left un-stripped (nxt_img = nxt_text, sentinel and all),
+                # so the actual src attribute was
+                # "\x00IMG\x00data:image/png;base64,..." — invalid as a
+                # URL, which is exactly what rendered as a tiny broken-
+                # image icon instead of the real picture.
+                nxt_label, nxt_img = "Image slide", nxt_text[len(IMG_SLIDE_PREFIX):]
             else:
                 nxt_label = f"{nxt_ref} — {nxt_text}" if nxt_ref else nxt_text  # full text, no truncation
     elif state.get("service_id"):
@@ -2624,7 +2631,7 @@ def _stage_slide_info(state):
                 if si + 1 < len(slides):
                     nxt_ref, nxt_text, nxt_text2 = slides[si + 1]
                     if nxt_text.startswith(IMG_SLIDE_PREFIX):
-                        nxt_label, nxt_img = "Image slide", nxt_text
+                        nxt_label, nxt_img = "Image slide", nxt_text[len(IMG_SLIDE_PREFIX):]
                     else:
                         nxt_label = f"{nxt_ref} — {nxt_text}" if nxt_ref else nxt_text  # full text, no truncation
                 elif idx + 1 < len(items):
@@ -2632,7 +2639,7 @@ def _stage_slide_info(state):
                     if nslides:
                         nxt_ref, nxt_text, nxt_text2 = nslides[0]
                         if nxt_text.startswith(IMG_SLIDE_PREFIX):
-                            nxt_label, nxt_img = f"(Next) {items[idx + 1]['title']}", nxt_text
+                            nxt_label, nxt_img = f"(Next) {items[idx + 1]['title']}", nxt_text[len(IMG_SLIDE_PREFIX):]
                         else:
                             n0_full = f"{nxt_ref} — {nxt_text}" if nxt_ref else nxt_text
                             nxt_label = f"(Next) {items[idx + 1]['title']} — {n0_full}"  # full text, no truncation
@@ -2693,18 +2700,31 @@ def render_stage_display():
                           padding-bottom: 3vh; border-bottom: 1px solid #24262C; margin-bottom: 3vh; }}
         .stage-current-img {{ display:block; width:100%; max-height:34vh; object-fit:contain; border-radius:8px; }}
         .stage-next {{ color:#C9CBD1; font-family:'Inter',sans-serif; font-size: clamp(1rem,2vw,1.6rem);
-                      line-height:1.4; }}
+                      line-height:1.4; display:block; width:100%; }}
+        /* This markdown block is the actual containing box that .stage-next
+           (and its child .stage-next-img-wrap) resolve their percentage
+           widths against. Streamlit's markdown wrapper doesn't always
+           stretch to the full page width on its own — it can shrink-wrap
+           to whatever content happens to force it wide, and a short div
+           with no large text inside it doesn't force anything. This is
+           what silently collapsed the "Up Next" image to a tiny broken-
+           looking square: percentages cascading through an ancestor that
+           was never actually full-width in the first place. Forcing it
+           here, on the real Streamlit-rendered block, is the fix — not
+           another percentage on an inner div that just inherits the same
+           problem. */
+        div[data-testid="stAppViewBlockContainer"] .stMarkdown {{ width:100% !important; }}
         .stage-next-img-wrap {{
-            width:100%; max-width:640px; border:1px solid #24262C; border-radius:10px;
+            width:100%; max-width:640px; min-width:280px; border:1px solid #24262C; border-radius:10px;
             padding:0.6rem; background:#111218; box-sizing:border-box;
         }}
-        .stage-next-img {{ display:block; width:100%; max-height:18vh; object-fit:contain; border-radius:6px; }}
+        .stage-next-img {{ display:block; width:100%; min-height:80px; max-height:18vh; object-fit:contain; border-radius:6px; }}
         </style>
         <div class="stage-clock" id="ecc-stage-clock">--:--</div>
         <div class="stage-label">Now</div>
         <div class="stage-current">{current_html}</div>
         <div class="stage-label">Up Next</div>
-        <div class="stage-next" style="width:100%;max-width:640px;">{next_html}</div>
+        <div class="stage-next">{next_html}</div>
         """)
         components.html(
             """
@@ -2778,6 +2798,13 @@ def _render_remote_body():
     section[data-testid="stSidebar"] {display:none;}
     .block-container { padding: 3vw 4vw !important; max-width: 100% !important; }
     div[data-testid="stButton"] button { font-size: 1.3rem !important; padding: 1.2rem !important; font-weight:700 !important; }
+    /* Forces the markdown blocks below (the Now/Up Next images) to actually
+       span the page width instead of shrink-wrapping to nothing — a lone
+       <img style="width:100%"> with no wide sibling content to force its
+       own container wide has nothing real to resolve that percentage
+       against, which is what collapsed these to a tiny broken-looking
+       square instead of a real preview. */
+    div[data-testid="stAppViewBlockContainer"] .stMarkdown { width:100% !important; }
     </style>
     """)
     render_status_badge(state)
@@ -2786,7 +2813,7 @@ def _render_remote_body():
         st.markdown("**Now:** (hidden)")
     elif cur_is_img:
         st.markdown("**Now:**")
-        render_html(f'<img src="{cur_text[len(IMG_SLIDE_PREFIX):]}" style="display:block;width:100%;max-height:22vh;object-fit:contain;border-radius:8px;" />')
+        render_html(f'<img src="{cur_text[len(IMG_SLIDE_PREFIX):]}" style="display:block;width:100%;min-width:200px;max-height:22vh;object-fit:contain;border-radius:8px;" />')
     else:
         st.markdown(f"**Now:** {cur_text[:80] or 'Nothing live'}")
     # "Up Next" is a real miniature of the actual next slide (live theme
@@ -2794,7 +2821,7 @@ def _render_remote_body():
     # image for image slides — not a text summary either way.
     st.caption("Up next:")
     if nxt_img:
-        render_html(f'<img src="{nxt_img}" style="display:block;width:100%;max-height:14vh;object-fit:contain;border-radius:6px;" onerror="this.replaceWith(Object.assign(document.createElement(\'div\'),{{textContent:\'(image failed to load)\',style:\'color:#B0463F;font-size:0.85rem;\'}}))" />')
+        render_html(f'<img src="{nxt_img}" style="display:block;width:100%;min-width:200px;max-height:14vh;object-fit:contain;border-radius:6px;" onerror="this.replaceWith(Object.assign(document.createElement(\'div\'),{{textContent:\'(image failed to load)\',style:\'color:#B0463F;font-size:0.85rem;\'}}))" />')
     elif nxt_text:
         render_html(_render_mini_slide(
             nxt_text, nxt_ref, nxt_text2,

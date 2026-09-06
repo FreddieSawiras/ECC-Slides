@@ -2448,17 +2448,21 @@ def _stage_slide_info(state):
     raw base64 image data onto the phone remote and stage display as
     literal garbled text.
 
-    nxt_label is always a short TEXT label (safe to print directly).
+    nxt_ref/nxt_text/nxt_text2 are the RAW next-slide parts (same shape as
+    cur_ref/cur_text/cur_text2) — callers that want a real mini-slide
+    preview (see _render_mini_slide) should use these, not nxt_label.
+    nxt_label remains as a ready-made short text fallback for callers that
+    just want a line of text (e.g. when crossing into a whole different
+    upcoming service item, where "(Next) Song Title — first line" reads
+    better than a bare mini-slide with no item context).
     nxt_img is either None (next slide is text, or there is no next slide)
     or the actual \\x00IMG\\x00<data-uri> string for the next slide's real
     image — callers that want a real thumbnail preview of the next slide
-    (not just a "🖼️ Image slide" placeholder label) should check nxt_img
-    the same way they check cur_text, and render it as an <img> when it's
-    set. Before this, "next" only ever got a text placeholder even when the
-    current slide's own image WAS rendered properly — this is what fixed
-    that gap.
+    should check nxt_img the same way they check cur_text, and render it as
+    an <img> when it's set.
     """
     cur_ref, cur_text, cur_text2 = None, "", None
+    nxt_ref, nxt_text, nxt_text2 = None, "", None
     nxt_label, nxt_img = "—", None
     if state.get("adhoc_active"):
         slides = json.loads(state["adhoc_slides"]) if state.get("adhoc_slides") else []
@@ -2466,11 +2470,11 @@ def _stage_slide_info(state):
         if 0 <= si < len(slides):
             cur_ref, cur_text, cur_text2 = slides[si]
         if si + 1 < len(slides):
-            nxt_ref_or_text = slides[si + 1][1]
-            if nxt_ref_or_text.startswith(IMG_SLIDE_PREFIX):
-                nxt_label, nxt_img = "Image slide", nxt_ref_or_text
+            nxt_ref, nxt_text, nxt_text2 = slides[si + 1]
+            if nxt_text.startswith(IMG_SLIDE_PREFIX):
+                nxt_label, nxt_img = "Image slide", nxt_text
             else:
-                nxt_label = slides[si + 1][0] or nxt_ref_or_text[:40]
+                nxt_label = f"{nxt_ref} — {nxt_text}" if nxt_ref else nxt_text  # full text, no truncation
     elif state.get("service_id"):
         service = get_service(state["service_id"])
         if service:
@@ -2482,24 +2486,24 @@ def _stage_slide_info(state):
                 if 0 <= si < len(slides):
                     cur_ref, cur_text, cur_text2 = slides[si]
                 if si + 1 < len(slides):
-                    nxt_ref_or_text = slides[si + 1][1]
-                    if nxt_ref_or_text.startswith(IMG_SLIDE_PREFIX):
-                        nxt_label, nxt_img = "Image slide", nxt_ref_or_text
+                    nxt_ref, nxt_text, nxt_text2 = slides[si + 1]
+                    if nxt_text.startswith(IMG_SLIDE_PREFIX):
+                        nxt_label, nxt_img = "Image slide", nxt_text
                     else:
-                        nxt_label = slides[si + 1][0] or nxt_ref_or_text[:40]
+                        nxt_label = f"{nxt_ref} — {nxt_text}" if nxt_ref else nxt_text  # full text, no truncation
                 elif idx + 1 < len(items):
                     nslides = item_slides(items[idx + 1], state.get("font_scale") or 1.0)
                     if nslides:
-                        n0 = nslides[0][1]
-                        if n0.startswith(IMG_SLIDE_PREFIX):
-                            nxt_label, nxt_img = f"(Next) {items[idx + 1]['title']}", n0
+                        nxt_ref, nxt_text, nxt_text2 = nslides[0]
+                        if nxt_text.startswith(IMG_SLIDE_PREFIX):
+                            nxt_label, nxt_img = f"(Next) {items[idx + 1]['title']}", nxt_text
                         else:
-                            n0_preview = n0[:30] if not nslides[0][0] else nslides[0][0]
-                            nxt_label = f"(Next) {items[idx + 1]['title']} — {n0_preview}"
+                            n0_full = f"{nxt_ref} — {nxt_text}" if nxt_ref else nxt_text
+                            nxt_label = f"(Next) {items[idx + 1]['title']} — {n0_full}"  # full text, no truncation
                     else:
                         nxt_label = f"(Next) {items[idx + 1]['title']}"
     hidden = bool(state.get("black") or state.get("cleared") or not state.get("live"))
-    return cur_ref, cur_text, cur_text2, nxt_label, nxt_img, hidden
+    return cur_ref, cur_text, cur_text2, nxt_ref, nxt_text, nxt_text2, nxt_label, nxt_img, hidden
 
 
 def render_stage_display():
@@ -2509,7 +2513,7 @@ def render_stage_display():
     without needing to peek at the projector or guess."""
     def _tick():
         state = get_state()
-        cur_ref, cur_text, cur_text2, nxt_label, nxt_img, hidden = _stage_slide_info(state)
+        cur_ref, cur_text, cur_text2, nxt_ref, nxt_text, nxt_text2, nxt_label, nxt_img, hidden = _stage_slide_info(state)
         cur_is_img = (cur_text or "").startswith(IMG_SLIDE_PREFIX)
         cur_img_src = cur_text[len(IMG_SLIDE_PREFIX):] if cur_is_img else ""
         # NOTE: render_html() goes through st.markdown(unsafe_allow_html=True),
@@ -2523,16 +2527,20 @@ def render_stage_display():
             f'<img src="{cur_img_src}" class="stage-current-img" />' if (cur_is_img and not hidden)
             else ("(hidden from projector)" if hidden else (cur_text or "Nothing live"))
         )
-        # Same idea for "next": if the next slide is a real imported image
-        # (e.g. a Google Slides PDF page), show the ACTUAL thumbnail of that
-        # page instead of a generic "🖼️ Image slide" text placeholder —
-        # this used to only apply to the "Now" side, leaving "Up Next"
-        # showing a placeholder even for slides whose real image was
-        # readily available.
-        next_html = (
-            f'<div class="stage-next-img-wrap"><img src="{nxt_img}" class="stage-next-img" onerror="this.replaceWith(Object.assign(document.createElement(\'div\'),{{textContent:\'(image failed to load)\',style:\'color:#B0463F;font-size:0.9rem;\'}}))" /></div>' if nxt_img
-            else nxt_label
-        )
+        # "Up Next" is a real miniature of the actual next slide (live
+        # theme background, font, text color — see _render_mini_slide) for
+        # text slides, and the actual imported image for image slides —
+        # not a generic placeholder or a plain text label either way.
+        if nxt_img:
+            next_html = f'<div class="stage-next-img-wrap"><img src="{nxt_img}" class="stage-next-img" onerror="this.replaceWith(Object.assign(document.createElement(\'div\'),{{textContent:\'(image failed to load)\',style:\'color:#B0463F;font-size:0.9rem;\'}}))" /></div>'
+        elif nxt_text:
+            next_html = _render_mini_slide(
+                nxt_text, nxt_ref, nxt_text2,
+                theme_name=state.get("theme"), background_key=state.get("background"),
+                height_px=180
+            )
+        else:
+            next_html = nxt_label
         render_html(f"""
         <style>
         #MainMenu, footer, header {{visibility: hidden;}}
@@ -2559,7 +2567,7 @@ def render_stage_display():
         <div class="stage-label">Now</div>
         <div class="stage-current">{current_html}</div>
         <div class="stage-label">Up Next</div>
-        <div class="stage-next" style="width:100%;">{next_html}</div>
+        <div class="stage-next" style="width:100%;max-width:640px;">{next_html}</div>
         """)
         components.html(
             """
@@ -2605,7 +2613,7 @@ def render_remote():
         return
 
     state = get_state()
-    cur_ref, cur_text, cur_text2, nxt_label, nxt_img, hidden = _stage_slide_info(state)
+    cur_ref, cur_text, cur_text2, nxt_ref, nxt_text, nxt_text2, nxt_label, nxt_img, hidden = _stage_slide_info(state)
 
     render_html("""
     <style>
@@ -2624,14 +2632,20 @@ def render_remote():
         render_html(f'<img src="{cur_text[len(IMG_SLIDE_PREFIX):]}" style="display:block;width:100%;max-height:22vh;object-fit:contain;border-radius:8px;" />')
     else:
         st.markdown(f"**Now:** {cur_text[:80] or 'Nothing live'}")
-    # Same real-thumbnail treatment for "Up Next" as "Now" above — before,
-    # an imported PDF/image slide up next only ever showed a "🖼️ Image
-    # slide" text placeholder, never the actual page.
+    # "Up Next" is a real miniature of the actual next slide (live theme
+    # background, font, text color) for text slides, and the real imported
+    # image for image slides — not a text summary either way.
+    st.caption("Up next:")
     if nxt_img:
-        st.caption("Up next:")
         render_html(f'<img src="{nxt_img}" style="display:block;width:100%;max-height:14vh;object-fit:contain;border-radius:6px;" onerror="this.replaceWith(Object.assign(document.createElement(\'div\'),{{textContent:\'(image failed to load)\',style:\'color:#B0463F;font-size:0.85rem;\'}}))" />')
+    elif nxt_text:
+        render_html(_render_mini_slide(
+            nxt_text, nxt_ref, nxt_text2,
+            theme_name=state.get("theme"), background_key=state.get("background"),
+            height_px=110
+        ))
     else:
-        st.caption(f"Up next: {nxt_label}")
+        st.caption(nxt_label)
     st.write("")
 
     adhoc = bool(state.get("adhoc_active"))
@@ -2761,13 +2775,9 @@ def render_remote_grid():
         state = get_state()
         adhoc_slides_raw = json.loads(state["adhoc_slides"]) if state.get("adhoc_slides") else []
         entries = _slide_grid_entries([], True, adhoc_slides_raw, 0, state.get("font_scale") or 1.0)
-        theme = state.get("theme") or "Modern Worship"
-        t = THEMES.get(theme, {})
-        thumb_px = st.slider("Card size", min_value=50, max_value=160, value=st.session_state.get("rgrid_thumb_px", 84),
-                              step=6, key="rgrid_thumb_px", label_visibility="collapsed")
         _render_slide_grid(entries, adhoc=True, item_index=0, slide_index=state.get("adhoc_index") or 0,
-                            cols_per_row=3, compact=True, key_prefix="rgrid_", thumb_px=thumb_px,
-                            theme_bg=t.get("bg"), theme_fg=t.get("fg"))
+                            cols_per_row=3, compact=True, key_prefix="rgrid_", thumb_px=200,
+                            theme_name=state.get("theme"), background_key=state.get("background"))
         return
 
     if not items:
@@ -2797,16 +2807,12 @@ def render_remote_grid():
 
     st.write("")
     state = get_state()  # re-fetch: the control row above may have just changed it
-    thumb_px = st.slider("Card size", min_value=50, max_value=160, value=st.session_state.get("rgrid_thumb_px", 84),
-                          step=6, key="rgrid_thumb_px", label_visibility="collapsed")
-    theme = state.get("theme") or "Modern Worship"
-    t = THEMES.get(theme, {})
     browse_idx = st.session_state["rgrid_browse_idx"]
     entries = _slide_grid_entries(items, False, None, browse_idx, state.get("font_scale") or 1.0, extend=False)
     _render_slide_grid(entries, adhoc=False, item_index=state.get("item_index") or 0,
                         slide_index=state.get("slide_index") or 0, cols_per_row=3,
-                        compact=True, key_prefix="rgrid_", thumb_px=thumb_px,
-                        theme_bg=t.get("bg"), theme_fg=t.get("fg"))
+                        compact=True, key_prefix="rgrid_", thumb_px=200,
+                        theme_name=state.get("theme"), background_key=state.get("background"))
 
 
 # ---------------------------------------------------------------------------
@@ -3647,30 +3653,98 @@ def _slide_grid_entries(items, adhoc, adhoc_slides, item_index, font_scale, exte
     return entries
 
 
-def _render_slide_grid(entries, adhoc, item_index, slide_index, cols_per_row=4, compact=False,
-                        key_prefix="grid", thumb_px=None, theme_bg=None, theme_fg=None):
-    """The ProPresenter-style thumbnail grid itself. Each cell is a visual
-    'slide' card — a real rendered image for imported PDF/image slides, or
-    the live theme's background + text color for lyric/verse slides, so the
-    grid actually looks like the projector instead of generic dark boxes.
-    Clicking anywhere on the card selects it (a real Streamlit button is
-    stretched invisibly over the whole card via CSS — see .ecc-grid-select
-    — rather than a separate small "Select" button underneath it). The
-    currently-live slide gets a gold highlighted border via .slide-thumb.active
-    so it's obvious at a glance which slide is on the projector right now.
+def _render_mini_slide(text, ref=None, text2=None, theme_name=None, background_key=None,
+                        height_px=160, is_active=False, extra_class="", badge=None):
+    """Renders one slide's actual look in miniature — the real theme
+    background (color, gradient, or uploaded photo), the real theme font
+    and text color, centered the same way the projector centers it — at a
+    fixed height so it reads as a genuine small slide rectangle instead of
+    a plain text box in a generic card. This is the shared building block
+    behind the slide grid, and every "Up Next" preview (Presentation tab,
+    Stage Display, phone remote) — one real implementation instead of each
+    place hand-rolling its own approximation.
 
-    thumb_px overrides the card height in pixels (from the size slider on
-    the caller's page); theme_bg/theme_fg are the live theme's CSS
-    background and text color, used behind text-only slides so the grid
-    matches the actual presentation display instead of always showing flat
-    dark cards regardless of the live background/theme."""
+    Unlike the full projector, text here SHRINKS to fit the fixed height
+    (via a clamp() tuned for thumbnail scale, not full-screen scale) rather
+    than wrapping/overflowing — a thumbnail that clips long lyrics defeats
+    the point of a preview, so this favors "readable but smaller" over
+    "full size but cut off".
+
+    badge, if given, overlays a small translucent label bar across the top
+    (LIVE indicator / slide number / reference) — same treatment the image
+    slides already got, so text and image cards look like one consistent
+    system instead of two different styles."""
+    theme_name = theme_name or "Modern Worship"
+    t = THEMES.get(theme_name, THEMES["Modern Worship"])
+    bg_css = t["bg"]
+    if background_key == CUSTOM_BACKGROUND_KEY:
+        data_uri = get_settings().get("custom_background_data")
+        if data_uri:
+            bg_css = f"url('{data_uri}') center/cover no-repeat"
+    elif background_key:
+        bg_def = BACKGROUNDS.get(background_key)
+        if bg_def:
+            bg_css = bg_def["css"]
+    has_photo_bg = bool(background_key and background_key != "None (theme color)")
+    text_shadow = "0 1px 8px rgba(0,0,0,0.55)" if has_photo_bg else "none"
+    border = f"2px solid {ACCENT}" if is_active else f"1px solid {CARD_BORDER}"
+    box_shadow = f"0 0 0 1px {ACCENT}55, 0 4px 16px {ACCENT}22" if is_active else "none"
+    badge_html = (
+        f'''<div style="position:absolute;top:0;left:0;right:0;z-index:2;background:linear-gradient(180deg,rgba(0,0,0,0.6),transparent);
+        font-size:0.62rem;text-transform:uppercase;letter-spacing:.06em;color:#fff;padding:0.3rem 0.4rem;
+        white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">{badge}</div>'''
+        if badge else ""
+    )
+
+    if text2:
+        # Split-screen slide (e.g. bilingual) — mirror .proj-split's stacked
+        # halves, each independently centered, at thumbnail scale.
+        top_dir = "rtl" if _looks_arabic(text) else "ltr"
+        bottom_dir = "rtl" if _looks_arabic(text2) else "ltr"
+        inner = f"""
+        <div style="height:50%;display:flex;flex-direction:column;align-items:center;justify-content:center;
+        text-align:center;padding:6% 8%;border-bottom:1px solid {t['sub']}44;overflow:hidden;" dir="{top_dir}">
+        {f'<div style="font-family:{t["font"]};color:{t["sub"]};letter-spacing:0.1em;text-transform:uppercase;font-size:clamp(0.5rem,1.6cqw,0.8rem);margin-bottom:4%;font-weight:600;">{ref}</div>' if ref else ''}
+        <div style="font-family:{t['font']};color:{t['fg']};font-size:clamp(0.6rem,2.6cqw,1.1rem);line-height:1.25;font-weight:700;white-space:pre-line;text-shadow:{text_shadow};">{text}</div>
+        </div>
+        <div style="height:50%;display:flex;align-items:center;justify-content:center;text-align:center;padding:6% 8%;overflow:hidden;" dir="{bottom_dir}">
+        <div style="font-family:{t['font']};color:{t['fg']};font-size:clamp(0.55rem,2.2cqw,0.95rem);line-height:1.25;font-weight:700;white-space:pre-line;text-shadow:{text_shadow};">{text2}</div>
+        </div>"""
+    else:
+        inner = f"""
+        <div style="height:100%;width:100%;display:flex;flex-direction:column;align-items:center;
+        justify-content:center;text-align:center;padding:8%;overflow:hidden;box-sizing:border-box;">
+        {f'<div style="font-family:{t["font"]};color:{t["sub"]};letter-spacing:0.12em;text-transform:uppercase;font-size:clamp(0.5rem,1.8cqw,0.85rem);margin-bottom:5%;font-weight:600;">{ref}</div>' if ref else ''}
+        <div style="font-family:{t['font']};color:{t['fg']};font-size:clamp(0.65rem,3cqw,1.3rem);line-height:1.3;font-weight:700;white-space:pre-line;text-shadow:{text_shadow};">{text if (text or '').strip() else '(blank)'}</div>
+        </div>"""
+
+    return f'''<div class="{extra_class}" style="container-type:inline-size;height:{height_px}px;width:100%;
+    border-radius:10px;overflow:hidden;background:{bg_css};border:{border};box-shadow:{box_shadow};
+    position:relative;">{badge_html}{inner}</div>'''
+
+
+def _render_slide_grid(entries, adhoc, item_index, slide_index, cols_per_row=4, compact=False,
+                        key_prefix="grid", thumb_px=None, theme_bg=None, theme_fg=None,
+                        theme_name=None, background_key=None):
+    """The ProPresenter-style thumbnail grid itself. Each cell is a real
+    miniature of the actual slide — the live theme's background, font, and
+    text color, centered the same way the projector centers it (see
+    _render_mini_slide) — for text slides, and a real rendered image for
+    imported PDF/image slides. Both are fixed-height, so clicking anywhere
+    on either kind of card selects it (one real Streamlit button stretched
+    invisibly over the whole card via CSS). The currently-live slide gets a
+    gold highlighted border so it's obvious at a glance which slide is on
+    the projector right now.
+
+    thumb_px overrides the card height in pixels. theme_name/background_key
+    select which theme/background the mini-slide preview renders with
+    (should match whatever's actually live). theme_bg/theme_fg are kept as
+    accepted-but-unused parameters for backward compatibility with existing
+    call sites."""
     if not entries:
         st.caption("No slides to show yet — pick a song or Bible passage to see its slides here.")
         return
-    thumb_h_px = thumb_px or (64 if compact else 84)
-    thumb_h = f"{thumb_h_px}px"
-    card_bg = theme_bg or None
-    card_fg = theme_fg or None
+    thumb_h_px = thumb_px or (120 if compact else 160)
     idx = 0
     while idx < len(entries):
         row = entries[idx:idx + cols_per_row]
@@ -3689,7 +3763,7 @@ def _render_slide_grid(entries, adhoc, item_index, slide_index, cols_per_row=4, 
                 if is_img:
                     img_src = text[len(IMG_SLIDE_PREFIX):]
                     render_html(
-                        f'''<div class="{active_class}" style="min-height:{thumb_h};height:{thumb_h};padding:0;overflow:hidden;">
+                        f'''<div class="{active_class}" style="min-height:{thumb_h_px}px;height:{thumb_h_px}px;padding:0;overflow:hidden;">
                         <div class="slide-thumb-imgwrap">
                         <img class="slide-thumb-img" src="{img_src}" />
                         <div style="position:absolute;top:0;left:0;right:0;z-index:1;background:linear-gradient(180deg,rgba(0,0,0,0.65),transparent);
@@ -3699,21 +3773,20 @@ def _render_slide_grid(entries, adhoc, item_index, slide_index, cols_per_row=4, 
                         </div>'''
                     )
                 else:
-                    preview_txt = text.replace("\n", "  ·  ")
-                    if len(preview_txt) > (56 if compact else 78):
-                        preview_txt = preview_txt[:(56 if compact else 78)] + "…"
-                    if not preview_txt.strip():
-                        preview_txt = "(blank)"
-                    bg_style = f"background:{card_bg};" if card_bg and not is_active else ""
-                    fg_style = f"color:{card_fg};" if card_fg and not is_active else ""
-                    render_html(
-                        f'''<div class="{active_class}" style="min-height:{thumb_h};height:{thumb_h};{bg_style}display:flex;flex-direction:column;justify-content:space-between;">
-                        <div style="font-size:0.66rem;text-transform:uppercase;letter-spacing:.06em;opacity:0.8;margin-bottom:0.3rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;{fg_style}">
-                        {"● LIVE · " if is_active else ""}{n:02d} · {badge}</div>
-                        <div style="font-size:{'0.72rem' if compact else '0.78rem'};line-height:1.3;{fg_style}">{preview_txt}</div>
-                        </div>'''
-                    )
-                st.markdown(f'<div class="ecc-grid-select" style="--ecc-thumb-h:{thumb_h};">', unsafe_allow_html=True)
+                    render_html(_render_mini_slide(
+                        entry["text"], entry["ref"], entry.get("text2"),
+                        theme_name=theme_name, background_key=background_key,
+                        height_px=thumb_h_px, is_active=is_active,
+                        badge=f'{"● LIVE · " if is_active else ""}{n:02d} · {badge}'
+                    ))
+                # Both image AND text cards are now fixed-height (the
+                # mini-slide shrinks its own font to fit rather than
+                # growing the card), so the invisible click-anywhere
+                # overlay works reliably for both — one consistent
+                # interaction model instead of image cards getting
+                # click-anywhere while text cards needed a separate visible
+                # button underneath.
+                st.markdown(f'<div class="ecc-grid-select" style="--ecc-thumb-h:{thumb_h_px}px;">', unsafe_allow_html=True)
                 if st.button("select", key=f"{key_prefix}sel_{entry['item_idx']}_{entry['slide_idx']}_{idx}",
                              use_container_width=True, disabled=is_active):
                     if adhoc:
@@ -3834,16 +3907,11 @@ def page_presentation():
                 if st.button("✕ Exit Full Screen", use_container_width=True, key="grid_exit_fs"):
                     st.session_state["presentation_grid_fullscreen"] = False
                     st.rerun()
-            fs_thumb_px = st.slider("Card size", min_value=60, max_value=200,
-                                     value=st.session_state.get("fsgrid_thumb_px", 84),
-                                     step=8, key="fsgrid_thumb_px", label_visibility="collapsed")
-            fs_theme = state.get("theme") or "Modern Worship"
-            fs_t = THEMES.get(fs_theme, {})
             fs_entries = _slide_grid_entries(items, adhoc, slides if adhoc else None, item_index,
                                               state.get("font_scale") or 1.0, extend=True, min_count=15)
             _render_slide_grid(fs_entries, adhoc, item_index, slide_index, cols_per_row=5,
-                                compact=True, key_prefix="fsgrid_", thumb_px=fs_thumb_px,
-                                theme_bg=fs_t.get("bg"), theme_fg=fs_t.get("fg"))
+                                compact=True, key_prefix="fsgrid_", thumb_px=200,
+                                theme_name=state.get("theme"), background_key=state.get("background"))
         _render_operator_keyboard_shortcuts()
         return
 
@@ -3937,22 +4005,28 @@ def page_presentation():
                 nxt_ref, nxt_text, nxt_text2 = nslides[0]
             nxt_item_title = items[item_index + 1]['title']
         nxt_is_img = (nxt_text or "").startswith(IMG_SLIDE_PREFIX)
+        if nxt_item_title:
+            st.caption(f"(Next item) {nxt_item_title}")
         if nxt_is_img:
             # Real thumbnail of the actual next slide (an imported PDF/Google
             # Slides page, etc.) instead of a "(image slide)" text
             # placeholder — this mirrors the fix already applied to the
             # Stage Display and phone Remote's own "Up Next" sections.
-            prefix_label = f'<div style="color:{t["sub"]};font-size:0.8rem;margin-bottom:0.5rem;">{"(Next item) " + nxt_item_title if nxt_item_title else ""}</div>' if nxt_item_title else ""
             st.markdown(
-                f'<div class="ecc-card" style="padding:0.6rem;">{prefix_label}'
+                f'<div class="ecc-card" style="padding:0.6rem;">'
                 f'<img src="{nxt_text[len(IMG_SLIDE_PREFIX):]}" style="width:100%;max-height:160px;object-fit:contain;border-radius:8px;" onerror="this.replaceWith(Object.assign(document.createElement(&quot;div&quot;),{{textContent:&quot;(image failed to load)&quot;,style:&quot;color:#B0463F;font-size:0.85rem;&quot;}}))" /></div>',
                 unsafe_allow_html=True
             )
         else:
-            nxt_display = nxt_text
-            if nxt_item_title:
-                nxt_display = f"(Next item) {nxt_item_title} — {nxt_text}"
-            st.markdown(f'<div class="ecc-card">{(nxt_ref + " — ") if nxt_ref else ""}{nxt_display}{(" / " + nxt_text2) if nxt_text2 else ""}</div>', unsafe_allow_html=True)
+            # A real miniature of the actual next slide — live theme
+            # background, font, and text color, same as the projector
+            # itself, not a plain text box — so you're previewing what will
+            # genuinely appear, not just reading a text summary of it.
+            render_html(_render_mini_slide(
+                nxt_text, nxt_ref, nxt_text2,
+                theme_name=state.get("theme"), background_key=state.get("background"),
+                height_px=160
+            ))
 
     with right:
         st.markdown("**Controls**")
@@ -4007,18 +4081,16 @@ def page_presentation():
     grid_l, grid_r = st.columns([4, 1.3])
     with grid_l:
         st.markdown("**🎬 Slide Grid**")
-        st.caption("ProPresenter-style — every slide of the current item, in order. Click a thumbnail to jump straight to it.")
+        st.caption("ProPresenter-style — a real miniature of every slide in the current item, in order. Click one to jump straight to it.")
     with grid_r:
         if st.button("⛶ Full Screen", use_container_width=True, key="grid_enter_fs"):
             st.session_state["presentation_grid_fullscreen"] = True
             st.rerun()
-    grid_thumb_px = st.slider("Card size", min_value=60, max_value=200,
-                               value=st.session_state.get("grid_thumb_px", 84),
-                               step=8, key="grid_thumb_px", label_visibility="collapsed")
     grid_entries = _slide_grid_entries(items, adhoc, slides if adhoc else None, item_index,
                                         state.get("font_scale") or 1.0, extend=False)
     _render_slide_grid(grid_entries, adhoc, item_index, slide_index, cols_per_row=4, compact=False,
-                        key_prefix="grid_", thumb_px=grid_thumb_px, theme_bg=card_bg, theme_fg=t.get("fg"))
+                        key_prefix="grid_", thumb_px=200,
+                        theme_name=state.get("theme"), background_key=state.get("background"))
 
     _render_operator_keyboard_shortcuts()
 

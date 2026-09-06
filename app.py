@@ -633,21 +633,33 @@ LOCALIZED_BOOK_NAMES = {
 # DATABASE
 # ---------------------------------------------------------------------------
 
+_wal_initialized = False  # process-wide: PRAGMA journal_mode=WAL sets a durable,
+                           # file-level property (survives across connections and
+                           # process restarts) — it does not need to be re-applied
+                           # on every single get_conn() call. Re-running it every
+                           # 0.4s from the phone remote's poll loop (and every other
+                           # fragment's poll loop) was pure wasted round-trip time on
+                           # every single tick; setting it once per process is enough.
+
+
 def get_conn():
+    global _wal_initialized
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.row_factory = sqlite3.Row
-    # WAL (Write-Ahead Logging) mode: readers no longer block on a writer
-    # and vice versa. This matters concretely here — with the phone remote,
-    # stage display, and Presentation tab now all polling get_state() every
-    # 0.35-0.5s (see their st.fragment(run_every=...) wrappers) while
-    # occasional writes (slide changes) happen from any of them, the
-    # default SQLite journal mode makes writers and readers wait on each
-    # other; WAL lets them proceed concurrently, which is the difference
-    # between "the read that would show your slide change stalls behind
-    # another device's read" and "it doesn't". PRAGMA calls are cheap and
-    # idempotent — safe to run on every single connection open.
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA synchronous=NORMAL")  # safe pairing with WAL; still durable, less fsync overhead than FULL
+    if not _wal_initialized:
+        # WAL (Write-Ahead Logging) mode: readers no longer block on a writer
+        # and vice versa. This matters concretely here — with the phone remote,
+        # stage display, and Presentation tab all polling get_state() every
+        # 0.35-0.5s (see their st.fragment(run_every=...) wrappers) while
+        # occasional writes (slide changes) happen from any of them, the
+        # default SQLite journal mode makes writers and readers wait on each
+        # other; WAL lets them proceed concurrently, which is the difference
+        # between "the read that would show your slide change stalls behind
+        # another device's read" and "it doesn't". Only needs to run once —
+        # see _wal_initialized above.
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")  # safe pairing with WAL; still durable, less fsync overhead than FULL
+        _wal_initialized = True
     return conn
 
 
@@ -1294,6 +1306,46 @@ def get_service(service_id):
     r = conn.execute("SELECT * FROM services WHERE id=?", (service_id,)).fetchone()
     conn.close()
     return r
+
+
+# Process-wide cache: (service_id) -> (updated_at, parsed_items_list).
+# Used only by the polling hot paths (phone remote, stage display,
+# projector) — see get_service_items_cached below.
+_service_items_cache = {}
+
+
+def get_service_items_cached(service_id):
+    """
+    Like json.loads(get_service(service_id)["items"]), but skips the
+    json.loads() entirely when the service hasn't changed since the last
+    call from ANY poller.
+
+    Why this exists: the phone remote, stage display, and projector each
+    poll every 0.35-0.4s via st.fragment(run_every=...), and every poll
+    re-fetches the service row and re-parses its `items` JSON blob. For a
+    service that includes an imported slide deck (Google Slides photos),
+    that blob embeds full base64 image data for every slide — potentially
+    tens of megabytes — so re-parsing it 2-3 times a second per connected
+    phone was real, measurable latency on every tap, not just a rerun-scope
+    issue. Since the underlying data only changes when someone actually
+    edits the service (which bumps `updated_at`), it's safe to reuse the
+    already-parsed Python list whenever `updated_at` hasn't moved.
+
+    Only used by the read-only polling/live-display code paths above —
+    anything that EDITS a service still calls get_service()/json.loads()
+    directly and writes straight back to the DB via update_service_items(),
+    so editing correctness doesn't depend on this cache at all.
+    """
+    row = get_service(service_id)
+    if not row:
+        _service_items_cache.pop(service_id, None)
+        return None, []
+    cached = _service_items_cache.get(service_id)
+    if cached and cached[0] == row["updated_at"]:
+        return row, cached[1]
+    items = json.loads(row["items"])
+    _service_items_cache[service_id] = (row["updated_at"], items)
+    return row, items
 
 
 def update_service_items(service_id, items):
@@ -2408,12 +2460,18 @@ def projector_css(theme_name, background_key=None, font_scale=1.0):
     .proj-ref {{
         font-family: {t['font']}; color: {t['sub']}; letter-spacing:0.15em;
         text-transform: uppercase; font-size: clamp(1rem, 2.2vw, 2rem);
-        margin-bottom: 2vh; font-weight:600;
+        margin-bottom: 2vh; font-weight:600; flex-shrink:0;
     }}
+    /* .proj-text starts at this size and proj_autofit_js() below shrinks it
+       (via an inline font-size override) until it no longer overflows its
+       flex container — the clamp() here is just the ceiling/initial guess,
+       not a fixed size, which is what let long verses (e.g. Deut 1:1) run
+       off the bottom of the screen before. */
     .proj-text {{
         font-family: {t['font']}; color: {t['fg']}; font-size: calc(clamp(2.2rem, 5.4vw, 5.5rem) * {font_scale});
         line-height: 1.35; font-weight: 700; white-space: pre-line;
         text-shadow: {"0 2px 18px rgba(0,0,0,0.55)" if bg_def else "none"};
+        max-width: 100%; min-height:0;
     }}
     .proj-split {{
         height: 100vh; width: 100vw; display:flex; flex-direction:column;
@@ -2422,12 +2480,14 @@ def projector_css(theme_name, background_key=None, font_scale=1.0):
     .proj-half {{
         flex: 1; display:flex; flex-direction:column; align-items:center;
         justify-content:center; text-align:center; padding: 2.5vw; overflow:hidden;
+        min-height:0;
     }}
     .proj-half-top {{ border-bottom: 1px solid {t['sub']}44; }}
     .proj-text-secondary {{
         font-family: {t['font']}; color: {t['fg']}; font-size: calc(clamp(1.6rem, 4vw, 3.6rem) * {font_scale});
         line-height: 1.35; font-weight: 700; white-space: pre-line;
         text-shadow: {"0 2px 18px rgba(0,0,0,0.55)" if bg_def else "none"};
+        max-width: 100%; min-height:0;
     }}
     [dir="rtl"] .proj-text, [dir="rtl"] .proj-text-secondary {{
         font-family: 'Traditional Arabic', 'Noto Naskh Arabic', 'Segoe UI', Tahoma, sans-serif;
@@ -2436,10 +2496,106 @@ def projector_css(theme_name, background_key=None, font_scale=1.0):
     """)
 
 
+def proj_autofit_js():
+    """
+    Shrink-to-fit algorithm for the projector's verse text.
+
+    Long verses (e.g. Deuteronomy 1:1, which lists half a dozen place
+    names) previously overflowed .proj-text / .proj-text-secondary because
+    those classes only set a *starting* font-size via CSS clamp() — there
+    was no mechanism to make the text smaller when even the minimum clamp
+    size didn't fit the screen.
+
+    This script re-runs after every projector update (it's re-injected
+    each poll, and components.html re-executes its <script> on every call)
+    and, for each `.proj-autofit` element:
+      1. Resets to its CSS-defined font-size (so growth back to full size
+         is possible if the slide changes to something shorter).
+      2. Repeatedly reduces font-size in small steps while the element's
+         scrollHeight/scrollWidth exceeds its container's clientHeight/
+         clientWidth, down to a readable floor (18px) so text never
+         disappears entirely on a pathologically long slide.
+    This runs client-side in the projector tab, so it costs nothing on the
+    operator's phone and adds no extra network round trip.
+    """
+    components.html(
+        """
+        <script>
+        (function() {
+            const doc = window.parent.document;
+            function fitOne(el) {
+                if (!el) return;
+                const container = el.parentElement;
+                if (!container) return;
+                // Reset to the CSS-computed size first so a shorter slide
+                // can grow back up instead of staying shrunk forever.
+                el.style.fontSize = '';
+                const startPx = parseFloat(window.getComputedStyle(el).fontSize);
+                let size = startPx;
+                const floor = 18; // px — never shrink below a readable size
+                let guard = 0; // safety cap on loop iterations
+                while (guard < 60 &&
+                       size > floor &&
+                       (el.scrollHeight > container.clientHeight + 1 ||
+                        el.scrollWidth > container.clientWidth + 1)) {
+                    size -= Math.max(1, size * 0.04);
+                    el.style.fontSize = size + 'px';
+                    guard++;
+                }
+            }
+            function fitAll() {
+                doc.querySelectorAll('.proj-autofit').forEach(fitOne);
+            }
+            // Run now, and again after fonts/images finish loading (their
+            // metrics aren't final until then, so fitting too early can
+            // measure the wrong box).
+            fitAll();
+            if (doc.fonts && doc.fonts.ready) { doc.fonts.ready.then(fitAll); }
+            window.addEventListener('resize', fitAll);
+            setTimeout(fitAll, 60);
+            setTimeout(fitAll, 250);
+        })();
+        </script>
+        """,
+        height=0,
+    )
+
+
 def _looks_arabic(text):
     """True if the text contains Arabic-script characters, so we can set text
     direction/font automatically without the operator having to configure it."""
     return any("\u0600" <= ch <= "\u06FF" for ch in (text or ""))
+
+
+def _fragment_rerun():
+    """
+    Rerun ONLY the enclosing st.fragment, not the whole Streamlit script.
+
+    The phone remote (render_remote / render_remote_grid) is wrapped in
+    st.fragment(run_every=...), but every button inside it used to call
+    plain st.rerun() — which is a *full app* rerun regardless of what
+    triggered it. On a phone that meant: the whole page tore down and
+    rebuilt on every tap (slow), and the browser lost its scroll position
+    and jumped back to the top (since the DOM the browser had scrolled
+    within was discarded and replaced), which is exactly what was reported.
+
+    st.rerun(scope="fragment") (Streamlit >= 1.37) reruns just the
+    fragment's own output in place, leaving the rest of the page —
+    including scroll position — untouched. Older Streamlit installs don't
+    accept the scope= kwarg at all (it raises TypeError), so this detects
+    that and falls back to a plain st.rerun(); on those older versions the
+    scroll-jump can still happen, but everything still functions.
+    """
+    try:
+        st.rerun(scope="fragment")
+    except Exception:
+        # Covers both: (a) Streamlit too old to accept scope= at all
+        # (raises TypeError), and (b) Streamlit new enough to accept it but
+        # called from outside any st.fragment (raises
+        # StreamlitAPIException). Either way, a full st.rerun() is the
+        # correct fallback — it's exactly what every caller here used
+        # before this helper existed.
+        st.rerun()
 
 
 # ---------------------------------------------------------------------------
@@ -2464,9 +2620,11 @@ def render_projector():
             if 0 <= si < len(slides):
                 ref, text, text2 = slides[si]
         elif state["service_id"]:
-            service = get_service(state["service_id"])
+            # get_service_items_cached: skips re-parsing the (potentially
+            # multi-MB, image-embedding) items JSON when the service hasn't
+            # changed since the last poll — see its docstring.
+            service, items = get_service_items_cached(state["service_id"])
             if service:
-                items = json.loads(service["items"])
                 idx = state["item_index"]
                 if 0 <= idx < len(items):
                     slides = item_slides(items[idx], state.get("font_scale") or 1.0)
@@ -2476,10 +2634,18 @@ def render_projector():
 
         if text.startswith(IMG_SLIDE_PREFIX):
             img_src = text[len(IMG_SLIDE_PREFIX):]
+            # Imported slide-deck photos (e.g. Google Slides exports) now
+            # fill the entire screen edge-to-edge (object-fit: cover)
+            # instead of letterboxing with black bars top/bottom
+            # (object-fit: contain). Since these images are typically
+            # already the right aspect ratio (full slide exports), cover
+            # crops only the rare mismatched edge rather than shrinking
+            # the whole image to fit inside black bars.
             render_html(
                 f"""<div style="height:100vh;width:100vw;display:flex;align-items:center;
-                justify-content:center;background:#000;animation: eccFadeIn 0.45s ease;">
-                <img src="{img_src}" style="max-width:100%;max-height:100%;object-fit:contain;" />
+                justify-content:center;background:#000;animation: eccFadeIn 0.45s ease;
+                overflow:hidden;">
+                <img src="{img_src}" style="width:100%;height:100%;object-fit:cover;" />
                 </div>"""
             )
         elif text2:
@@ -2489,20 +2655,22 @@ def render_projector():
                 f"""<div class="proj-split">
                 <div class="proj-half proj-half-top" dir="{top_dir}">
                 {f'<div class="proj-ref">{ref}</div>' if ref else ''}
-                <div class="proj-text">{text}</div>
+                <div class="proj-text proj-autofit">{text}</div>
                 </div>
                 <div class="proj-half proj-half-bottom" dir="{bottom_dir}">
-                <div class="proj-text-secondary">{text2}</div>
+                <div class="proj-text-secondary proj-autofit">{text2}</div>
                 </div>
                 </div>"""
             )
+            proj_autofit_js()
         else:
             render_html(
                 f"""<div class="proj-wrap">
                 {f'<div class="proj-ref">{ref}</div>' if ref else ''}
-                <div class="proj-text">{text}</div>
+                <div class="proj-text proj-autofit">{text}</div>
                 </div>"""
             )
+            proj_autofit_js()
 
     # Auto-refreshing fragment (only this output re-renders per tick, no
     # full-page reload) needs Streamlit >= 1.33. Older installs don't have
@@ -2619,9 +2787,11 @@ def _stage_slide_info(state):
             else:
                 nxt_label = f"{nxt_ref} — {nxt_text}" if nxt_ref else nxt_text  # full text, no truncation
     elif state.get("service_id"):
-        service = get_service(state["service_id"])
+        # get_service_items_cached: see its docstring — avoids re-parsing
+        # a potentially large (image-embedding) items blob on every poll
+        # tick when nothing about the service has actually changed.
+        service, items = get_service_items_cached(state["service_id"])
         if service:
-            items = json.loads(service["items"])
             idx = state["item_index"]
             if 0 <= idx < len(items):
                 slides = item_slides(items[idx], state.get("font_scale") or 1.0)
@@ -2782,6 +2952,59 @@ def render_remote():
         time.sleep(1)
         st.rerun()
 
+    _remote_scroll_preserve_js()
+
+
+def _remote_scroll_preserve_js():
+    """
+    Belt-and-suspenders scroll-position fix for the phone remote.
+
+    _fragment_rerun() (used by every button in the remote) already avoids
+    the full-page reload that was the main cause of "every tap jumps me
+    back to the top" — but Streamlit's periodic run_every polling on this
+    same fragment, plus the fragment's own DOM being replaced on each
+    rerun, can still shift scroll position slightly on some mobile
+    browsers if the new content is a different height than the old.
+
+    This continuously remembers the page's scrollTop in sessionStorage
+    (survives this poll/rerun cycle, cleared when the tab closes) and
+    re-applies it right after each update, so even if the fragment swap
+    resets scroll to 0 for a moment, it's restored within the same frame —
+    the volunteer holding the phone shouldn't perceive any jump.
+    """
+    components.html(
+        """
+        <script>
+        (function() {
+            const win = window.parent;
+            const KEY = 'ecc_remote_scroll_y';
+
+            function restore() {
+                const saved = win.sessionStorage.getItem(KEY);
+                if (saved !== null) {
+                    win.scrollTo(0, parseFloat(saved));
+                }
+            }
+            function save() {
+                win.sessionStorage.setItem(KEY, String(win.scrollY));
+            }
+
+            if (!win._eccRemoteScrollBound) {
+                win._eccRemoteScrollBound = true;
+                win.addEventListener('scroll', save, { passive: true });
+            }
+            // Restore immediately, and once more after the fragment's
+            // DOM has finished settling (fonts/images can change layout
+            // height slightly after first paint).
+            restore();
+            setTimeout(restore, 50);
+            setTimeout(restore, 200);
+        })();
+        </script>
+        """,
+        height=0,
+    )
+
 
 def _render_remote_body():
     st.session_state.setdefault("remote_grid_mode", False)
@@ -2837,8 +3060,11 @@ def _render_remote_body():
         slides = json.loads(state["adhoc_slides"]) if state.get("adhoc_slides") else []
         si = state.get("adhoc_index") or 0
     else:
-        service = get_service(state["service_id"]) if state.get("service_id") else None
-        items = json.loads(service["items"]) if service else []
+        # get_service_items_cached: avoids re-parsing the items JSON (which
+        # can embed multi-MB base64 images for imported slide decks) on
+        # every 0.4s poll tick — this is what made the remote feel slow.
+        service, items = (get_service_items_cached(state["service_id"])
+                           if state.get("service_id") else (None, []))
         idx = state.get("item_index") or 0
         slides = item_slides(items[idx], state.get("font_scale") or 1.0) if 0 <= idx < len(items) else []
         si = state.get("slide_index") or 0
@@ -2850,7 +3076,7 @@ def _render_remote_body():
                 set_state(adhoc_index=si - 1, cleared=0)
             else:
                 set_state(slide_index=si - 1, cleared=0)
-            st.rerun()
+            _fragment_rerun()
         elif not adhoc and idx > 0:
             # Was on the first slide of this item — cross back into the
             # PREVIOUS item's last slide, mirroring what NEXT already does
@@ -2858,27 +3084,27 @@ def _render_remote_body():
             # moment you crossed into a new item, which looked broken.
             prev_slides = item_slides(items[idx - 1], state.get("font_scale") or 1.0)
             set_state(item_index=idx - 1, slide_index=max(0, len(prev_slides) - 1), cleared=0)
-            st.rerun()
+            _fragment_rerun()
     if c2.button("NEXT ▶", use_container_width=True, key="remote_next"):
         if si < len(slides) - 1:
             if adhoc:
                 set_state(adhoc_index=si + 1, cleared=0)
             else:
                 set_state(slide_index=si + 1, cleared=0)
-            st.rerun()
+            _fragment_rerun()
         elif not adhoc and idx + 1 < len(items):
             set_state(item_index=idx + 1, slide_index=0, cleared=0)
-            st.rerun()
+            _fragment_rerun()
     st.write("")
     is_black = bool(state.get("black"))
     black_label = "🔆 Show Display (currently Black)" if is_black else "⬛ Black Screen"
     if st.button(black_label, use_container_width=True, key="remote_black"):
         set_state(black=0 if is_black else 1)
-        st.rerun()
+        _fragment_rerun()
     st.write("")
     if st.button("🎬 Slide Grid", use_container_width=True, key="remote_open_grid"):
         st.session_state["remote_grid_mode"] = True
-        st.rerun()
+        _fragment_rerun()
 
 
 def render_remote_grid():
@@ -2906,8 +3132,8 @@ def render_remote_grid():
     </style>
     """)
 
-    service = get_service(state["service_id"]) if state.get("service_id") else None
-    items = json.loads(service["items"]) if service else []
+    service, items = (get_service_items_cached(state["service_id"])
+                       if state.get("service_id") else (None, []))
     adhoc = bool(state.get("adhoc_active"))
 
     top1, top2, top3, top4 = st.columns(4)
@@ -2916,7 +3142,7 @@ def render_remote_grid():
         if st.button("⬛" if not is_black else "🔆", use_container_width=True, key="rgrid_black",
                      help="Black Screen"):
             set_state(black=0 if is_black else 1)
-            st.rerun()
+            _fragment_rerun()
     with top2:
         if st.button("◀", use_container_width=True, key="rgrid_prev", help="Previous slide"):
             if adhoc:
@@ -2931,7 +3157,7 @@ def render_remote_grid():
                 elif idx > 0:
                     prev_slides = item_slides(items[idx - 1], state.get("font_scale") or 1.0)
                     set_state(item_index=idx - 1, slide_index=max(0, len(prev_slides) - 1), cleared=0)
-            st.rerun()
+            _fragment_rerun()
     with top3:
         if st.button("▶", use_container_width=True, key="rgrid_next", help="Next slide"):
             if adhoc:
@@ -2947,11 +3173,11 @@ def render_remote_grid():
                     set_state(slide_index=si + 1, cleared=0)
                 elif idx + 1 < len(items):
                     set_state(item_index=idx + 1, slide_index=0, cleared=0)
-            st.rerun()
+            _fragment_rerun()
     with top4:
         if st.button("✕ Back", use_container_width=True, key="rgrid_back"):
             st.session_state["remote_grid_mode"] = False
-            st.rerun()
+            _fragment_rerun()
 
     st.write("")
     if adhoc:
@@ -2987,7 +3213,7 @@ def render_remote_grid():
             if st.button(label, key=f"rgrid_pick_item_{i}", use_container_width=True,
                          type="primary" if is_browsing else "secondary"):
                 st.session_state["rgrid_browse_idx"] = i
-                st.rerun()
+                _fragment_rerun()
 
     st.write("")
     state = get_state()  # re-fetch: the control row above may have just changed it
@@ -3457,6 +3683,14 @@ def page_bible():
     st.markdown("### Bible")
 
     translations = get_bible_translations()
+    # Default the Bilingual checkbox ON whenever a second translation is
+    # available (e.g. Arabic + English), instead of requiring the operator
+    # to remember to switch it on every time. This is only the *default*
+    # for the checkbox's very first value in a session — st.checkbox still
+    # remembers whatever the operator later sets it to via bible_bilingual
+    # in session_state, so turning it off (for an English-only slot) sticks.
+    if "bible_bilingual" not in st.session_state:
+        st.session_state["bible_bilingual"] = len(translations) >= 2
     top1, top2 = st.columns([1, 1])
     with top1:
         translation = st.selectbox("Translation", translations, key="bible_translation")
@@ -3977,7 +4211,12 @@ def _render_slide_grid(entries, adhoc, item_index, slide_index, cols_per_row=4, 
                         set_state(adhoc_index=entry["slide_idx"], cleared=0)
                     else:
                         set_state(item_index=entry["item_idx"], slide_index=entry["slide_idx"], cleared=0, black=0)
-                    st.rerun()
+                    # _fragment_rerun(): scoped rerun when called from the
+                    # phone remote's fragment (no page-wide reload / scroll
+                    # reset there); this function is also called from the
+                    # non-fragment operator page, where it transparently
+                    # falls back to a normal st.rerun().
+                    _fragment_rerun()
                 st.markdown('</div>', unsafe_allow_html=True)
         idx += cols_per_row
 
@@ -4049,8 +4288,11 @@ def _page_presentation_body():
         st.info("No active service. Build one in Service Builder first — or present a Bible verse directly from the Bible tab.")
         return
 
-    service = get_service(sid) if sid else None
-    items = json.loads(service["items"]) if service else []
+    # get_service_items_cached: this page polls every 0.4s (see
+    # page_presentation's st.fragment(run_every=...) above) — avoid
+    # re-parsing the items JSON (which can embed multi-MB base64 images for
+    # imported slide decks) on every tick when the service hasn't changed.
+    service, items = get_service_items_cached(sid) if sid else (None, [])
     state = get_state()
     if service and state["service_id"] != sid and not adhoc:
         set_state(service_id=sid, item_index=0, slide_index=0, black=0, cleared=1, live=1)

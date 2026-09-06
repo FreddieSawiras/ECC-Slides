@@ -480,8 +480,27 @@ _DB_INITIALIZED = False  # see main() — makes init_db() run once per process, 
 BG = "#0D0C0A"               # warm near-black (cinematic warm dark vs. cold tech dark)
 CARD = "#17161A"             # charcoal card, warmed to match BG
 CARD_BORDER = "#26252A"
+CARD_2 = "#1D1C21"           # one step lighter than CARD — the "raised" tier in the elevation scale
 TEXT_PRIMARY = "#F4F3EF"
 TEXT_MUTED = "#9A9CA3"
+
+# Design tokens — a defined scale instead of one-off numbers picked per
+# component. Radius and shadow values were previously inconsistent across
+# .ecc-card/.ecc-hero/.slide-thumb/buttons (10px here, 14px there, 16px,
+# 20px — no scale, just numbers that happened to look fine individually).
+# Exposed as CSS custom properties (--ecc-r-sm etc.) so every component
+# below references the same scale instead of hardcoding its own value.
+RADIUS_SM = "8px"   # buttons, inputs, pills-adjacent small controls
+RADIUS_MD = "12px"  # cards, expanders, popovers — the default "chrome" radius
+RADIUS_LG = "20px"  # hero/feature panels — deliberately larger, used sparingly
+# Three-tier elevation: resting / hover / active. Shadow softness and
+# spread scale together so "raised" reads as physically closer, not just
+# "has a bigger shadow" — each tier adds warmth (a faint gold-tinted second
+# shadow layer) rather than just deepening black, which is what separates
+# a considered elevation system from a generic drop-shadow.
+SHADOW_REST = "0 1px 2px rgba(0,0,0,0.3), 0 4px 16px rgba(0,0,0,0.22)"
+SHADOW_HOVER = f"0 2px 4px rgba(0,0,0,0.35), 0 8px 28px rgba(0,0,0,0.28), 0 0 0 1px {ACCENT}12"
+SHADOW_ACTIVE = f"0 0 0 1px {ACCENT}55, 0 4px 20px {ACCENT}26, 0 8px 32px rgba(0,0,0,0.3)"
 
 THEMES = {
     "Minimal Dark": {"bg": "#000000", "fg": "#FFFFFF", "sub": "#C9C9C9", "font": "'Inter', sans-serif"},
@@ -617,6 +636,18 @@ LOCALIZED_BOOK_NAMES = {
 def get_conn():
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.row_factory = sqlite3.Row
+    # WAL (Write-Ahead Logging) mode: readers no longer block on a writer
+    # and vice versa. This matters concretely here — with the phone remote,
+    # stage display, and Presentation tab now all polling get_state() every
+    # 0.35-0.5s (see their st.fragment(run_every=...) wrappers) while
+    # occasional writes (slide changes) happen from any of them, the
+    # default SQLite journal mode makes writers and readers wait on each
+    # other; WAL lets them proceed concurrently, which is the difference
+    # between "the read that would show your slide change stalls behind
+    # another device's read" and "it doesn't". PRAGMA calls are cheap and
+    # idempotent — safe to run on every single connection open.
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")  # safe pairing with WAL; still durable, less fsync overhead than FULL
     return conn
 
 
@@ -1988,16 +2019,43 @@ def _render_splash_screen():
 
 def inject_css():
     render_html(f"""
-    <style>    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=Manrope:wght@400;500;700&display=swap');
+    <style>    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=Manrope:wght@600;700;800&family=JetBrains+Mono:wght@500;700&display=swap');
 
     html, body, [class*="css"]  {{
         font-family: 'Inter', -apple-system, sans-serif;
     }}
     html, body {{ background: {BG} !important; }}
+    /* --ecc-num is the tabular/monospace treatment for anything numeric —
+       slide counts, timers, "12/40" chips. Apply via style="font-family:
+       var(--ecc-num)" or the .ecc-num utility class below. Distinct
+       numeric typography is a small, cheap signal that reads as
+       considered rather than "everything in the same body font". */
+    :root {{ --ecc-num: 'JetBrains Mono', 'SF Mono', monospace; }}
+    .ecc-num {{ font-family: var(--ecc-num); font-variant-numeric: tabular-nums; font-weight: 600; }}
     .stApp {{
-        background: {BG};
+        background:
+            radial-gradient(circle at 15% 8%, {ACCENT}08, transparent 40%),
+            radial-gradient(circle at 85% 92%, {ACCENT}05, transparent 45%),
+            {BG};
         color: {TEXT_PRIMARY};
+        position: relative;
     }}
+    /* Very faint noise texture over the whole app — a truly flat dark
+       background reads as "empty void" at a glance; premium dark UIs
+       almost always carry a barely-visible grain to give the surface some
+       material quality. This is intentionally subtle (2% opacity) — it
+       should not be consciously noticeable, only felt. */
+    .stApp::before {{
+        content: ""; position: fixed; inset: 0; pointer-events: none; z-index: 0;
+        opacity: 0.025; mix-blend-mode: overlay;
+        background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='120' height='120'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+    }}
+    /* Pin real app content above the fixed noise layer explicitly, rather
+       than relying on default stacking-order behavior between a
+       position:fixed pseudo-element and normal-flow siblings — that
+       relationship isn't something to leave implicit when the noise layer
+       covers the entire viewport. */
+    [data-testid="stAppViewContainer"] {{ position: relative; z-index: 1; }}
     section[data-testid="stSidebar"] {{
         background: linear-gradient(180deg, #101116 0%, #0A0B0E 100%);
         border-right: 1px solid {CARD_BORDER};
@@ -2021,7 +2079,11 @@ def inject_css():
     }}
 
     /* ---- Premium console chrome: typography, scrollbars, alerts ---- */
-    h1, h2, h3 {{ letter-spacing: -0.01em; font-weight: 800 !important; color: {TEXT_PRIMARY}; }}
+    /* H1/H2 use Manrope (previously imported but never actually applied
+       anywhere) to differentiate top-level titles from body text — H3 down
+       stays in Inter so the hierarchy has exactly two voices, not three. */
+    h1, h2 {{ font-family: 'Manrope', 'Inter', sans-serif; letter-spacing: -0.015em; font-weight: 800 !important; color: {TEXT_PRIMARY}; }}
+    h3 {{ letter-spacing: -0.01em; font-weight: 800 !important; color: {TEXT_PRIMARY}; }}
     h4, h5, h6 {{ letter-spacing: 0.01em; font-weight: 700 !important; color: {TEXT_PRIMARY}; }}
     p, span, label, .stMarkdown {{ color: {TEXT_PRIMARY}; }}
     [data-testid="stCaptionContainer"], .stCaption {{ color: {TEXT_MUTED} !important; }}
@@ -2030,6 +2092,16 @@ def inject_css():
     ::-webkit-scrollbar-thumb {{ background: {CARD_BORDER}; border-radius: 8px; }}
     ::-webkit-scrollbar-thumb:hover {{ background: {ACCENT}66; }}
     * {{ scrollbar-width: thin; scrollbar-color: {CARD_BORDER} {BG}; }}
+
+    /* Page-level entrance — Streamlit's own page switches are instant
+       cuts; this gives the main content area a quick fade-and-lift on
+       every rerun so navigation feels like a transition, not a hard swap.
+       Kept short (180ms) so it never feels like it's in the way. */
+    @keyframes eccPageIn {{
+        0% {{ opacity: 0; transform: translateY(6px); }}
+        100% {{ opacity: 1; transform: translateY(0); }}
+    }}
+    [data-testid="stAppViewBlockContainer"] > div {{ animation: eccPageIn 0.22s ease both; }}
 
     div[data-testid="stAlert"] {{
         background: {CARD}; border: 1px solid {CARD_BORDER}; border-radius: 12px;
@@ -2075,20 +2147,20 @@ def inject_css():
     .ecc-card {{
         background: linear-gradient(160deg, {CARD} 0%, #131217 100%);
         border: 1px solid {CARD_BORDER};
-        border-radius: 16px;
+        border-radius: {RADIUS_MD};
         padding: 1.4rem 1.6rem;
         margin-bottom: 1rem;
-        box-shadow: 0 6px 24px rgba(0,0,0,0.25);
-        transition: all .15s ease;
+        box-shadow: {SHADOW_REST};
+        transition: box-shadow .18s ease, border-color .18s ease, transform .18s ease;
     }}
-    .ecc-card:hover {{ border-color: {ACCENT}55; }}
+    .ecc-card:hover {{ border-color: {ACCENT}55; box-shadow: {SHADOW_HOVER}; transform: translateY(-1px); }}
     .ecc-hero {{
         background: linear-gradient(135deg, #17140B, #0E0F13 70%);
         border: 1px solid {ACCENT}33;
-        border-radius: 20px;
+        border-radius: {RADIUS_LG};
         padding: 2rem 2.2rem;
         margin-bottom: 1.5rem;
-        box-shadow: 0 10px 36px rgba(0,0,0,0.35);
+        box-shadow: {SHADOW_HOVER};
     }}
     .ecc-muted {{ color: {TEXT_MUTED}; font-size: 0.88rem; }}
     .ecc-label {{
@@ -2101,17 +2173,17 @@ def inject_css():
         margin-right: 0.3rem;
     }}
     .stButton>button {{
-        border-radius: 10px; border: 1px solid {CARD_BORDER};
+        border-radius: {RADIUS_SM}; border: 1px solid {CARD_BORDER};
         background: {CARD}; color: {TEXT_PRIMARY}; font-weight: 600;
-        transition: all .12s ease; box-shadow: 0 1px 3px rgba(0,0,0,0.2);
+        transition: all .12s ease; box-shadow: {SHADOW_REST};
     }}
-    .stButton>button:hover {{ border-color: {ACCENT}; color: {ACCENT}; box-shadow: 0 0 0 3px {ACCENT}18; }}
+    .stButton>button:hover {{ border-color: {ACCENT}; color: {ACCENT}; box-shadow: {SHADOW_HOVER}; transform: translateY(-1px); }}
     .stButton>button:active {{ transform: translateY(1px); }}
     button[kind="primary"], .ecc-primary button {{
         background: linear-gradient(160deg, {ACCENT}, #A9803A) !important; color: #1A1400 !important; border: none !important;
         font-weight: 700 !important; box-shadow: 0 4px 14px {ACCENT}33 !important;
     }}
-    button[kind="primary"]:hover {{ filter: brightness(1.08); }}
+    button[kind="primary"]:hover {{ filter: brightness(1.08); box-shadow: 0 6px 20px {ACCENT}4D !important; }}
 
     /* Destructive buttons — wrap the button in
        st.container(key="ecc-danger-...") (any key starting with
@@ -2153,27 +2225,27 @@ def inject_css():
     .ecc-status-black {{ background: {BLACK_RED}1E; color: {BLACK_RED}; border: 1px solid {BLACK_RED}55; }}
     .ecc-status-paused {{ background: {PAUSE_AMBER}1E; color: {PAUSE_AMBER}; border: 1px solid {PAUSE_AMBER}55; }}
     div[data-testid="stVerticalBlockBorderWrapper"] {{
-        border-radius: 14px !important; border-color: {CARD_BORDER} !important;
+        border-radius: {RADIUS_MD} !important; border-color: {CARD_BORDER} !important;
         background: {CARD};
     }}
     hr {{ border-color: {CARD_BORDER}; }}
     .slide-thumb {{
-        border: 1px solid {CARD_BORDER}; border-radius: 10px; padding: 0.7rem;
+        border: 1px solid {CARD_BORDER}; border-radius: {RADIUS_SM}; padding: 0.7rem;
         background: linear-gradient(160deg, {CARD} 0%, #101116 100%); margin-bottom: 0.35rem;
         font-size: 0.82rem; color: {TEXT_MUTED};
-        transition: border-color .12s ease, box-shadow .12s ease;
+        transition: border-color .15s ease, box-shadow .15s ease, transform .15s ease;
         position: relative; /* anchors the invisible full-card click target below */
     }}
     .slide-thumb.active {{
         border-color: {ACCENT}; color: {TEXT_PRIMARY}; background: {ACCENT}14;
-        box-shadow: 0 0 0 1px {ACCENT}55, 0 4px 16px {ACCENT}22;
+        box-shadow: {SHADOW_ACTIVE};
     }}
-    .slide-thumb:hover {{ border-color: {ACCENT}99; cursor: pointer; }}
+    .slide-thumb:hover {{ border-color: {ACCENT}99; cursor: pointer; box-shadow: {SHADOW_HOVER}; transform: translateY(-1px); }}
     .slide-thumb-img {{
-        width: 100%; height: 100%; object-fit: cover; border-radius: 6px;
+        width: 100%; height: 100%; object-fit: cover; border-radius: calc({RADIUS_SM} - 2px);
         position: absolute; inset: 0; z-index: 0;
     }}
-    .slide-thumb-imgwrap {{ position: relative; width: 100%; height: 100%; border-radius: 6px; overflow: hidden; }}
+    .slide-thumb-imgwrap {{ position: relative; width: 100%; height: 100%; border-radius: calc({RADIUS_SM} - 2px); overflow: hidden; }}
     /* The whole card is the click target now — one real Streamlit button,
        stretched invisibly over the entire card via negative margin +
        absolute positioning, instead of a separate small "Select" button
@@ -2184,6 +2256,70 @@ def inject_css():
     .ecc-grid-select .stButton>button {{
         width: 100%; height: 100%; opacity: 0; cursor: pointer;
     }}
+
+    /* ---- Custom widget skins: checkbox, toggle, radio, slider ---- */
+    /* Streamlit's stock controls are the single biggest visual tell that
+       this is "a Streamlit app with CSS on top" rather than a considered
+       product — everything else in this file gets real styling, but these
+       four were left as unstyled browser/Streamlit defaults.
+
+       Two layers, deliberately: `accent-color` is a real, well-supported
+       CSS property that themes a native checkbox/radio/range input's own
+       rendering without needing to know anything about the surrounding
+       component's internal DOM — it's the reliable baseline. On top of
+       that, the more specific data-testid selectors below add richer
+       styling (rounded corners, shadows, custom thumb) for Streamlit's
+       actual (BaseWeb-backed) rendering of these controls, which visually
+       replaces the native input entirely — so if Streamlit's internal
+       structure ever shifts under a version bump, the accent-color layer
+       still guarantees the color, at minimum, tracks the accent everywhere
+       rather than silently reverting to browser-default blue/red. */
+    input[type="checkbox"], input[type="radio"], input[type="range"] {{ accent-color: {ACCENT}; }}
+
+    /* Checkbox — square, rounded, gold check when ticked. */
+    [data-testid="stCheckbox"] {{ padding-top: 2px; }}
+    [data-testid="stCheckbox"] > label > div:first-child {{
+        background: {CARD} !important; border: 1.5px solid {CARD_BORDER} !important;
+        border-radius: 6px !important; transition: all .15s ease !important;
+        box-shadow: {SHADOW_REST} !important;
+    }}
+    [data-testid="stCheckbox"] > label:hover > div:first-child {{ border-color: {ACCENT}99 !important; }}
+    [data-testid="stCheckbox"] > label > div:first-child:has(svg) {{
+        background: linear-gradient(160deg, {ACCENT}, #A9803A) !important; border-color: {ACCENT} !important;
+    }}
+
+    /* Toggle — real pill-shaped switch instead of the default flat bar;
+       gold when on, matching the primary-action color everywhere else. */
+    div[data-testid="stToggle"] label > div:first-child {{
+        background: {CARD_BORDER} !important; border-radius: 999px !important;
+        box-shadow: inset 0 1px 3px rgba(0,0,0,0.3) !important; transition: background .18s ease !important;
+    }}
+    div[data-testid="stToggle"] label > div:first-child > div {{
+        background: {TEXT_MUTED} !important; box-shadow: 0 1px 3px rgba(0,0,0,0.4) !important;
+        transition: transform .18s cubic-bezier(0.34, 1.56, 0.64, 1), background .18s ease !important;
+    }}
+    div[data-testid="stToggle"] input:checked ~ div {{ background: {ACCENT}55 !important; }}
+    div[data-testid="stToggle"] input:checked ~ div > div {{ background: {ACCENT} !important; }}
+
+    /* Radio — gold dot instead of the default browser-blue accent. */
+    [data-testid="stRadio"] label span:first-child {{
+        border-color: {CARD_BORDER} !important; transition: border-color .15s ease !important;
+    }}
+    [data-testid="stRadio"] input:checked + div {{
+        border-color: {ACCENT} !important; background: {ACCENT} !important;
+    }}
+
+    /* Slider — gold track fill and thumb, replacing Streamlit's default
+       red/pink accent so it matches the rest of the app's palette instead
+       of clashing with it. */
+    div[data-testid="stSlider"] [data-baseweb="slider"] > div:nth-child(2) {{
+        background: {ACCENT} !important;
+    }}
+    div[data-testid="stSlider"] [role="slider"] {{
+        background: {ACCENT} !important; border: 2px solid #1A1400 !important;
+        box-shadow: 0 2px 8px {ACCENT}55 !important;
+    }}
+    div[data-testid="stSlider"] [data-baseweb="slider"] > div:first-child {{ background: {CARD_BORDER} !important; }}
     </style>
     """)
 
@@ -2543,12 +2679,13 @@ def render_stage_display():
             next_html = nxt_label
         render_html(f"""
         <style>
+        @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@700&display=swap');
         #MainMenu, footer, header {{visibility: hidden;}}
         section[data-testid="stSidebar"] {{display:none;}}
         .block-container {{ padding: 1.5vw 2vw !important; max-width: 100% !important; }}
         .stApp {{ background: #0B0C0F; }}
-        .stage-clock {{ color: #C8A24A; font-family:'Inter',sans-serif; font-size: clamp(1.2rem,2.4vw,2.2rem);
-                        font-weight:700; text-align:right; margin-bottom: 1.5vh; }}
+        .stage-clock {{ color: #C8A24A; font-family:'JetBrains Mono','SF Mono',monospace; font-size: clamp(1.2rem,2.4vw,2.2rem);
+                        font-weight:700; text-align:right; margin-bottom: 1.5vh; font-variant-numeric: tabular-nums; }}
         .stage-label {{ color:#8A8D93; font-family:'Inter',sans-serif; letter-spacing:.15em; text-transform:uppercase;
                         font-size: clamp(0.75rem,1.2vw,1rem); margin-bottom: 0.6vh; }}
         .stage-current {{ color:#FFFFFF; font-family:'Inter',sans-serif; font-weight:700;
@@ -2606,7 +2743,27 @@ def render_remote():
     phone) — big Prev/Next/Black buttons so any volunteer can advance
     slides without needing the full operator screen. Also offers a
     full-catalog Slide Grid view (see render_remote_grid) for browsing every
-    slide in the active service without needing to pick a song/verse first."""
+    slide in the active service without needing to pick a song/verse first.
+
+    Wrapped in st.fragment(run_every=...) — this used to only re-render
+    when THIS phone pressed one of its own buttons, so if the operator (or
+    a different phone) changed the live slide, this screen stayed on
+    whatever it last showed until someone touched it again. Now it polls
+    the shared state on its own, same as the Stage Display already did, so
+    external changes show up here within the poll interval regardless of
+    what triggered them."""
+    def _render_body():
+        _render_remote_body()
+
+    if hasattr(st, "fragment"):
+        st.fragment(run_every=0.4)(_render_body)()
+    else:
+        _render_body()
+        time.sleep(1)
+        st.rerun()
+
+
+def _render_remote_body():
     st.session_state.setdefault("remote_grid_mode", False)
     if st.session_state["remote_grid_mode"]:
         render_remote_grid()
@@ -3842,6 +3999,23 @@ def _render_operator_keyboard_shortcuts():
 
 
 def page_presentation():
+    """Wrapped in st.fragment(run_every=...) — this page used to only
+    re-render in response to ITS OWN button clicks, so if the phone remote
+    (or another operator) changed the live slide, this page kept showing
+    the old one until someone personally clicked something on it. Now it
+    polls the shared presentation_state on its own, same pattern as the
+    Stage Display and phone Remote, so external changes appear here within
+    the poll interval regardless of what triggered them."""
+    def _render_body():
+        _page_presentation_body()
+
+    if hasattr(st, "fragment"):
+        st.fragment(run_every=0.4)(_render_body)()
+    else:
+        _render_body()
+
+
+def _page_presentation_body():
     adhoc = bool(get_state().get("adhoc_active"))
     sid = st.session_state.get("active_service_id") or ensure_active_service()
     if not sid and not adhoc:
@@ -4030,7 +4204,10 @@ def page_presentation():
 
     with right:
         st.markdown("**Controls**")
-        st.caption(f"Slide {slide_index + 1 if slides else 0} / {len(slides)}")
+        render_html(
+            f'<span class="ecc-num" style="color:{TEXT_MUTED};font-size:0.85rem;">'
+            f'Slide {slide_index + 1 if slides else 0} / {len(slides)}</span>'
+        )
         cp, cn = st.columns(2)
         if cp.button("◀ PREV", use_container_width=True) and slide_index > 0:
             if adhoc:

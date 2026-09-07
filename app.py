@@ -692,6 +692,16 @@ def init_db():
         id INTEGER PRIMARY KEY CHECK (id=1),
         church_name TEXT, default_theme TEXT, default_background TEXT
     )""")
+    # History of uploaded custom background photos — kept separate from
+    # settings.custom_background_data (which only ever holds ONE "current"
+    # photo and gets overwritten every time a new one is saved) so that
+    # replacing the active photo doesn't delete the old ones. Each row is
+    # one processed (blurred/dimmed) upload; is_active marks whichever one
+    # is currently wired up as CUSTOM_BACKGROUND_KEY.
+    c.execute("""CREATE TABLE IF NOT EXISTS custom_backgrounds(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        data TEXT, label TEXT, is_active INTEGER DEFAULT 0, created_at TEXT
+    )""")
     c.execute("""CREATE TABLE IF NOT EXISTS presentation_state(
         id INTEGER PRIMARY KEY CHECK (id=1),
         service_id INTEGER, item_index INTEGER, slide_index INTEGER,
@@ -735,6 +745,21 @@ def init_db():
         conn.commit()
     except sqlite3.OperationalError:
         pass  # column already exists (older database)
+
+    # One-time backfill: if there's an existing "current" custom photo in
+    # settings.custom_background_data but nothing in the new
+    # custom_backgrounds history table yet, copy it in as the first
+    # history entry (marked active) — so upgrading to the history feature
+    # doesn't make an already-uploaded photo look like it vanished.
+    existing_row = c.execute("SELECT custom_background_data FROM settings WHERE id=1").fetchone()
+    existing_data = existing_row["custom_background_data"] if existing_row else None
+    history_count = c.execute("SELECT COUNT(*) AS n FROM custom_backgrounds").fetchone()["n"]
+    if existing_data and history_count == 0:
+        c.execute(
+            "INSERT INTO custom_backgrounds (data, label, is_active, created_at) VALUES (?,?,1,?)",
+            (existing_data, "Background", now())
+        )
+        conn.commit()
 
     # Incremental-sync support: each of these gets an updated_at (stamped on
     # every local write — see _touch_song/_touch_service/_touch_deck below)
@@ -1382,7 +1407,7 @@ def present_adhoc_now(slides):
     """
     Push slides straight to the projector without needing a saved service —
     used by the Bible tab's "Present Now" buttons. `slides` is a list of
-    (ref, text, text2_or_None) tuples, same shape as item_slides() returns.
+    (ref, text, text2_or_None, ref2_or_None) tuples, same shape as item_slides() returns.
     Any in-progress service navigation (item_index/slide_index) is left
     untouched so resuming the service afterward picks up where it left off;
     adhoc_active just tells the projector/operator view to show this instead.
@@ -1440,10 +1465,17 @@ def _wrap_text_lines(text, max_lines):
 
 
 def item_slides(item, font_scale=1.0):
-    """Return list of (reference_or_none, text, secondary_text_or_None) for a service item.
-    For imported slide decks (Google Slides PDF import), each "text" is an
-    image data-URI prefixed with IMG_SLIDE_PREFIX — renderers check for that
-    prefix and draw an <img> full-bleed instead of styled text.
+    """Return list of (reference_or_none, text, secondary_text_or_None,
+    secondary_reference_or_None) for a service item. For imported slide
+    decks (Google Slides PDF import), each "text" is an image data-URI
+    prefixed with IMG_SLIDE_PREFIX — renderers check for that prefix and
+    draw an <img> full-bleed instead of styled text.
+
+    The 4th element (ref2) is only ever populated for bilingual Bible
+    slides — it's the reference localized to the secondary/bottom
+    language (see make_bible_item / _secondary_ref), so the projector and
+    every preview can show a reference under BOTH halves of a bilingual
+    slide, not just the top.
 
     font_scale reflows plain-text slides (song lyrics, custom slides,
     announcements, single-language Bible verses) so they keep fitting on
@@ -1453,15 +1485,15 @@ def item_slides(item, font_scale=1.0):
     never cut in half. Image slides and bilingual split-screen slides are
     left as-is (their own layouts already handle sizing)."""
     if item["type"] == "song":
-        raw = [(None, s, None) for s in item["slides"]]
+        raw = [(None, s, None, None) for s in item["slides"]]
     elif item["type"] == "bible":
-        raw = [(v["ref"], v["text"], v.get("text2")) for v in item["slides"]]
+        raw = [(v["ref"], v["text"], v.get("text2"), v.get("ref2")) for v in item["slides"]]
     elif item["type"] in ("custom", "announcement"):
-        raw = [(None, item["slides"][0] if item["slides"] else "", None)]
+        raw = [(None, item["slides"][0] if item["slides"] else "", None, None)]
     elif item["type"] == "imagedeck":
-        return [(None, IMG_SLIDE_PREFIX + img, None) for img in item.get("images", [])]
+        return [(None, IMG_SLIDE_PREFIX + img, None, None) for img in item.get("images", [])]
     else:
-        return [(None, "", None)]
+        return [(None, "", None, None)]
 
     font_scale = font_scale or 1.0
     if font_scale <= 1.0:
@@ -1469,12 +1501,12 @@ def item_slides(item, font_scale=1.0):
 
     max_lines = max(1, round(BASE_MAX_LINES_PER_SLIDE / font_scale))
     expanded = []
-    for ref, text, text2 in raw:
+    for ref, text, text2, ref2 in raw:
         if text2 or not text or text.startswith(IMG_SLIDE_PREFIX):
-            expanded.append((ref, text, text2))
+            expanded.append((ref, text, text2, ref2))
             continue
         for chunk in _wrap_text_lines(text, max_lines):
-            expanded.append((ref, chunk, None))
+            expanded.append((ref, chunk, None, None))
     return expanded
 
 
@@ -1502,6 +1534,27 @@ def localized_book_name(book, translation, sample_text=""):
     return (names.get(lang) or book) if names else book
 
 
+def _secondary_ref(book, chapter, verse_nums, translation, secondary_translation, book_number):
+    """
+    Builds the reference string for the SECOND (bottom) language of a
+    bilingual slide — e.g. "يوحنا ٣:١٦" to sit under "John 3:16" — so both
+    halves of a bilingual slide carry their own reference instead of only
+    the top one. Uses the secondary translation's own localized book name
+    (looked up by the shared canonical book number, same trick as the top
+    heading) and, if that language is Arabic, converts the chapter/verse
+    numbers to Arabic-Indic digits too.
+    """
+    sample = get_verse_in_translation(book, chapter, verse_nums[0], secondary_translation, book_number)
+    heading_book2 = localized_book_name(book, secondary_translation, sample)
+    if len(verse_nums) == 1:
+        ref2 = f"{heading_book2} {chapter}:{verse_nums[0]}"
+    else:
+        ref2 = f"{heading_book2} {chapter}:{verse_nums[0]}-{verse_nums[-1]}"
+    if _looks_arabic(heading_book2) or _looks_arabic(sample):
+        ref2 = _arabicize_numerals(ref2)
+    return ref2
+
+
 def make_bible_item(book, chapter, verse_nums, translation=None, secondary_translation=None, combine=False):
     """
     Build a Bible service item. If secondary_translation is given, each slide
@@ -1509,6 +1562,9 @@ def make_bible_item(book, chapter, verse_nums, translation=None, secondary_trans
     shared canonical book number when available, so an Arabic and an English
     translation can still be lined up even though they name books
     differently) — this is what powers the bilingual split-screen display.
+    Each slide also carries its own bottom-half reference (ref2), localized
+    to the secondary language (Arabic book name + Arabic-Indic numerals when
+    that language is Arabic), so the reference isn't only shown on top.
 
     If combine=True, all the requested verses are merged into a single slide
     (e.g. selecting verses 1,2,3 shows them together, referenced as
@@ -1529,6 +1585,7 @@ def make_bible_item(book, chapter, verse_nums, translation=None, secondary_trans
                 for v in verse_nums
             )
             slide["text2"] = combined_text2
+            slide["ref2"] = _secondary_ref(book, chapter, verse_nums, translation, secondary_translation, book_number)
         slides = [slide]
     else:
         slides = []
@@ -1536,6 +1593,7 @@ def make_bible_item(book, chapter, verse_nums, translation=None, secondary_trans
             slide = {"ref": f"{heading_book} {chapter}:{v}", "text": verses.get(v, "")}
             if secondary_translation:
                 slide["text2"] = get_verse_in_translation(book, chapter, v, secondary_translation, book_number)
+                slide["ref2"] = _secondary_ref(book, chapter, [v], translation, secondary_translation, book_number)
             slides.append(slide)
 
     label = f"{book} {chapter}:{verse_nums[0]}" if len(verse_nums) == 1 else \
@@ -2404,11 +2462,67 @@ def save_custom_background(uploaded_file, blur_radius=10, dim_factor=0.55):
 CUSTOM_BACKGROUND_KEY = "Custom Photo (uploaded)"
 
 
+def add_custom_background(data_uri, label=None):
+    """Adds a newly processed photo to the background history (does NOT
+    delete any previous ones) and marks it as the active one. Returns its
+    new row id."""
+    conn = get_conn()
+    conn.execute("UPDATE custom_backgrounds SET is_active=0")
+    cur = conn.execute(
+        "INSERT INTO custom_backgrounds (data, label, is_active, created_at) VALUES (?,?,1,?)",
+        (data_uri, label or "Background", now())
+    )
+    conn.commit()
+    new_id = cur.lastrowid
+    conn.close()
+    return new_id
+
+
+def get_custom_backgrounds():
+    """Returns every saved background photo, most recent first, as a list
+    of sqlite3.Row (id, data, label, is_active, created_at)."""
+    conn = get_conn()
+    rows = conn.execute("SELECT * FROM custom_backgrounds ORDER BY id DESC").fetchall()
+    conn.close()
+    return rows
+
+
+def get_active_custom_background():
+    """Returns the data URI of whichever saved photo is currently marked
+    active, or None if none is set/saved yet."""
+    conn = get_conn()
+    row = conn.execute("SELECT data FROM custom_backgrounds WHERE is_active=1 ORDER BY id DESC LIMIT 1").fetchone()
+    conn.close()
+    return row["data"] if row else None
+
+
+def set_active_custom_background(bg_id):
+    """Marks one saved photo (by id) as the active one, without deleting
+    any others — this is what lets the operator switch BACK to a
+    previously-uploaded photo instead of it being gone the moment a
+    different one was made active."""
+    conn = get_conn()
+    conn.execute("UPDATE custom_backgrounds SET is_active=0")
+    conn.execute("UPDATE custom_backgrounds SET is_active=1 WHERE id=?", (bg_id,))
+    conn.commit()
+    conn.close()
+
+
+def delete_custom_background(bg_id):
+    """Permanently removes one saved photo from history — this is the only
+    way a photo actually goes away now; replacing the active one no longer
+    does this implicitly."""
+    conn = get_conn()
+    conn.execute("DELETE FROM custom_backgrounds WHERE id=?", (bg_id,))
+    conn.commit()
+    conn.close()
+
+
 def projector_css(theme_name, background_key=None, font_scale=1.0):
     t = THEMES.get(theme_name, THEMES["Modern Worship"])
     bg_size_rule, bg_anim_rule = "", ""
     if background_key == CUSTOM_BACKGROUND_KEY:
-        data_uri = get_settings().get("custom_background_data")
+        data_uri = get_active_custom_background()
         bg_def = {"css": f"url('{data_uri}') center/cover no-repeat"} if data_uri else None
         app_bg = bg_def["css"] if bg_def else t["bg"]
     else:
@@ -2567,6 +2681,16 @@ def _looks_arabic(text):
     return any("\u0600" <= ch <= "\u06FF" for ch in (text or ""))
 
 
+_ARABIC_INDIC_DIGITS = "٠١٢٣٤٥٦٧٨٩"
+
+
+def _arabicize_numerals(text):
+    """Converts any ASCII 0-9 digits in a reference string to Arabic-Indic
+    numerals (٠-٩) — used so a bottom-half Arabic reference reads e.g.
+    "يوحنا ٣:١٦" instead of mixing in Western digits for the chapter/verse."""
+    return "".join(_ARABIC_INDIC_DIGITS[int(ch)] if ch.isdigit() else ch for ch in (text or ""))
+
+
 def _fragment_rerun():
     """
     Rerun ONLY the enclosing st.fragment, not the whole Streamlit script.
@@ -2602,101 +2726,21 @@ def _fragment_rerun():
 # PROJECTOR VIEW (opened in a second browser tab / window)
 # ---------------------------------------------------------------------------
 
-def render_projector():
-    def _render_body():
-        state = get_state()
-        projector_css(state["theme"] or "Modern Worship", state.get("background"), state.get("font_scale") or 1.0)
-
-        text, ref, text2 = "", None, None
-        if state["cleared"] or not state["live"]:
-            text = ""
-        elif state["black"]:
-            text = ""
-        elif state.get("adhoc_active"):
-            # "Present Now" from the Bible tab — bypasses the saved-service
-            # lookup entirely and reads straight from the ad-hoc slide list.
-            slides = json.loads(state["adhoc_slides"]) if state.get("adhoc_slides") else []
-            si = state.get("adhoc_index") or 0
-            if 0 <= si < len(slides):
-                ref, text, text2 = slides[si]
-        elif state["service_id"]:
-            # get_service_items_cached: skips re-parsing the (potentially
-            # multi-MB, image-embedding) items JSON when the service hasn't
-            # changed since the last poll — see its docstring.
-            service, items = get_service_items_cached(state["service_id"])
-            if service:
-                idx = state["item_index"]
-                if 0 <= idx < len(items):
-                    slides = item_slides(items[idx], state.get("font_scale") or 1.0)
-                    si = state["slide_index"]
-                    if 0 <= si < len(slides):
-                        ref, text, text2 = slides[si]
-
-        if text.startswith(IMG_SLIDE_PREFIX):
-            img_src = text[len(IMG_SLIDE_PREFIX):]
-            # Imported slide-deck photos (e.g. Google Slides exports) now
-            # fill the entire screen edge-to-edge (object-fit: cover)
-            # instead of letterboxing with black bars top/bottom
-            # (object-fit: contain). Since these images are typically
-            # already the right aspect ratio (full slide exports), cover
-            # crops only the rare mismatched edge rather than shrinking
-            # the whole image to fit inside black bars.
-            render_html(
-                f"""<div style="height:100vh;width:100vw;display:flex;align-items:center;
-                justify-content:center;background:#000;animation: eccFadeIn 0.45s ease;
-                overflow:hidden;">
-                <img src="{img_src}" style="width:100%;height:100%;object-fit:cover;" />
-                </div>"""
-            )
-        elif text2:
-            top_dir = "rtl" if _looks_arabic(text) else "ltr"
-            bottom_dir = "rtl" if _looks_arabic(text2) else "ltr"
-            render_html(
-                f"""<div class="proj-split">
-                <div class="proj-half proj-half-top" dir="{top_dir}">
-                {f'<div class="proj-ref">{ref}</div>' if ref else ''}
-                <div class="proj-text proj-autofit">{text}</div>
-                </div>
-                <div class="proj-half proj-half-bottom" dir="{bottom_dir}">
-                <div class="proj-text-secondary proj-autofit">{text2}</div>
-                </div>
-                </div>"""
-            )
-            proj_autofit_js()
-        else:
-            render_html(
-                f"""<div class="proj-wrap">
-                {f'<div class="proj-ref">{ref}</div>' if ref else ''}
-                <div class="proj-text proj-autofit">{text}</div>
-                </div>"""
-            )
-            proj_autofit_js()
-
-    # Auto-refreshing fragment (only this output re-renders per tick, no
-    # full-page reload) needs Streamlit >= 1.33. Older installs don't have
-    # st.fragment at all — calling it would throw and blank the whole page,
-    # which is worse than the small extra lag, so detect it and fall back
-    # to the previous sleep-and-rerun loop instead of hard-requiring it.
-    if hasattr(st, "fragment"):
-        st.fragment(run_every=0.35)(_render_body)()
-    else:
-        _render_body()
-        time.sleep(1)
-        st.rerun()
-
-    # Real browser fullscreen, two ways in:
-    #  1. Press "F" anywhere on this page (old docstring promised this but
-    #     nothing ever listened for it — F alone does nothing by default,
-    #     only F11 does natively; this wires it up).
-    #  2. The FIRST click or keypress on this page fullscreens it
-    #     automatically, with no need to know about "F" at all. This is the
-    #     fallback for when the auto-open button's cross-window
-    #     requestFullscreen() call gets silently ignored by the browser
-    #     (common — it only reliably fires when called synchronously off
-    #     the very gesture that opened the window, and a lot of browsers
-    #     just refuse it from a different window's script no matter what).
-    #     A single click anywhere the operator would naturally make once
-    #     the display is up covers that gap.
+def _render_fullscreen_fallback_js():
+    """
+    Real browser fullscreen, two ways in — shared by every ?display=...
+    view (projector, stage):
+     1. Press "F" anywhere on this page.
+     2. The FIRST click or keypress on this page fullscreens it
+        automatically, with no need to know about "F" at all. This is the
+        fallback for when the auto-open button's cross-window
+        requestFullscreen() call gets silently ignored by the browser
+        (common — it only reliably fires when called synchronously off
+        the very gesture that opened the window, and a lot of browsers
+        just refuse it from a different window's script no matter what).
+        A single click anywhere the operator would naturally make once
+        the display is up covers that gap.
+    """
     components.html(
         """
         <script>
@@ -2739,6 +2783,95 @@ def render_projector():
     )
 
 
+def render_projector():
+    def _render_body():
+        state = get_state()
+        projector_css(state["theme"] or "Modern Worship", state.get("background"), state.get("font_scale") or 1.0)
+
+        text, ref, text2, ref2 = "", None, None, None
+        if state["cleared"] or not state["live"]:
+            text = ""
+        elif state["black"]:
+            text = ""
+        elif state.get("adhoc_active"):
+            # "Present Now" from the Bible tab — bypasses the saved-service
+            # lookup entirely and reads straight from the ad-hoc slide list.
+            slides = json.loads(state["adhoc_slides"]) if state.get("adhoc_slides") else []
+            si = state.get("adhoc_index") or 0
+            if 0 <= si < len(slides):
+                ref, text, text2, ref2 = slides[si]
+        elif state["service_id"]:
+            # get_service_items_cached: skips re-parsing the (potentially
+            # multi-MB, image-embedding) items JSON when the service hasn't
+            # changed since the last poll — see its docstring.
+            service, items = get_service_items_cached(state["service_id"])
+            if service:
+                idx = state["item_index"]
+                if 0 <= idx < len(items):
+                    slides = item_slides(items[idx], state.get("font_scale") or 1.0)
+                    si = state["slide_index"]
+                    if 0 <= si < len(slides):
+                        ref, text, text2, ref2 = slides[si]
+
+        if text.startswith(IMG_SLIDE_PREFIX):
+            img_src = text[len(IMG_SLIDE_PREFIX):]
+            # Imported slide-deck photos (e.g. Google Slides exports) now
+            # fill the entire screen edge-to-edge (object-fit: cover)
+            # instead of letterboxing with black bars top/bottom
+            # (object-fit: contain). Since these images are typically
+            # already the right aspect ratio (full slide exports), cover
+            # crops only the rare mismatched edge rather than shrinking
+            # the whole image to fit inside black bars.
+            render_html(
+                f"""<div style="height:100vh;width:100vw;display:flex;align-items:center;
+                justify-content:center;background:#000;animation: eccFadeIn 0.45s ease;
+                overflow:hidden;">
+                <img src="{img_src}" style="width:100%;height:100%;object-fit:cover;" />
+                </div>"""
+            )
+        elif text2:
+            top_dir = "rtl" if _looks_arabic(text) else "ltr"
+            bottom_dir = "rtl" if _looks_arabic(text2) else "ltr"
+            render_html(
+                f"""<div class="proj-split">
+                <div class="proj-half proj-half-top" dir="{top_dir}">
+                {f'<div class="proj-ref">{ref}</div>' if ref else ''}
+                <div class="proj-text proj-autofit">{text}</div>
+                </div>
+                <div class="proj-half proj-half-bottom" dir="{bottom_dir}">
+                {f'<div class="proj-ref">{ref2}</div>' if ref2 else ''}
+                <div class="proj-text-secondary proj-autofit">{text2}</div>
+                </div>
+                </div>"""
+            )
+            proj_autofit_js()
+        else:
+            render_html(
+                f"""<div class="proj-wrap">
+                {f'<div class="proj-ref">{ref}</div>' if ref else ''}
+                <div class="proj-text proj-autofit">{text}</div>
+                </div>"""
+            )
+            proj_autofit_js()
+
+    # Auto-refreshing fragment (only this output re-renders per tick, no
+    # full-page reload) needs Streamlit >= 1.33. Older installs don't have
+    # st.fragment at all — calling it would throw and blank the whole page,
+    # which is worse than the small extra lag, so detect it and fall back
+    # to the previous sleep-and-rerun loop instead of hard-requiring it.
+    if hasattr(st, "fragment"):
+        st.fragment(run_every=0.35)(_render_body)()
+    else:
+        _render_body()
+        time.sleep(1)
+        st.rerun()
+
+    # Real browser fullscreen, two ways in — see _render_fullscreen_fallback_js()
+    # docstring for why this needs a live click rather than firing on load.
+    _render_fullscreen_fallback_js()
+
+
+
 def _stage_slide_info(state):
     """Shared by Stage Display and the phone Remote: figures out the current
     slide and a preview of what's coming next, from whichever mode is
@@ -2752,8 +2885,8 @@ def _stage_slide_info(state):
     raw base64 image data onto the phone remote and stage display as
     literal garbled text.
 
-    nxt_ref/nxt_text/nxt_text2 are the RAW next-slide parts (same shape as
-    cur_ref/cur_text/cur_text2) — callers that want a real mini-slide
+    nxt_ref/nxt_text/nxt_text2/nxt_ref2 are the RAW next-slide parts (same
+    shape as cur_ref/cur_text/cur_text2/cur_ref2) — callers that want a real mini-slide
     preview (see _render_mini_slide) should use these, not nxt_label.
     nxt_label remains as a ready-made short text fallback for callers that
     just want a line of text (e.g. when crossing into a whole different
@@ -2765,16 +2898,16 @@ def _stage_slide_info(state):
     should check nxt_img the same way they check cur_text, and render it as
     an <img> when it's set.
     """
-    cur_ref, cur_text, cur_text2 = None, "", None
-    nxt_ref, nxt_text, nxt_text2 = None, "", None
+    cur_ref, cur_text, cur_text2, cur_ref2 = None, "", None, None
+    nxt_ref, nxt_text, nxt_text2, nxt_ref2 = None, "", None, None
     nxt_label, nxt_img = "—", None
     if state.get("adhoc_active"):
         slides = json.loads(state["adhoc_slides"]) if state.get("adhoc_slides") else []
         si = state.get("adhoc_index") or 0
         if 0 <= si < len(slides):
-            cur_ref, cur_text, cur_text2 = slides[si]
+            cur_ref, cur_text, cur_text2, cur_ref2 = slides[si]
         if si + 1 < len(slides):
-            nxt_ref, nxt_text, nxt_text2 = slides[si + 1]
+            nxt_ref, nxt_text, nxt_text2, nxt_ref2 = slides[si + 1]
             if nxt_text.startswith(IMG_SLIDE_PREFIX):
                 # Strip the sentinel here so nxt_img is always a clean,
                 # directly-usable <img src="..."> value — this used to be
@@ -2797,9 +2930,9 @@ def _stage_slide_info(state):
                 slides = item_slides(items[idx], state.get("font_scale") or 1.0)
                 si = state["slide_index"]
                 if 0 <= si < len(slides):
-                    cur_ref, cur_text, cur_text2 = slides[si]
+                    cur_ref, cur_text, cur_text2, cur_ref2 = slides[si]
                 if si + 1 < len(slides):
-                    nxt_ref, nxt_text, nxt_text2 = slides[si + 1]
+                    nxt_ref, nxt_text, nxt_text2, nxt_ref2 = slides[si + 1]
                     if nxt_text.startswith(IMG_SLIDE_PREFIX):
                         nxt_label, nxt_img = "Image slide", nxt_text[len(IMG_SLIDE_PREFIX):]
                     else:
@@ -2807,7 +2940,7 @@ def _stage_slide_info(state):
                 elif idx + 1 < len(items):
                     nslides = item_slides(items[idx + 1], state.get("font_scale") or 1.0)
                     if nslides:
-                        nxt_ref, nxt_text, nxt_text2 = nslides[0]
+                        nxt_ref, nxt_text, nxt_text2, nxt_ref2 = nslides[0]
                         if nxt_text.startswith(IMG_SLIDE_PREFIX):
                             nxt_label, nxt_img = f"(Next) {items[idx + 1]['title']}", nxt_text[len(IMG_SLIDE_PREFIX):]
                         else:
@@ -2816,7 +2949,8 @@ def _stage_slide_info(state):
                     else:
                         nxt_label = f"(Next) {items[idx + 1]['title']}"
     hidden = bool(state.get("black") or state.get("cleared") or not state.get("live"))
-    return cur_ref, cur_text, cur_text2, nxt_ref, nxt_text, nxt_text2, nxt_label, nxt_img, hidden
+    return (cur_ref, cur_text, cur_text2, cur_ref2, nxt_ref, nxt_text, nxt_text2, nxt_ref2,
+            nxt_label, nxt_img, hidden)
 
 
 def render_stage_display():
@@ -2826,7 +2960,8 @@ def render_stage_display():
     without needing to peek at the projector or guess."""
     def _tick():
         state = get_state()
-        cur_ref, cur_text, cur_text2, nxt_ref, nxt_text, nxt_text2, nxt_label, nxt_img, hidden = _stage_slide_info(state)
+        (cur_ref, cur_text, cur_text2, cur_ref2, nxt_ref, nxt_text, nxt_text2, nxt_ref2,
+         nxt_label, nxt_img, hidden) = _stage_slide_info(state)
         cur_is_img = (cur_text or "").startswith(IMG_SLIDE_PREFIX)
         cur_img_src = cur_text[len(IMG_SLIDE_PREFIX):] if cur_is_img else ""
         # NOTE: render_html() goes through st.markdown(unsafe_allow_html=True),
@@ -2850,7 +2985,7 @@ def render_stage_display():
             next_html = _render_mini_slide(
                 nxt_text, nxt_ref, nxt_text2,
                 theme_name=state.get("theme"), background_key=state.get("background"),
-                height_px=180
+                height_px=180, ref2=nxt_ref2
             )
         else:
             next_html = nxt_label
@@ -2926,6 +3061,13 @@ def render_stage_display():
         _tick()
         time.sleep(1)
         st.rerun()
+
+    # Same click/F-key fullscreen fallback as the projector — the Stage
+    # Display's own auto-open link (in the sidebar) tries requestFullscreen()
+    # immediately on open, but that cross-window call isn't honored by every
+    # browser, so this covers the gap with the first click/keypress inside
+    # the window itself.
+    _render_fullscreen_fallback_js()
 
 
 def render_remote():
@@ -3013,7 +3155,8 @@ def _render_remote_body():
         return
 
     state = get_state()
-    cur_ref, cur_text, cur_text2, nxt_ref, nxt_text, nxt_text2, nxt_label, nxt_img, hidden = _stage_slide_info(state)
+    (cur_ref, cur_text, cur_text2, cur_ref2, nxt_ref, nxt_text, nxt_text2, nxt_ref2,
+     nxt_label, nxt_img, hidden) = _stage_slide_info(state)
 
     render_html("""
     <style>
@@ -3049,7 +3192,7 @@ def _render_remote_body():
         render_html(_render_mini_slide(
             nxt_text, nxt_ref, nxt_text2,
             theme_name=state.get("theme"), background_key=state.get("background"),
-            height_px=110
+            height_px=110, ref2=nxt_ref2
         ))
     else:
         st.caption(nxt_label)
@@ -3411,12 +3554,13 @@ def sidebar():
             """
             <div style="font-family:'Inter',sans-serif;font-size:0.82rem;display:flex;flex-direction:column;gap:0.5rem;">
               <div style="display:flex;align-items:center;gap:0.4rem;">
-                <a id="ecc-stage-link" href="#" onclick="return eccOpenLink(event, this)"
+                <a id="ecc-stage-link" href="#" onclick="return eccOpenStageDisplay(event)"
                    style="flex:1;color:#C8A24A;text-decoration:underline;cursor:pointer;">🖥 Stage Display (current + next slide, clock)</a>
                 <button onclick="eccCopyLink('ecc-stage-link', this)"
                         style="flex-shrink:0;background:#24262C;color:#F4F3EF;border:none;
                                border-radius:4px;padding:0.3rem 0.6rem;font-size:0.72rem;cursor:pointer;">Copy</button>
               </div>
+              <div id="ecc-stage-msg" style="color:#9A9CA3;font-size:0.72rem;"></div>
               <div style="display:flex;align-items:center;gap:0.4rem;">
                 <a id="ecc-remote-link" href="#" onclick="return eccOpenLink(event, this)"
                    style="flex:1;color:#C8A24A;text-decoration:underline;cursor:pointer;">📱 Phone Remote (Next/Prev/Black)</a>
@@ -3440,6 +3584,47 @@ def sidebar():
                 if (el.dataset.url) window.parent.open(el.dataset.url, "_blank");
                 return false;
               }
+              // Stage Display gets the same "new window, positioned on the
+              // extended display, full screen" treatment as the projector
+              // link above — clicking it never navigates THIS window away
+              // from wherever the operator currently is; it only ever opens
+              // the stage display in its own separate window.
+              async function eccOpenStageDisplay(e) {
+                e.preventDefault();
+                const link = document.getElementById("ecc-stage-link");
+                const msg = document.getElementById("ecc-stage-msg");
+                const url = link && link.dataset.url;
+                if (!url) return false;
+                if (!window.parent.getScreenDetails) {
+                  const w = window.parent.open(url, "ecc_stage");
+                  if (msg) msg.innerText = w ? "" : "Popup was blocked — allow popups for this site and try again.";
+                  return false;
+                }
+                try {
+                  const details = await window.parent.getScreenDetails();
+                  const current = details.currentScreen;
+                  const other = details.screens.find(s => s !== current) || current;
+                  const w = window.parent.open(
+                    url, "ecc_stage",
+                    `left=${other.availLeft},top=${other.availTop},width=${other.availWidth},height=${other.availHeight}`
+                  );
+                  if (!w) { if (msg) msg.innerText = "Popup was blocked — allow popups for this site and try again."; return false; }
+                  try { w.document.documentElement.requestFullscreen(); } catch (err) {}
+                  if (msg) {
+                    msg.innerText = other === current
+                      ? "Only one screen detected — opened here."
+                      : "Opened full-screen on the extended display.";
+                  }
+                } catch (err) {
+                  const w = window.parent.open(url, "ecc_stage");
+                  if (msg) {
+                    msg.innerText = w
+                      ? "Multi-screen permission isn't granted — opened in a normal window instead. Drag it and press F to fullscreen."
+                      : "Permission needed for auto-positioning, and the popup was blocked too.";
+                  }
+                }
+                return false;
+              }
               function eccCopyLink(linkId, btn) {
                 const el = document.getElementById(linkId);
                 if (!el || !el.dataset.url) return;
@@ -3451,7 +3636,7 @@ def sidebar():
               }
             </script>
             """,
-            height=80,
+            height=115,
         )
 
 
@@ -4030,9 +4215,9 @@ def _slide_grid_entries_all(items, font_scale, cap=120):
     "current song" to scope from; the whole service's slides are the point."""
     entries = []
     for ix, it in enumerate(items):
-        for j, (ref, text, text2) in enumerate(item_slides(it, font_scale)):
+        for j, (ref, text, text2, ref2) in enumerate(item_slides(it, font_scale)):
             entries.append({"item_idx": ix, "slide_idx": j, "ref": ref, "text": text, "text2": text2,
-                             "item_title": it["title"]})
+                             "ref2": ref2, "item_title": it["title"]})
             if len(entries) >= cap:
                 return entries
     return entries
@@ -4049,8 +4234,9 @@ def _slide_grid_entries(items, adhoc, adhoc_slides, item_index, font_scale, exte
     if adhoc:
         for i, s in enumerate(adhoc_slides or []):
             ref, text, text2 = s[0], s[1], s[2] if len(s) > 2 else None
+            ref2 = s[3] if len(s) > 3 else None
             entries.append({"item_idx": None, "slide_idx": i, "ref": ref, "text": text, "text2": text2,
-                             "item_title": "Verse"})
+                             "ref2": ref2, "item_title": "Verse"})
         return entries
 
     if not items or not (0 <= item_index < len(items)):
@@ -4058,9 +4244,9 @@ def _slide_grid_entries(items, adhoc, adhoc_slides, item_index, font_scale, exte
 
     def add_item(ix):
         it = items[ix]
-        for j, (ref, text, text2) in enumerate(item_slides(it, font_scale)):
+        for j, (ref, text, text2, ref2) in enumerate(item_slides(it, font_scale)):
             entries.append({"item_idx": ix, "slide_idx": j, "ref": ref, "text": text, "text2": text2,
-                             "item_title": it["title"]})
+                             "ref2": ref2, "item_title": it["title"]})
 
     add_item(item_index)
     if extend:
@@ -4072,7 +4258,7 @@ def _slide_grid_entries(items, adhoc, adhoc_slides, item_index, font_scale, exte
 
 
 def _render_mini_slide(text, ref=None, text2=None, theme_name=None, background_key=None,
-                        height_px=160, is_active=False, extra_class="", badge=None):
+                        height_px=160, is_active=False, extra_class="", badge=None, ref2=None):
     """Renders one slide's actual look in miniature — the real theme
     background (color, gradient, or uploaded photo), the real theme font
     and text color, centered the same way the projector centers it — at a
@@ -4096,7 +4282,7 @@ def _render_mini_slide(text, ref=None, text2=None, theme_name=None, background_k
     t = THEMES.get(theme_name, THEMES["Modern Worship"])
     bg_css = t["bg"]
     if background_key == CUSTOM_BACKGROUND_KEY:
-        data_uri = get_settings().get("custom_background_data")
+        data_uri = get_active_custom_background()
         if data_uri:
             bg_css = f"url('{data_uri}') center/cover no-repeat"
     elif background_key:
@@ -4125,7 +4311,8 @@ def _render_mini_slide(text, ref=None, text2=None, theme_name=None, background_k
         {f'<div style="font-family:{t["font"]};color:{t["sub"]};letter-spacing:0.1em;text-transform:uppercase;font-size:clamp(0.5rem,1.6cqw,0.8rem);margin-bottom:4%;font-weight:600;">{ref}</div>' if ref else ''}
         <div style="font-family:{t['font']};color:{t['fg']};font-size:clamp(0.6rem,2.6cqw,1.1rem);line-height:1.25;font-weight:700;white-space:pre-line;text-shadow:{text_shadow};">{text}</div>
         </div>
-        <div style="height:50%;display:flex;align-items:center;justify-content:center;text-align:center;padding:6% 8%;overflow:hidden;" dir="{bottom_dir}">
+        <div style="height:50%;display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;padding:6% 8%;overflow:hidden;" dir="{bottom_dir}">
+        {f'<div style="font-family:{t["font"]};color:{t["sub"]};letter-spacing:0.1em;text-transform:uppercase;font-size:clamp(0.5rem,1.6cqw,0.8rem);margin-bottom:4%;font-weight:600;">{ref2}</div>' if ref2 else ''}
         <div style="font-family:{t['font']};color:{t['fg']};font-size:clamp(0.55rem,2.2cqw,0.95rem);line-height:1.25;font-weight:700;white-space:pre-line;text-shadow:{text_shadow};">{text2}</div>
         </div>"""
     else:
@@ -4195,7 +4382,8 @@ def _render_slide_grid(entries, adhoc, item_index, slide_index, cols_per_row=4, 
                         entry["text"], entry["ref"], entry.get("text2"),
                         theme_name=theme_name, background_key=background_key,
                         height_px=thumb_h_px, is_active=is_active,
-                        badge=f'{"● LIVE · " if is_active else ""}{n:02d} · {badge}'
+                        badge=f'{"● LIVE · " if is_active else ""}{n:02d} · {badge}',
+                        ref2=entry.get("ref2")
                     ))
                 # Both image AND text cards are now fixed-height (the
                 # mini-slide shrinks its own font to fit rather than
@@ -4281,12 +4469,103 @@ def page_presentation():
         _render_body()
 
 
+def _render_presentation_mode_launch_banner():
+    """
+    A one-click, full-width "go live" banner shown the first time the
+    operator lands on the Presentation page in a session — this is what
+    "clicking presentation mode" actually opens the projector display:
+    a real new browser window, positioned on the extended
+    display/monitor if one is detected, and fullscreened. Browsers only
+    honor requestFullscreen()/getScreenDetails() when triggered by a
+    live user click — a page-load auto-trigger with no click at all gets
+    silently blocked — so this renders as one obvious button the
+    operator presses once per session rather than something that fires
+    invisibly on navigation. Dismissible so it doesn't nag every single
+    time the fragment refreshes.
+    """
+    if st.session_state.get("_ecc_pres_mode_launched"):
+        return
+    with st.container():
+        render_html(
+            """<div style="background:linear-gradient(90deg,#1B1D24,#22242C);border:1px solid #C8A24A55;
+            border-radius:10px;padding:0.9rem 1.1rem;margin-bottom:0.8rem;">
+            <div style="color:#F4F3EF;font-weight:700;font-size:0.95rem;margin-bottom:0.2rem;">
+            🖥 Presentation Mode</div>
+            <div style="color:#9A9CA3;font-size:0.82rem;">
+            One click opens the projector display in a new, full-screen window on your extended
+            display (TV/projector) — this window stays right here on the operator screen.</div>
+            </div>"""
+        )
+        bcol1, bcol2 = st.columns([3, 1])
+        with bcol1:
+            components.html(
+                """
+                <div style="font-family:'Inter',sans-serif;">
+                  <button id="ecc-launch-btn" onclick="eccLaunchPresentationMode()"
+                          style="width:100%;background:#C8A24A;color:#0B0C0F;border:none;border-radius:6px;
+                                 padding:0.7rem 0.9rem;font-size:0.92rem;font-weight:800;cursor:pointer;">
+                    ⛶ Open on Extended Display (Full Screen)
+                  </button>
+                  <div id="ecc-launch-msg" style="color:#9A9CA3;font-size:0.75rem;margin-top:0.35rem;"></div>
+                </div>
+                <script>
+                  let displayUrl = null;
+                  try {
+                    displayUrl = window.parent.location.origin + window.parent.location.pathname + "?display=projector";
+                  } catch (e) {}
+                  async function eccLaunchPresentationMode() {
+                    const msg = document.getElementById("ecc-launch-msg");
+                    if (!displayUrl) { msg.innerText = "Couldn't detect the app URL — use the sidebar link instead."; return; }
+                    if (!window.parent.getScreenDetails) {
+                      // No Window Management API (non-Chromium browser) — still
+                      // open a real new window so the operator isn't stuck; they
+                      // drag it to the TV manually and press F for fullscreen.
+                      const w = window.parent.open(displayUrl, "ecc_projector");
+                      msg.innerText = w
+                        ? "Opened in a new window — drag it to your TV/projector and press F to fullscreen (auto-positioning needs Chrome or Edge)."
+                        : "Popup blocked — allow popups for this site and try again.";
+                      return;
+                    }
+                    try {
+                      const details = await window.parent.getScreenDetails();
+                      const current = details.currentScreen;
+                      const other = details.screens.find(s => s !== current) || current;
+                      const w = window.parent.open(
+                        displayUrl, "ecc_projector",
+                        `left=${other.availLeft},top=${other.availTop},width=${other.availWidth},height=${other.availHeight}`
+                      );
+                      if (!w) { msg.innerText = "Popup was blocked — allow popups for this site and try again."; return; }
+                      // Must run synchronously off this same click for the
+                      // browser to honor a cross-window fullscreen request.
+                      try { w.document.documentElement.requestFullscreen(); } catch (e) {}
+                      msg.innerText = other === current
+                        ? "Only one screen detected — opened here. Connect your TV/projector for auto-positioning."
+                        : "Opened full-screen on the extended display. You're still right here on this window.";
+                    } catch (e) {
+                      const w = window.parent.open(displayUrl, "ecc_projector");
+                      msg.innerText = w
+                        ? "Multi-screen permission isn't granted — opened in a normal window instead. Drag it to your TV and press F. (Enable auto-positioning: click the site-info/padlock icon → Site settings → allow \\"Window management\\".)"
+                        : "Permission needed for auto-positioning, and the popup was blocked too. Allow popups for this site.";
+                    }
+                  }
+                </script>
+                """,
+                height=80,
+            )
+        with bcol2:
+            if st.button("Dismiss", key="pres_mode_dismiss", use_container_width=True):
+                st.session_state["_ecc_pres_mode_launched"] = True
+                st.rerun()
+
+
 def _page_presentation_body():
     adhoc = bool(get_state().get("adhoc_active"))
     sid = st.session_state.get("active_service_id") or ensure_active_service()
     if not sid and not adhoc:
         st.info("No active service. Build one in Service Builder first — or present a Bible verse directly from the Bible tab.")
         return
+
+    _render_presentation_mode_launch_banner()
 
     # get_service_items_cached: this page polls every 0.4s (see
     # page_presentation's st.fragment(run_every=...) above) — avoid
@@ -4341,7 +4620,7 @@ def _page_presentation_body():
             with top_l:
                 st.markdown("**🎬 Slide Grid — Full Screen**")
                 if slides:
-                    live_ref, live_text, _ = slides[slide_index]
+                    live_ref, live_text, _, _ = slides[slide_index]
                     live_label = live_ref or (live_text[:60] + "…" if len(live_text) > 60 else live_text)
                 else:
                     live_label = "Nothing selected"
@@ -4371,7 +4650,7 @@ def _page_presentation_body():
         st.markdown("**Current — shown on projector**")
         theme = state["theme"] or "Modern Worship"
         t = THEMES[theme]
-        cur_ref, cur_text, cur_text2 = slides[slide_index] if slides else (None, "Nothing selected", None)
+        cur_ref, cur_text, cur_text2, cur_ref2 = slides[slide_index] if slides else (None, "Nothing selected", None, None)
         hidden = state["black"] or state["cleared"]
 
         # Match the real projector background — a preset gradient, a custom
@@ -4380,7 +4659,7 @@ def _page_presentation_body():
         # actually live on the projector.
         bg_key = state.get("background")
         if bg_key == CUSTOM_BACKGROUND_KEY:
-            custom_data = get_settings().get("custom_background_data")
+            custom_data = get_active_custom_background()
             card_bg = f"center/cover no-repeat url('{custom_data}')" if custom_data else t["bg"]
         else:
             bg_def = BACKGROUNDS.get(bg_key) if bg_key else None
@@ -4397,7 +4676,7 @@ def _page_presentation_body():
         # overflow:hidden is still the hard backstop against content
         # overflow; the font-scale-aware slide splitting in item_slides()
         # is what keeps content actually fitting inside it.
-        PREVIEW_BOX = "aspect-ratio:16/9;width:100%;max-height:360px;overflow:hidden;"
+        PREVIEW_BOX = "aspect-ratio:16/9;width:100%;max-height:520px;overflow:hidden;"
 
         if cur_text.startswith(IMG_SLIDE_PREFIX) and not hidden:
             img_src = cur_text[len(IMG_SLIDE_PREFIX):]
@@ -4418,7 +4697,9 @@ def _page_presentation_body():
                 {f'<div style="color:{t["sub"]};letter-spacing:.1em;text-transform:uppercase;margin-bottom:0.6rem;font-family:{t["font"]};font-size:0.8rem;{text_shadow}">{cur_ref}</div>' if cur_ref else ''}
                 <div style="color:{t['fg']};font-family:{t['font']};font-size:1.2rem;font-weight:700;white-space:pre-line;line-height:1.4;{text_shadow}">{cur_text}</div>
                 </div>
-                <div dir="{bottom_dir}" style="flex:1;padding:1.2rem;display:flex;align-items:center;justify-content:center;text-align:center;overflow:hidden;">
+                <div dir="{bottom_dir}" style="flex:1;padding:1.2rem;display:flex;flex-direction:column;overflow:hidden;
+                align-items:center;justify-content:center;text-align:center;">
+                {f'<div style="color:{t["sub"]};letter-spacing:.1em;text-transform:uppercase;margin-bottom:0.6rem;font-family:{t["font"]};font-size:0.8rem;{text_shadow}">{cur_ref2}</div>' if cur_ref2 else ''}
                 <div style="color:{t['fg']};font-family:{t['font']};font-size:1.1rem;font-weight:700;white-space:pre-line;line-height:1.4;{text_shadow}">{cur_text2}</div>
                 </div>
                 </div>"""
@@ -4438,14 +4719,14 @@ def _page_presentation_body():
             )
         st.caption("This mirrors the projector exactly, including the live background and font size — locked to a fixed size, never scrolls.")
         st.markdown("**Up Next**")
-        nxt_ref, nxt_text, nxt_text2 = (None, "—", None)
+        nxt_ref, nxt_text, nxt_text2, nxt_ref2 = (None, "—", None, None)
         nxt_item_title = None
         if slides and slide_index + 1 < len(slides):
-            nxt_ref, nxt_text, nxt_text2 = slides[slide_index + 1]
+            nxt_ref, nxt_text, nxt_text2, nxt_ref2 = slides[slide_index + 1]
         elif not adhoc and item_index + 1 < len(items):
             nslides = item_slides(items[item_index + 1], state.get("font_scale") or 1.0)
             if nslides:
-                nxt_ref, nxt_text, nxt_text2 = nslides[0]
+                nxt_ref, nxt_text, nxt_text2, nxt_ref2 = nslides[0]
             nxt_item_title = items[item_index + 1]['title']
         nxt_is_img = (nxt_text or "").startswith(IMG_SLIDE_PREFIX)
         if nxt_item_title:
@@ -4456,8 +4737,8 @@ def _page_presentation_body():
             # placeholder — this mirrors the fix already applied to the
             # Stage Display and phone Remote's own "Up Next" sections.
             st.markdown(
-                f'<div class="ecc-card" style="padding:0.6rem;">'
-                f'<img src="{nxt_text[len(IMG_SLIDE_PREFIX):]}" style="width:100%;max-height:160px;object-fit:contain;border-radius:8px;" onerror="this.replaceWith(Object.assign(document.createElement(&quot;div&quot;),{{textContent:&quot;(image failed to load)&quot;,style:&quot;color:#B0463F;font-size:0.85rem;&quot;}}))" /></div>',
+                f'<div class="ecc-card" style="padding:0.6rem;max-width:520px;margin:0 auto;">'
+                f'<img src="{nxt_text[len(IMG_SLIDE_PREFIX):]}" style="width:100%;max-height:220px;object-fit:contain;border-radius:8px;" onerror="this.replaceWith(Object.assign(document.createElement(&quot;div&quot;),{{textContent:&quot;(image failed to load)&quot;,style:&quot;color:#B0463F;font-size:0.85rem;&quot;}}))" /></div>',
                 unsafe_allow_html=True
             )
         else:
@@ -4465,11 +4746,18 @@ def _page_presentation_body():
             # background, font, and text color, same as the projector
             # itself, not a plain text box — so you're previewing what will
             # genuinely appear, not just reading a text summary of it.
-            render_html(_render_mini_slide(
-                nxt_text, nxt_ref, nxt_text2,
-                theme_name=state.get("theme"), background_key=state.get("background"),
-                height_px=160
-            ))
+            # Capped to max-width so it doesn't stretch edge-to-edge of the
+            # (fairly wide) center column — a 16:9-ish card reads as a real
+            # slide preview, a full-width strip just reads as empty space
+            # with tiny text in it.
+            render_html(
+                f'<div style="max-width:520px;margin:0 auto;">' +
+                _render_mini_slide(
+                    nxt_text, nxt_ref, nxt_text2,
+                    theme_name=state.get("theme"), background_key=state.get("background"),
+                    height_px=220, ref2=nxt_ref2
+                ) + '</div>'
+            )
 
     with right:
         st.markdown("**Controls**")
@@ -4957,7 +5245,9 @@ def page_display_settings():
     st.caption(
         "Upload your own landscape photo — it's automatically blurred and dimmed (the same "
         "\"blurred, dim\" look as the built-in options) so slide text stays readable on top of it. "
-        "I can't source real stock photos myself, but this lets you use your own."
+        "I can't source real stock photos myself, but this lets you use your own. Every photo you "
+        "save is kept here — uploading a new one doesn't delete the old ones, so you can always "
+        "switch back."
     )
     if not PIL_AVAILABLE:
         st.warning("This needs the `Pillow` package — add `Pillow` to requirements.txt to enable it.")
@@ -4980,9 +5270,14 @@ def page_display_settings():
         if photo is not None and st.button("💾 Process & Save as Background", use_container_width=True):
             data_uri = save_custom_background(photo, blur_radius=blur, dim_factor=dim)
             if data_uri:
+                # Adds a NEW history entry rather than overwriting the old
+                # one — this is the actual fix: the previous active photo
+                # stays in custom_backgrounds and can be switched back to
+                # later instead of being gone the moment this save happens.
+                add_custom_background(data_uri, label=photo.name)
                 set_settings(custom_background_data=data_uri, default_background=CUSTOM_BACKGROUND_KEY)
                 set_state(background=CUSTOM_BACKGROUND_KEY)
-                st.toast("Saved locally and set as the live background.", icon="✅")
+                st.toast("Saved and set as the live background. Your previous photo is still available below.", icon="✅")
                 if turso_configured():
                     try:
                         settings_now = get_settings()
@@ -4995,21 +5290,33 @@ def page_display_settings():
             else:
                 st.error("Couldn't process that image.")
 
-        if not settings.get("custom_background_data"):
+        saved_backgrounds = get_custom_backgrounds()
+        if not saved_backgrounds:
             st.write("")
             _render_bg_preview(theme, current_bg, settings)
-
-        if settings.get("custom_background_data"):
+        else:
             st.write("")
-            st.markdown("**Saved background**")
-            st.image(settings["custom_background_data"], caption="Current custom background (processed)", width=300)
-            is_active_custom = current_bg == CUSTOM_BACKGROUND_KEY
-            if is_active_custom:
-                st.success("✅ Currently active")
-            if st.button("Use this custom photo now", key="use_custom_bg", disabled=is_active_custom):
-                set_settings(default_background=CUSTOM_BACKGROUND_KEY)
-                set_state(background=CUSTOM_BACKGROUND_KEY)
-                st.rerun()
+            st.markdown(f"**Saved backgrounds** ({len(saved_backgrounds)})")
+            st.caption("Pick any previous upload to make it active again, or delete the ones you no longer want.")
+            gal_cols = st.columns(3)
+            for i, bg in enumerate(saved_backgrounds):
+                with gal_cols[i % 3]:
+                    st.image(bg["data"], caption=bg["label"] or "Background", use_container_width=True)
+                    is_active_custom = bool(bg["is_active"]) and current_bg == CUSTOM_BACKGROUND_KEY
+                    if is_active_custom:
+                        st.success("✅ Currently active")
+                    else:
+                        if st.button("Use this photo", key=f"use_bg_{bg['id']}", use_container_width=True):
+                            set_active_custom_background(bg["id"])
+                            set_settings(custom_background_data=bg["data"], default_background=CUSTOM_BACKGROUND_KEY)
+                            set_state(background=CUSTOM_BACKGROUND_KEY)
+                            st.toast("Switched back to this photo.", icon="✅")
+                            st.rerun()
+                    if st.button("🗑 Delete", key=f"del_bg_{bg['id']}", use_container_width=True):
+                        delete_custom_background(bg["id"])
+                        st.toast("Deleted.", icon="🗑")
+                        st.rerun()
+                    st.write("")
 
             st.write("")
             _render_bg_preview(theme, current_bg, settings)
@@ -5285,16 +5592,59 @@ def render_login():
 MEETING_OPTIONS = ["Sunday", "Saturday", "Sanctuary Arabic", "Sanctuary English"]
 
 
+def _find_translation_by_hint(translations, hints):
+    """Finds the first available Bible translation whose name loosely
+    matches one of the given hints (case-insensitive substring match,
+    spaces/punctuation ignored) — e.g. hints=["van dyke", "vandyke"]
+    matches a translation the operator imported and named "Van Dyke
+    Arabic", "VanDyke", "Van-Dyke NT", etc. Returns None if nothing
+    matches, so the caller can leave the selection alone rather than
+    force an unrelated translation."""
+    def norm(s):
+        return re.sub(r"[^a-z0-9]", "", (s or "").lower())
+    normalized_hints = [norm(h) for h in hints]
+    for t in translations:
+        nt = norm(t)
+        if any(h in nt for h in normalized_hints):
+            return t
+    return None
+
+
+def _apply_meeting_bible_default(meeting):
+    """Sets the default Bible translation for the session based on which
+    meeting was just picked: Sanctuary Arabic -> the Van Dyke Arabic Bible
+    (if one has been imported), any other meeting -> the KJV English
+    Bible (if one has been imported). Matching is by translation name
+    (loose, case-insensitive), since translation names are whatever the
+    operator typed in when importing them, not a fixed set of choices.
+    Only sets bible_translation in session_state — st.selectbox with
+    key="bible_translation" then picks it up as its initial value the
+    next time the Bible page renders. Silently does nothing if no
+    matching translation has been imported yet."""
+    translations = get_bible_translations()
+    if not translations:
+        return
+    if meeting == "Sanctuary Arabic":
+        match = _find_translation_by_hint(translations, ["van dyke", "vandyke", "van dyck", "vandyck", "svd"])
+    else:
+        match = _find_translation_by_hint(translations, ["kjv", "king james"])
+    if match:
+        st.session_state["bible_translation"] = match
+
+
 def render_meeting_select():
     """Shown once, right after a successful sign-in and before the
     dashboard: asks which of the four regular meetings this session is for.
     The choice is saved to settings.meeting_type (so it persists as the
     church's current default across sign-ins/devices, same as the other
     settings columns) AND to session state (so the rest of THIS session can
-    read it immediately without a DB round-trip). Meeting-specific behavior
-    beyond just remembering the choice — different themes, defaults, etc.
-    per meeting — isn't wired up yet; that comes later once it's decided
-    what each meeting should actually change."""
+    read it immediately without a DB round-trip). Picking "Sanctuary
+    Arabic" also defaults the Bible tab's translation to the Van Dyke
+    Arabic Bible for this session (if imported); any other meeting
+    defaults it to the KJV English Bible (if imported) — see
+    _apply_meeting_bible_default(). Other meeting-specific behavior isn't
+    wired up yet; that comes later once it's decided what else each
+    meeting should change."""
     render_html(f"""
     <style>
     html, body {{ overflow: hidden !important; height: 100vh; width: 100vw; margin:0; padding:0; }}
@@ -5344,6 +5694,7 @@ def render_meeting_select():
         if st.button(meeting, use_container_width=True, key=f"meeting_pick_{meeting}"):
             set_settings(meeting_type=meeting)
             st.session_state["meeting_type"] = meeting
+            _apply_meeting_bible_default(meeting)
             st.session_state["_ecc_meeting_select_pending"] = False
             st.session_state["_ecc_meeting_transition_pending"] = True
             st.session_state["_ecc_meeting_transition_name"] = meeting

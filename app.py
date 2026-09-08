@@ -52,7 +52,7 @@ except ImportError:
     PYMUPDF_AVAILABLE = False
 
 # ---------------------------------------------------------------------------
-# CONFIG / CONSTANTS
+
 # ---------------------------------------------------------------------------
 
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ecc_worship.db")

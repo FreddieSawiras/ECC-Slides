@@ -1114,6 +1114,10 @@ def reformat_all_songs_to_line_limit(max_lines=LYRICS_MAX_LINES_PER_SLIDE, on_pr
             if j > 0:
                 combined_lines.append("")  # stanza break between old slides
             combined_lines.extend(slide_text.split("\n"))
+        # Apply the same source/footer cleanup used during import so
+        # Format All Slides also removes sources that were already saved
+        # inside existing songs (for example, "Source: LyricFind").
+        combined_lines = strip_musixmatch_footer(combined_lines)
         new_slides = pack_lyrics_into_slides(combined_lines, max_lines=max_lines) or ["(empty)"]
         # Replace the entire existing slide list with the newly formatted
         # list. Nothing from the old slide set is appended or retained.

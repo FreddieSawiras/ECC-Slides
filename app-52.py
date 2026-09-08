@@ -1338,55 +1338,121 @@ def add_song_with_slides(title, artist, category, tags, slides):
 
 
 def parse_pasted_lyrics(raw, max_slide_chars=None):
-    """Parses the standard lyrics-site paste format:
+    """Parse lyrics pasted from common lyrics sites, including full page copies.
+
+    Supported examples include both the older compact format::
 
         Song Title
-        Song by Artist Name ‧ Year
-
+        Song by Artist Name ‧ 2023
         Overview
         Lyrics
-        <actual lyrics...>
+        <lyrics>
 
-    Strips the title/artist/year header and the "Overview"/"Lyrics" section
-    labels, then packs the remaining lines onto slides of at most
-    LYRICS_MAX_LINES_PER_SLIDE lines each (see pack_lyrics_into_slides) — a
-    stanza (blank-line) break always starts a fresh slide too, and an
-    over-long single line is word-wrapped rather than left to overflow.
-    Returns (title, artist, year, slides). max_slide_chars is accepted for
-    backward compatibility but no longer used — line count, not character
-    count, is what now decides where lyric slides break."""
+    and full-page copies such as::
+
+        Song Title
+        Artist Name
+        Producers
+        ...metadata...
+        Song Title Lyrics
+        <lyrics>
+
+    Full-page metadata is ignored. Recommendation blocks beginning with
+    ``You might also like`` are also ignored until the next lyric section
+    marker (for example ``[Verse 3]``). Returns (title, artist, year, slides).
+    """
     lines = raw.splitlines()
 
+    # Normalize whitespace enough for matching while preserving lyric text.
     while lines and not lines[0].strip():
         lines.pop(0)
 
-    title = _clean_song_title(lines.pop(0)) if lines else "Untitled"
-
+    title = _clean_song_title(lines[0].strip()) if lines else "Untitled"
     artist, year = "", ""
+
+    if lines:
+        lines.pop(0)
+
+    # Compact format: "Song by Artist ‧ 2023".
     if lines and re.match(r"^song by\s+", lines[0].strip(), re.IGNORECASE):
         m = re.match(r"^song by\s+(.*?)(?:\s*[‧·]\s*(\d{4}))?\s*$", lines[0].strip(), re.IGNORECASE)
         if m:
             artist = m.group(1).strip()
             year = m.group(2) or ""
         lines.pop(0)
+    else:
+        # Full-page format: the first non-empty line after the title is the
+        # artist. Everything between that and the explicit "... Lyrics"
+        # heading is metadata and is discarded.
+        while lines and not lines[0].strip():
+            lines.pop(0)
+        if lines and lines[0].strip():
+            candidate_artist = lines.pop(0).strip()
+            if candidate_artist.lower() not in {
+                "overview", "lyrics", "producers", "producer", "writers", "writer",
+            }:
+                artist = candidate_artist
 
-    # Skip blank lines and the "Overview"/"Lyrics" section labels that sit
-    # before the actual lyrics on most lyrics sites.
-    while lines and (not lines[0].strip() or lines[0].strip().lower() in ("overview", "lyrics")):
-        lines.pop(0)
+    # Locate the actual lyrics heading. Full-page pastes may contain many
+    # metadata lines (album, release date, viewers, contributors, etc.) before it.
+    lyrics_heading_idx = None
+    lyrics_heading_re = re.compile(r"^.+\s+lyrics\s*$", re.IGNORECASE)
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped.lower() == "lyrics" or lyrics_heading_re.match(stripped):
+            lyrics_heading_idx = i
+            break
 
-    body_lines = [l.rstrip() for l in lines]
+    if lyrics_heading_idx is not None:
+        heading = lines[lyrics_heading_idx].strip()
+        # Recover a year if the page header contained one, without using
+        # arbitrary metadata such as album/track information as the artist.
+        date_match = re.search(r"(?:\b|\D)(20\d{2}|19\d{2})(?:\b|\D)", " ".join(lines[:lyrics_heading_idx]))
+        if not year and date_match:
+            year = date_match.group(1)
+
+        # Some sites repeat the song title in the heading. It should not alter
+        # the already-cleaned title, so simply start lyrics after the heading.
+        body_lines = [l.rstrip() for l in lines[lyrics_heading_idx + 1:]]
+    else:
+        # Fallback for compact pastes with just "Overview" / "Lyrics" labels.
+        while lines and (not lines[0].strip() or lines[0].strip().lower() == "overview"):
+            lines.pop(0)
+        if lines and lines[0].strip().lower() == "lyrics":
+            lines.pop(0)
+        body_lines = [l.rstrip() for l in lines]
+
+    # Remove common full-page recommendation inserts. Keep the song itself by
+    # resuming only when the next lyrics section label (e.g. [Verse 3]) appears.
+    cleaned_body = []
+    skipping_recommendations = False
+    for line in body_lines:
+        stripped = line.strip()
+        lower = stripped.lower()
+
+        if lower == "you might also like":
+            skipping_recommendations = True
+            continue
+
+        if skipping_recommendations:
+            if re.match(r"^\[[^\]]+\]$", stripped):
+                skipping_recommendations = False
+            else:
+                continue
+
+        cleaned_body.append(line)
+
+    body_lines = cleaned_body
+
     while body_lines and not body_lines[-1].strip():
         body_lines.pop()
 
     body_lines = strip_musixmatch_footer(body_lines)
-
     slides = pack_lyrics_into_slides(body_lines)
 
     if not slides:
         slides = ["(empty)"]
     return title, artist, year, slides
-
 
 MUSIXMATCH_FOOTER_PATTERNS = [
     # Lyrics sites commonly append a final attribution such as

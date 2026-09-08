@@ -1115,6 +1115,8 @@ def reformat_all_songs_to_line_limit(max_lines=LYRICS_MAX_LINES_PER_SLIDE, on_pr
                 combined_lines.append("")  # stanza break between old slides
             combined_lines.extend(slide_text.split("\n"))
         new_slides = pack_lyrics_into_slides(combined_lines, max_lines=max_lines) or ["(empty)"]
+        # Replace the entire existing slide list with the newly formatted
+        # list. Nothing from the old slide set is appended or retained.
         if new_slides != old_slides:
             conn.execute("UPDATE songs SET slides=?, updated_at=? WHERE id=?",
                          (json.dumps(new_slides), now(), r["id"]))
@@ -1383,7 +1385,10 @@ def parse_pasted_lyrics(raw, max_slide_chars=None):
 
 
 MUSIXMATCH_FOOTER_PATTERNS = [
-    re.compile(r"^\s*source\s*:\s*musixmatch\s*$", re.IGNORECASE),
+    # Lyrics sites commonly append a final attribution such as
+    # "Source: LyricFind", "Source: Musixmatch", "Source: Genius", etc.
+    # Treat ANY trailing Source: line as a footer, regardless of provider.
+    re.compile(r"^\s*source\s*:\s*.+$", re.IGNORECASE),
     re.compile(r"^\s*songwriters?\s*:", re.IGNORECASE),
     re.compile(r"^\s*writers?\s*:", re.IGNORECASE),
     re.compile(r"lyrics\s*©", re.IGNORECASE),
@@ -3959,7 +3964,8 @@ def page_dashboard():
 
 def page_songs():
     st.markdown("### Songs")
-    st.caption("Find, organize, and prepare worship songs for your service.")
+    total_song_count = get_song_count()
+    st.caption(f"Find, organize, and prepare worship songs for your service. · **{total_song_count} song{'s' if total_song_count != 1 else ''} in library**")
 
     search = st.text_input("Search songs...", key="song_search", label_visibility="collapsed", placeholder="Search by title, artist, lyrics, or tag")
     tabs = ["All Songs", "Worship", "Praise", "Hymns", "Contemporary", "Recently Used", "Favorites"]
@@ -3982,7 +3988,7 @@ def page_songs():
         fmt_col, dupe_col = st.columns(2)
         with fmt_col:
             if st.button("✨ Format All Slides", use_container_width=True, key="format_all_slides",
-                         help=f"Re-splits every song's slides to at most {LYRICS_MAX_LINES_PER_SLIDE} lines each, with a bigger font."):
+                         help=f"Rebuilds every song's slide list from its current content, replacing all existing slides with newly formatted slides of at most {LYRICS_MAX_LINES_PER_SLIDE} lines each."):
                 overlay = st.empty()
                 _render_format_progress_overlay(overlay, 0, max(get_song_count(), 1))
                 changed, total = reformat_all_songs_to_line_limit(
@@ -5364,7 +5370,8 @@ def page_import_slides():
 
 
 def page_song_library():
-    st.markdown("### Song Library")
+    total_song_count = get_song_count()
+    st.markdown(f"### Song Library · {total_song_count} song{'s' if total_song_count != 1 else ''}")
     st.caption("Your full catalog — the same songs available from the Songs tab.")
     page_songs()
 

@@ -2310,7 +2310,7 @@ def _render_splash_screen():
         }})();
         </script>
         """,
-        height=0,
+        height=1,
     )
 
 
@@ -2858,7 +2858,7 @@ def proj_autofit_js():
         })();
         </script>
         """,
-        height=0,
+        height=1,
     )
 
 
@@ -2966,7 +2966,7 @@ def _render_fullscreen_fallback_js():
         })();
         </script>
         """,
-        height=0,
+        height=1,
     )
 
 
@@ -3289,7 +3289,7 @@ def render_stage_display():
             })();
             </script>
             """,
-            height=0,
+            height=1,
         )
 
     if hasattr(st, "fragment"):
@@ -3392,7 +3392,7 @@ def _remote_scroll_preserve_js():
         })();
         </script>
         """,
-        height=0,
+        height=1,
     )
 
 
@@ -4809,7 +4809,7 @@ def _render_operator_keyboard_shortcuts():
         })();
         </script>
         """,
-        height=0,
+        height=1,
     )
 
 
@@ -6168,7 +6168,7 @@ def _render_meeting_transition(meeting_name):
         }})();
         </script>
         """,
-        height=0,
+        height=1,
     )
 
 

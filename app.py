@@ -25,7 +25,6 @@ same local SQLite file so nothing is lost between sessions.
 """
 
 import streamlit as st
-import streamlit.components.v1 as components
 import sqlite3
 import json
 import os
@@ -37,6 +36,8 @@ import re
 import base64
 import requests
 import shutil
+import unicodedata
+import threading
 
 try:
     from PIL import Image, ImageFilter, ImageEnhance
@@ -636,30 +637,35 @@ LOCALIZED_BOOK_NAMES = {
 _wal_initialized = False  # process-wide: PRAGMA journal_mode=WAL sets a durable,
                            # file-level property (survives across connections and
                            # process restarts) — it does not need to be re-applied
-                           # on every single get_conn() call. Re-running it every
-                           # 0.4s from the phone remote's poll loop (and every other
-                           # fragment's poll loop) was pure wasted round-trip time on
-                           # every single tick; setting it once per process is enough.
+                           # on every single get_conn() call.
+_wal_init_lock = threading.Lock()
+_db_write_lock = threading.Lock()
 
 
 def get_conn():
     global _wal_initialized
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    # A busy timeout is important because the projector, stage display,
+    # presentation tab, and phone remote can all touch the same SQLite file
+    # at nearly the same time. WAL allows readers alongside a writer, but
+    # SQLite still permits only one writer at a time. Waiting here is much
+    # better than immediately raising "database is locked".
+    conn = sqlite3.connect(DB_PATH, timeout=30.0, check_same_thread=False)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout=30000")
     if not _wal_initialized:
-        # WAL (Write-Ahead Logging) mode: readers no longer block on a writer
-        # and vice versa. This matters concretely here — with the phone remote,
-        # stage display, and Presentation tab all polling get_state() every
-        # 0.35-0.5s (see their st.fragment(run_every=...) wrappers) while
-        # occasional writes (slide changes) happen from any of them, the
-        # default SQLite journal mode makes writers and readers wait on each
-        # other; WAL lets them proceed concurrently, which is the difference
-        # between "the read that would show your slide change stalls behind
-        # another device's read" and "it doesn't". Only needs to run once —
-        # see _wal_initialized above.
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA synchronous=NORMAL")  # safe pairing with WAL; still durable, less fsync overhead than FULL
-        _wal_initialized = True
+        # Only one thread/process session should attempt the WAL initialization
+        # at a time. Other connections simply use the durable journal setting
+        # once the first initialization finishes.
+        with _wal_init_lock:
+            if not _wal_initialized:
+                try:
+                    conn.execute("PRAGMA journal_mode=WAL")
+                    conn.execute("PRAGMA synchronous=NORMAL")
+                except sqlite3.OperationalError:
+                    # A concurrent connection may already have established WAL.
+                    # The connection remains usable because busy_timeout is set.
+                    pass
+                _wal_initialized = True
     return conn
 
 
@@ -706,7 +712,7 @@ def init_db():
         id INTEGER PRIMARY KEY CHECK (id=1),
         service_id INTEGER, item_index INTEGER, slide_index INTEGER,
         black INTEGER, cleared INTEGER, live INTEGER, theme TEXT, background TEXT, font_scale REAL, updated_at TEXT,
-        adhoc_active INTEGER, adhoc_slides TEXT, adhoc_index INTEGER
+        adhoc_active INTEGER, adhoc_slides TEXT, adhoc_index INTEGER, meeting_timer_start TEXT
     )""")
     c.execute("""CREATE TABLE IF NOT EXISTS bible_verses(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -742,6 +748,11 @@ def init_db():
         pass  # column already exists (older database)
     try:
         c.execute("ALTER TABLE settings ADD COLUMN meeting_type TEXT")
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass  # column already exists (older database)
+    try:
+        c.execute("ALTER TABLE presentation_state ADD COLUMN meeting_timer_start TEXT")
         conn.commit()
     except sqlite3.OperationalError:
         pass  # column already exists (older database)
@@ -990,6 +1001,169 @@ def _rows_needing_sync(table, columns):
 
 # ---------------- Songs ----------------
 
+# Lyrics slides are packed by LINE COUNT, not character budget — a
+# maximum of 4 lines per slide, full stop, so the font can always be
+# rendered large and legible instead of shrinking to fit a paragraph.
+# (Bible verses, custom slides, and announcements are untouched by this —
+# see item_slides()'s own font_scale reflow, which is a separate
+# mechanism for those.)
+LYRICS_MAX_LINES_PER_SLIDE = 4
+
+# A single line long enough to wrap on a real TV/projector at the larger
+# lyrics font size gets word-wrapped into two (never mid-word), and both
+# wrapped pieces count toward the 4-line cap — so one very long lyric line
+# doesn't quietly make its slide overflow at the bigger font size.
+LYRICS_WRAP_CHARS = 42
+
+
+def _wrap_lyric_line(line, wrap_chars=LYRICS_WRAP_CHARS):
+    """Splits ONE lyric line into exactly 2 pieces if it's longer than
+    wrap_chars, breaking at the word boundary closest to the middle (by
+    character count) so both halves come out roughly balanced — rather
+    than packing the first half to wrap_chars and leaving the second half
+    to carry whatever's left over (which could still be very long). Never
+    splits a word. A line already short enough comes back as a single-item
+    list unchanged."""
+    if len(line) <= wrap_chars:
+        return [line]
+    words = line.split()
+    if len(words) < 2:
+        return [line]  # one unsplittable word — leave it whole
+    lengths = [len(w) for w in words]
+    total = sum(lengths) + len(words) - 1  # + spaces between words
+    best_i, best_diff, acc = 1, float("inf"), 0
+    for i in range(1, len(words)):
+        acc += lengths[i - 1] + (1 if i > 1 else 0)
+        remaining = total - acc - 1
+        diff = abs(acc - remaining)
+        if diff < best_diff:
+            best_diff, best_i = diff, i
+    return [" ".join(words[:best_i]), " ".join(words[best_i:])]
+
+
+def pack_lyrics_into_slides(body_lines, max_lines=LYRICS_MAX_LINES_PER_SLIDE):
+    """
+    Packs already-cleaned lyric lines into slides of AT MOST max_lines
+    lines each. A blank line (stanza break) always starts a fresh slide,
+    same as before. A single source line longer than LYRICS_WRAP_CHARS is
+    word-wrapped into 2 lines first (see _wrap_lyric_line) — both wrapped
+    pieces count toward the same slide's 4-line budget, so a wrapped line
+    doesn't silently make a slide 5 "visual" lines tall.
+    """
+    stanzas, current = [], []
+    for l in body_lines:
+        if not l.strip():
+            if current:
+                stanzas.append(current)
+                current = []
+        else:
+            current.append(l)
+    if current:
+        stanzas.append(current)
+
+    slides = []
+    for stanza in stanzas:
+        wrapped_lines = []
+        for line in stanza:
+            wrapped_lines.extend(_wrap_lyric_line(line))
+        for i in range(0, len(wrapped_lines), max_lines):
+            slides.append("\n".join(wrapped_lines[i:i + max_lines]))
+    return slides
+
+
+# Kept as an alias so anything still passing max_slide_chars=... doesn't
+# hard-crash — the character budget itself is no longer used for lyrics,
+# but callers that don't pass it explicitly work unchanged.
+MAX_SLIDE_CHARS = 220
+
+
+def reformat_all_songs_to_line_limit(max_lines=LYRICS_MAX_LINES_PER_SLIDE, on_progress=None):
+    """
+    Re-flows EVERY saved song's existing slides into the current
+    lyrics-slide rules (at most max_lines lines per slide, long lines
+    word-wrapped in two — see pack_lyrics_into_slides) — this is what the
+    "Format All Slides" button runs, for songs that were imported back
+    when slides were packed by a character budget instead of a line count.
+
+    Each song's existing slide boundaries are treated as stanza breaks
+    (each slide's text is already one coherent chunk from however it was
+    originally split), so a song that already reads well keeps its natural
+    breaks where possible while still being re-packed to the new line cap.
+
+    on_progress, if given, is called after each song as
+    on_progress(done, total, song_title) — this is what drives the live
+    "X / Y songs formatted" overlay rather than the UI just freezing until
+    every song is done.
+
+    Returns (changed_count, total_count) — a song whose slides already
+    satisfy the current rule is left untouched and not counted as changed,
+    so "X songs formatted" only reports real changes.
+    """
+    conn = get_conn()
+    rows = conn.execute("SELECT id, title, slides FROM songs ORDER BY title").fetchall()
+    total = len(rows)
+    changed = 0
+    for i, r in enumerate(rows):
+        old_slides = json.loads(r["slides"])
+        # Each existing slide's lines become one "stanza" for repacking —
+        # a blank line is inserted between old slides so pack_lyrics_into_slides
+        # treats them as separate breaks rather than silently merging two
+        # unrelated slides' content together.
+        combined_lines = []
+        for j, slide_text in enumerate(old_slides):
+            if j > 0:
+                combined_lines.append("")  # stanza break between old slides
+            combined_lines.extend(slide_text.split("\n"))
+        new_slides = pack_lyrics_into_slides(combined_lines, max_lines=max_lines) or ["(empty)"]
+        if new_slides != old_slides:
+            conn.execute("UPDATE songs SET slides=?, updated_at=? WHERE id=?",
+                         (json.dumps(new_slides), now(), r["id"]))
+            changed += 1
+        if on_progress:
+            on_progress(i + 1, total, r["title"])
+    conn.commit()
+    conn.close()
+    return changed, total
+
+
+def _render_format_progress_overlay(placeholder, done, total, label=None):
+    """
+    A centered, golden, full-viewport overlay showing "X / Y songs
+    formatted" with a progress bar — shown while Format All Slides runs.
+    Rendered into the given st.empty() placeholder so each call replaces
+    the last (a real animating progress indicator, not a static toast),
+    and cleared by the caller (placeholder.empty()) once the work is done.
+    """
+    pct = int((done / total) * 100) if total else 100
+    text = label or f"{done} / {total} songs formatted"
+    placeholder.markdown(
+        f"""
+        <div style="position:fixed; inset:0; z-index:9999; background:rgba(11,12,15,0.82);
+                    display:flex; align-items:center; justify-content:center; backdrop-filter: blur(3px);">
+          <div style="background:linear-gradient(180deg,#1A1C22,#101116); border:1px solid #C8A24A;
+                      border-radius:16px; padding:2.2rem 2.8rem; text-align:center; min-width:320px;
+                      box-shadow: 0 0 60px rgba(200,162,74,0.25);">
+            <div style="font-size:2rem; margin-bottom:0.6rem;">✨</div>
+            <div style="color:#C8A24A; font-family:'Inter',sans-serif; font-weight:800; font-size:1.15rem;
+                        letter-spacing:0.03em; margin-bottom:1rem;">{text}</div>
+            <div style="width:260px; height:10px; border-radius:6px; background:#24262C; overflow:hidden; margin:0 auto;">
+              <div style="width:{pct}%; height:100%; background:linear-gradient(90deg,#C8A24A,#E8C97A);
+                          border-radius:6px; transition:width 0.25s ease;"></div>
+            </div>
+          </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def get_song_count():
+    conn = get_conn()
+    n = conn.execute("SELECT COUNT(*) AS n FROM songs").fetchone()["n"]
+    conn.close()
+    return n
+
+
 def get_songs(search="", category="All Songs"):
     conn = get_conn()
     rows = conn.execute("SELECT * FROM songs ORDER BY title").fetchall()
@@ -1019,16 +1193,21 @@ def delete_song(song_id):
 
 def find_duplicate_song_ids():
     """
-    Groups songs by (title, artist) case-insensitively and returns the ids
-    of every duplicate EXCEPT the one kept per group — the newest-added
-    (highest id), since that's usually the most complete re-import.
+    Groups songs by (title, artist) case-insensitively — titles cleaned of
+    invisible paste artifacts via _clean_song_title, same as every other
+    title comparison in the app, so two rows that only differ by a
+    zero-width character (the exact bug that used to let "duplicate"
+    imports silently pile up instead of overwriting) are correctly seen as
+    the same song here too — and returns the ids of every duplicate EXCEPT
+    the one kept per group — the newest-added (highest id), since that's
+    usually the most complete re-import.
     """
     conn = get_conn()
     rows = conn.execute("SELECT id, title, artist FROM songs ORDER BY id").fetchall()
     conn.close()
     groups = {}
     for r in rows:
-        key = (r["title"].strip().lower(), (r["artist"] or "").strip().lower())
+        key = (_clean_song_title(r["title"]).lower(), (r["artist"] or "").strip().lower())
         groups.setdefault(key, []).append(r["id"])
     to_delete = []
     for ids in groups.values():
@@ -1066,20 +1245,54 @@ def add_song(title, artist, category, tags, lyrics):
     return song_id, slides
 
 
+def _clean_song_title(title):
+    """
+    Strips whitespace AND the invisible characters that regularly sneak in
+    when lyrics are copy-pasted from a web page — zero-width spaces
+    (U+200B), zero-width no-break space / BOM (U+FEFF), zero-width
+    non-joiner/joiner (U+200C/200D), and any other Unicode "format"
+    character. Python's own str.strip() removes normal whitespace AND
+    non-breaking space (U+00A0), but NOT these — so two pastes of the
+    "same" song title could differ only by an invisible character neither
+    the operator nor a plain strip() would ever notice.
+
+    This is why re-saving a song "silently" created a second copy instead
+    of overwriting the first: title matching in upsert/get_song_by_title
+    is exact (case-insensitive), so an invisible character difference made
+    two pastes of the exact-looking same title compare as NOT equal. Every
+    title is now run through this before it's stored or looked up, so the
+    comparison is actually comparing what's visually on screen.
+    """
+    if not title:
+        return title
+    # Strip Unicode category Cf (format characters, e.g. zero-width space/
+    # joiner, BOM) anywhere in the string, then normal whitespace at the
+    # ends — the invisible characters most often show up at the very start
+    # or end of a pasted title, but stripping them everywhere is harmless
+    # and more thorough.
+    cleaned = "".join(ch for ch in title if unicodedata.category(ch) != "Cf")
+    return cleaned.strip()
+
+
 def get_song_by_title(title):
     """Case-insensitive exact-title lookup — used so adding a song that
-    already exists overwrites it instead of erroring or duplicating it."""
+    already exists overwrites it instead of erroring or duplicating it.
+    Title is cleaned first (see _clean_song_title) so an invisible
+    character difference between two pastes of "the same" title doesn't
+    cause a false non-match."""
     conn = get_conn()
-    r = conn.execute("SELECT * FROM songs WHERE LOWER(title)=LOWER(?)", (title.strip(),)).fetchone()
+    r = conn.execute("SELECT * FROM songs WHERE LOWER(title)=LOWER(?)", (_clean_song_title(title),)).fetchone()
     conn.close()
     return r
 
 
 def upsert_song(title, artist, category, tags, slides):
     """Save a song by its already-split slides. If a song with the same
-    title (case-insensitive) already exists, its slides/artist/category/tags
+    title (case-insensitive, and cleaned of invisible paste artifacts —
+    see _clean_song_title) already exists, its slides/artist/category/tags
     are overwritten in place instead of erroring or creating a duplicate row.
     Returns (song_id, slides, was_overwrite)."""
+    title = _clean_song_title(title)
     slides = slides or ["(empty)"]
     existing = get_song_by_title(title)
     conn = get_conn()
@@ -1118,16 +1331,7 @@ def add_song_with_slides(title, artist, category, tags, slides):
     return song_id, slides
 
 
-# Max characters packed onto one slide — sized to stay comfortably readable
-# on a regular TV/projector at normal font size. Lines are packed onto a
-# slide until the NEXT line would push the slide over this budget; that line
-# starts a new slide instead. A line is never split mid-way — if a single
-# line alone is longer than the budget, it still gets its own whole slide
-# rather than being cut.
-MAX_SLIDE_CHARS = 220
-
-
-def parse_pasted_lyrics(raw, max_slide_chars=MAX_SLIDE_CHARS):
+def parse_pasted_lyrics(raw, max_slide_chars=None):
     """Parses the standard lyrics-site paste format:
 
         Song Title
@@ -1138,19 +1342,19 @@ def parse_pasted_lyrics(raw, max_slide_chars=MAX_SLIDE_CHARS):
         <actual lyrics...>
 
     Strips the title/artist/year header and the "Overview"/"Lyrics" section
-    labels, then packs the remaining lines onto slides using a character
-    budget sized for a TV/projector (see MAX_SLIDE_CHARS) instead of a fixed
-    line count — a new slide starts whenever the next line would overflow
-    the budget, and a stanza (blank-line) break always starts a fresh slide
-    too. Lines are never split mid-line: if one line alone exceeds the
-    budget, it still becomes its own slide in full. Returns
-    (title, artist, year, slides)."""
+    labels, then packs the remaining lines onto slides of at most
+    LYRICS_MAX_LINES_PER_SLIDE lines each (see pack_lyrics_into_slides) — a
+    stanza (blank-line) break always starts a fresh slide too, and an
+    over-long single line is word-wrapped rather than left to overflow.
+    Returns (title, artist, year, slides). max_slide_chars is accepted for
+    backward compatibility but no longer used — line count, not character
+    count, is what now decides where lyric slides break."""
     lines = raw.splitlines()
 
     while lines and not lines[0].strip():
         lines.pop(0)
 
-    title = lines.pop(0).strip() if lines else "Untitled"
+    title = _clean_song_title(lines.pop(0)) if lines else "Untitled"
 
     artist, year = "", ""
     if lines and re.match(r"^song by\s+", lines[0].strip(), re.IGNORECASE):
@@ -1171,30 +1375,7 @@ def parse_pasted_lyrics(raw, max_slide_chars=MAX_SLIDE_CHARS):
 
     body_lines = strip_musixmatch_footer(body_lines)
 
-    stanzas, current = [], []
-    for l in body_lines:
-        if not l.strip():
-            if current:
-                stanzas.append(current)
-                current = []
-        else:
-            current.append(l)
-    if current:
-        stanzas.append(current)
-
-    slides = []
-    for stanza in stanzas:
-        current_lines, current_len = [], 0
-        for line in stanza:
-            line_len = len(line) + (1 if current_lines else 0)  # +1 for the joining newline
-            if current_lines and current_len + line_len > max_slide_chars:
-                slides.append("\n".join(current_lines))
-                current_lines, current_len = [line], len(line)
-            else:
-                current_lines.append(line)
-                current_len += line_len
-        if current_lines:
-            slides.append("\n".join(current_lines))
+    slides = pack_lyrics_into_slides(body_lines)
 
     if not slides:
         slides = ["(empty)"]
@@ -1396,11 +1577,17 @@ def get_state():
 
 def set_state(**kwargs):
     kwargs["updated_at"] = now()
-    conn = get_conn()
-    cols = ", ".join(f"{k}=?" for k in kwargs)
-    conn.execute(f"UPDATE presentation_state SET {cols} WHERE id=1", tuple(kwargs.values()))
-    conn.commit()
-    conn.close()
+    # Presentation state is the hottest write path in the whole app: operator,
+    # projector, stage display, and phone remote can all be active together.
+    # Serialize these short writes so they don't pile up behind each other.
+    with _db_write_lock:
+        conn = get_conn()
+        try:
+            cols = ", ".join(f"{k}=?" for k in kwargs)
+            conn.execute(f"UPDATE presentation_state SET {cols} WHERE id=1", tuple(kwargs.values()))
+            conn.commit()
+        finally:
+            conn.close()
 
 
 def present_adhoc_now(slides):
@@ -2021,7 +2208,7 @@ def _render_splash_screen():
     rather than a hard cut. Pure CSS/HTML, no image asset required, so
     there's nothing external to host or break.
 
-    This renders through components.html() (its own iframe) instead of
+    This renders through st.iframe() (its own iframe) instead of
     render_html()/st.markdown(), and its JS immediately injects the splash
     markup into the REAL page (window.parent.document), not just its own
     iframe. That's not cosmetic — it's the actual fix for "black screen for
@@ -2029,7 +2216,7 @@ def _render_splash_screen():
     wait for Streamlit to finish reconciling the ENTIRE rest of the page's
     component tree before it commits to the DOM, so on a script this size
     the splash was invisible for however long that reconciliation took.
-    A components.html() iframe mounts and runs independently of its
+    A st.iframe() iframe mounts and runs independently of its
     siblings — it doesn't wait on them — so injecting the splash from
     inside it shows the logo essentially as soon as Streamlit can render
     anything at all, instead of only once the whole page has caught up.
@@ -2038,7 +2225,7 @@ def _render_splash_screen():
     page load, so it doesn't include (and can't control) whatever gap
     Streamlit's own boot takes before that.
     """
-    components.html(
+    st.iframe(
         f"""
         <script>
         (function() {{
@@ -2621,7 +2808,7 @@ def proj_autofit_js():
     size didn't fit the screen.
 
     This script re-runs after every projector update (it's re-injected
-    each poll, and components.html re-executes its <script> on every call)
+    each poll, and st.iframe re-executes its <script> on every call)
     and, for each `.proj-autofit` element:
       1. Resets to its CSS-defined font-size (so growth back to full size
          is possible if the slide changes to something shorter).
@@ -2632,7 +2819,7 @@ def proj_autofit_js():
     This runs client-side in the projector tab, so it costs nothing on the
     operator's phone and adds no extra network round trip.
     """
-    components.html(
+    st.iframe(
         """
         <script>
         (function() {
@@ -2741,7 +2928,7 @@ def _render_fullscreen_fallback_js():
         A single click anywhere the operator would naturally make once
         the display is up covers that gap.
     """
-    components.html(
+    st.iframe(
         """
         <script>
         (function() {
@@ -2955,9 +3142,27 @@ def _stage_slide_info(state):
 
 def render_stage_display():
     """A separate backstage-only view (open ?display=stage on a second
-    laptop/tablet) showing the current slide, what's coming up next, and a
-    clock — so whoever's operating always knows what's about to happen
-    without needing to peek at the projector or guess."""
+    laptop/tablet) showing the current slide, what's coming up next, a
+    clock, and how long this meeting has been running — so whoever's
+    operating always knows what's about to happen and how long they've
+    been going without needing to peek at the projector or guess.
+
+    The meeting timer starts automatically the moment Stage Display is
+    first opened (state.meeting_timer_start gets set here, once, if it's
+    not already set) and keeps counting up from there — even across a
+    page refresh or a dropped connection — until it's explicitly reset.
+    It's stored server-side in presentation_state (not in the browser),
+    so every device that opens Stage Display sees the same running time,
+    same as the clock and the live slide. It's only ever shown here, not
+    on the projector or the operator's own Presentation page — this is a
+    backstage-only readout.
+    """
+    state = get_state()
+    if not state.get("meeting_timer_start"):
+        set_state(meeting_timer_start=now())
+        state = get_state()
+    timer_start_iso = state["meeting_timer_start"]
+
     def _tick():
         state = get_state()
         (cur_ref, cur_text, cur_text2, cur_ref2, nxt_ref, nxt_text, nxt_text2, nxt_ref2,
@@ -2968,7 +3173,7 @@ def render_stage_display():
         # which injects raw HTML but does NOT execute <script> tags — so the
         # clock script here never actually ran, no matter what it computed.
         # The div/CSS still render fine through render_html; the clock itself
-        # is wired up separately below via components.html (a real iframe,
+        # is wired up separately below via st.iframe (a real iframe,
         # where scripts DO execute), which reaches into the parent document
         # to update the #ecc-stage-clock element render_html created.
         current_html = (
@@ -2989,6 +3194,23 @@ def render_stage_display():
             )
         else:
             next_html = nxt_label
+        # Elapsed time computed server-side from meeting_timer_start (set
+        # once, above, the first time this view was opened) — avoids ANY
+        # timezone ambiguity between server and browser, since it's just a
+        # duration, not a clock reading. Recomputed fresh on every 0.5s
+        # tick, same cadence as the slide/clock refresh, so it visibly
+        # ticks up like a real running timer despite not being JS-driven.
+        elapsed_seconds = 0
+        if state.get("meeting_timer_start"):
+            try:
+                started = datetime.datetime.fromisoformat(state["meeting_timer_start"])
+                elapsed_seconds = max(0, int((datetime.datetime.now() - started).total_seconds()))
+            except ValueError:
+                pass
+        eh, rem = divmod(elapsed_seconds, 3600)
+        em, es = divmod(rem, 60)
+        elapsed_str = f"{eh}:{em:02d}:{es:02d}" if eh else f"{em}:{es:02d}"
+
         render_html(f"""
         <style>
         @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@700&display=swap');
@@ -2996,8 +3218,17 @@ def render_stage_display():
         section[data-testid="stSidebar"] {{display:none;}}
         .block-container {{ padding: 1.5vw 2vw !important; max-width: 100% !important; }}
         .stApp {{ background: #0B0C0F; }}
+        .stage-topbar {{ display:flex; justify-content:space-between; align-items:flex-end;
+                         margin-bottom: 1.5vh; gap: 1.5vw; }}
         .stage-clock {{ color: #C8A24A; font-family:'JetBrains Mono','SF Mono',monospace; font-size: clamp(1.2rem,2.4vw,2.2rem);
-                        font-weight:700; text-align:right; margin-bottom: 1.5vh; font-variant-numeric: tabular-nums; }}
+                        font-weight:700; text-align:right; font-variant-numeric: tabular-nums; }}
+        .stage-timer-wrap {{ text-align:left; }}
+        .stage-timer-label {{ color:#8A8D93; font-family:'Inter',sans-serif; letter-spacing:.15em; text-transform:uppercase;
+                              font-size: clamp(0.65rem,1vw,0.85rem); margin-bottom:0.2vh; }}
+        .stage-timer {{ color:#F4F3EF; font-family:'JetBrains Mono','SF Mono',monospace; font-size: clamp(1.2rem,2.4vw,2.2rem);
+                       font-weight:700; font-variant-numeric: tabular-nums;
+                       background: linear-gradient(180deg, #1A1C22, #101116); border: 1px solid #C8A24A44;
+                       border-radius: 10px; padding: 0.3vh 1vw; display:inline-block; }}
         .stage-label {{ color:#8A8D93; font-family:'Inter',sans-serif; letter-spacing:.15em; text-transform:uppercase;
                         font-size: clamp(0.75rem,1.2vw,1rem); margin-bottom: 0.6vh; }}
         .stage-current {{ color:#FFFFFF; font-family:'Inter',sans-serif; font-weight:700;
@@ -3025,13 +3256,19 @@ def render_stage_display():
         }}
         .stage-next-img {{ display:block; width:100%; min-height:80px; max-height:18vh; object-fit:contain; border-radius:6px; }}
         </style>
+        <div class="stage-topbar">
+        <div class="stage-timer-wrap">
+        <div class="stage-timer-label">Meeting Time</div>
+        <div class="stage-timer">⏱ {elapsed_str}</div>
+        </div>
         <div class="stage-clock" id="ecc-stage-clock">--:--</div>
+        </div>
         <div class="stage-label">Now</div>
         <div class="stage-current">{current_html}</div>
         <div class="stage-label">Up Next</div>
         <div class="stage-next">{next_html}</div>
         """)
-        components.html(
+        st.iframe(
             """
             <script>
             (function() {
@@ -3068,6 +3305,17 @@ def render_stage_display():
     # browser, so this covers the gap with the first click/keypress inside
     # the window itself.
     _render_fullscreen_fallback_js()
+
+    # A tucked-away reset for the meeting timer — deliberately small and out
+    # of the way (bottom of the page, plain text button) so it never
+    # competes visually with the Now/Up Next/clock/timer readout above, but
+    # is still reachable if the operator wants to restart the count (e.g.
+    # the previous meeting's timer was still running when this one began).
+    with st.container():
+        render_html('<div style="opacity:0.35;font-size:0.7rem;">&nbsp;</div>')
+        if st.button("↻ Reset meeting timer", key="stage_reset_timer"):
+            set_state(meeting_timer_start=now())
+            st.rerun()
 
 
 def render_remote():
@@ -3114,7 +3362,7 @@ def _remote_scroll_preserve_js():
     resets scroll to 0 for a moment, it's restored within the same frame —
     the volunteer holding the phone shouldn't perceive any jump.
     """
-    components.html(
+    st.iframe(
         """
         <script>
         (function() {
@@ -3396,7 +3644,7 @@ def render_display_open_widget(compact=False):
               </div>
               <div id="ecc-copy-msg" style="color:#9A9CA3;font-size:0.72rem;margin-top:0.2rem;"></div>
     """
-    components.html(
+    st.iframe(
         f"""
         <div style="font-family:'Inter',sans-serif;font-size:0.85rem;">
           {link_row}
@@ -3410,7 +3658,7 @@ def render_display_open_widget(compact=False):
         </div>
         <script>
           // NOTE: this snippet runs inside a sandboxed iframe (Streamlit's
-          // components.html), so window.location here refers to the iframe
+          // st.iframe), so window.location here refers to the iframe
           // itself (origin "null", path "srcdoc") — not the real page.
           // window.parent.location is the actual browser tab's address.
           const linkEl = document.getElementById("ecc-display-link");
@@ -3550,7 +3798,7 @@ def sidebar():
 
         st.write("")
         st.caption("Stage Display / Remote (open on another device)")
-        components.html(
+        st.iframe(
             """
             <div style="font-family:'Inter',sans-serif;font-size:0.82rem;display:flex;flex-direction:column;gap:0.5rem;">
               <div style="display:flex;align-items:center;gap:0.4rem;">
@@ -3720,8 +3968,9 @@ def page_songs():
     with st.expander("➕ Import Songs", expanded=st.session_state.get("show_add_song", False)):
         st.caption(
             "Paste lyrics straight from a lyrics site — same importer as the Import Lyrics tab, right "
-            "here so you don't have to leave this page. Slides are packed to a character budget sized "
-            "for a TV screen, and a line is never cut mid-way (see Import Lyrics for the format)."
+            f"here so you don't have to leave this page. Slides are packed to at most "
+            f"{LYRICS_MAX_LINES_PER_SLIDE} lines each, and a line is never cut mid-word (see Import "
+            "Lyrics for the format)."
         )
         render_import_lyrics_form(key_prefix="songlib_import")
 
@@ -3730,13 +3979,28 @@ def page_songs():
     dupe_ids = find_duplicate_song_ids()
     top_l, top_r = st.columns([3, 2])
     with top_r:
-        if dupe_ids:
-            st.markdown('<div class="ecc-danger">', unsafe_allow_html=True)
-            if st.button(f"🗑 Delete Duplicates ({len(dupe_ids)})", use_container_width=True, key="delete_dupes"):
-                delete_songs(dupe_ids)
-                st.toast(f"Removed {len(dupe_ids)} duplicate song(s).", icon="✅")
+        fmt_col, dupe_col = st.columns(2)
+        with fmt_col:
+            if st.button("✨ Format All Slides", use_container_width=True, key="format_all_slides",
+                         help=f"Re-splits every song's slides to at most {LYRICS_MAX_LINES_PER_SLIDE} lines each, with a bigger font."):
+                overlay = st.empty()
+                _render_format_progress_overlay(overlay, 0, max(get_song_count(), 1))
+                changed, total = reformat_all_songs_to_line_limit(
+                    on_progress=lambda done, total, title: _render_format_progress_overlay(
+                        overlay, done, total, label=f"{done} / {total} songs formatted"
+                    )
+                )
+                overlay.empty()
+                st.toast(f"Formatted {changed}/{total} song(s) to {LYRICS_MAX_LINES_PER_SLIDE} lines per slide.", icon="✨")
                 st.rerun()
-            st.markdown('</div>', unsafe_allow_html=True)
+        with dupe_col:
+            if dupe_ids:
+                st.markdown('<div class="ecc-danger">', unsafe_allow_html=True)
+                if st.button(f"🗑 Delete Duplicates ({len(dupe_ids)})", use_container_width=True, key="delete_dupes"):
+                    delete_songs(dupe_ids)
+                    st.toast(f"Removed {len(dupe_ids)} duplicate song(s).", icon="✅")
+                    st.rerun()
+                st.markdown('</div>', unsafe_allow_html=True)
     if not songs:
         st.caption("No songs match — try a different search or filter.")
     for s in songs:
@@ -4014,41 +4278,103 @@ def ensure_active_service():
     return st.session_state.get("active_service_id")
 
 
+def _render_service_builder_css():
+    """Scoped styling for the Service Builder redesign — reuses the app's
+    existing design tokens (ACCENT, CARD, SHADOW_*, RADIUS_*) rather than
+    inventing a new palette, so this page reads as part of the same app
+    instead of a bolted-on skin. Type-colored badges give each item a
+    recognizable color at a glance (song/Bible/announcement/custom/deck)
+    instead of everything being the same flat card."""
+    render_html(f"""
+    <style>
+    .ecc-sb-type-song {{ background: {ACCENT}22; color: {ACCENT}; }}
+    .ecc-sb-type-bible {{ background: {LIVE_GREEN}22; color: {LIVE_GREEN}; }}
+    .ecc-sb-type-announcement {{ background: {PAUSE_AMBER}22; color: {PAUSE_AMBER}; }}
+    .ecc-sb-type-custom {{ background: #7C8CD622; color: #93A0E0; }}
+    .ecc-sb-type-imagedeck {{ background: #C874B822; color: #D896CB; }}
+    .ecc-sb-badge {{
+        display:inline-flex; align-items:center; justify-content:center;
+        width: 2.1rem; height: 2.1rem; border-radius: {RADIUS_SM};
+        font-size: 1.05rem; flex-shrink: 0;
+    }}
+    .ecc-sb-add-card {{
+        background: linear-gradient(160deg, {CARD} 0%, #131217 100%);
+        border: 1px solid {CARD_BORDER}; border-radius: {RADIUS_MD};
+        padding: 0.9rem 1rem 0.3rem 1rem; text-align:center;
+        transition: border-color .15s ease, box-shadow .15s ease;
+    }}
+    .ecc-sb-add-card:hover {{ border-color: {ACCENT}55; box-shadow: {SHADOW_HOVER}; }}
+    .ecc-sb-add-icon {{ font-size: 1.6rem; margin-bottom: 0.15rem; }}
+    .ecc-sb-add-label {{ color: {TEXT_PRIMARY}; font-weight: 700; font-size: 0.85rem; margin-bottom: 0.5rem; }}
+    .ecc-sb-row {{
+        background: linear-gradient(160deg, {CARD} 0%, #131217 100%);
+        border: 1px solid {CARD_BORDER}; border-radius: {RADIUS_SM};
+        padding: 0.6rem 0.9rem; margin-bottom: 0.5rem;
+        display:flex; align-items:center; gap: 0.8rem;
+        transition: border-color .15s ease, box-shadow .15s ease;
+    }}
+    .ecc-sb-row:hover {{ border-color: {ACCENT}44; box-shadow: {SHADOW_HOVER}; }}
+    .ecc-sb-row-num {{ color: {TEXT_MUTED}; font-family: 'JetBrains Mono','SF Mono',monospace; font-size: 0.85rem; width:1.6rem; flex-shrink:0; }}
+    .ecc-sb-row-title {{ color: {TEXT_PRIMARY}; font-weight: 700; font-size: 0.95rem; }}
+    .ecc-sb-row-meta {{ color: {TEXT_MUTED}; font-size: 0.78rem; }}
+    .ecc-sb-empty {{
+        border: 1px dashed {CARD_BORDER}; border-radius: {RADIUS_MD}; padding: 2.4rem 1.5rem;
+        text-align:center; color: {TEXT_MUTED};
+    }}
+    .ecc-sb-empty-icon {{ font-size: 2.2rem; margin-bottom: 0.5rem; opacity: 0.6; }}
+    /* Compact icon-only reorder/delete buttons in the service order rows —
+       narrower padding than the app's default button so 3 of them fit
+       comfortably next to a title without crowding it. */
+    div[class*="st-key-sb_updn_"] .stButton>button {{
+        padding: 0.25rem 0 !important; font-size: 0.85rem !important; min-height: 0 !important;
+    }}
+    </style>
+    """)
+
+
 def page_service_builder():
-    st.markdown("### Service Builder")
+    _render_service_builder_css()
     services = get_services()
 
-    top1, top2, top3 = st.columns([2, 1, 1])
-    with top1:
+    # --- Hero header: pick/create a service, see it as one clear unit ---
+    hero_l, hero_r = st.columns([3, 1])
+    with hero_l:
+        st.markdown('<div class="ecc-label">Service Builder</div>', unsafe_allow_html=True)
         options = {s["id"]: f"{s['name']} — {s['service_date']}" for s in services}
         current = st.session_state.get("active_service_id")
         if options:
             chosen = st.selectbox("Active service", list(options.keys()),
                                    format_func=lambda i: options[i],
-                                   index=list(options.keys()).index(current) if current in options else 0)
+                                   index=list(options.keys()).index(current) if current in options else 0,
+                                   label_visibility="collapsed")
             st.session_state.active_service_id = chosen
-    with top2:
-        if st.button("➕ New Service", use_container_width=True):
-            sid = create_service("New Service", str(datetime.date.today()), "10:00 AM")
-            st.session_state.active_service_id = sid
-            st.rerun()
-    with top3:
-        templates = get_conn().execute("SELECT * FROM templates").fetchall()
-        tnames = {t["id"]: t["name"] for t in templates}
-        if tnames and st.button("From Template", use_container_width=True):
-            t = templates[0]
-            structure = json.loads(t["structure"])
-            items = []
-            for step in structure:
-                if step == "Song":
-                    items.append(make_announcement_item("(choose a song)"))
-                elif step == "Scripture Reading":
-                    items.append(make_announcement_item("(choose a passage)"))
-                else:
-                    items.append(make_custom_item(step, step))
-            sid = create_service(t["name"], str(datetime.date.today()), "10:00 AM", items)
-            st.session_state.active_service_id = sid
-            st.rerun()
+        else:
+            st.markdown('<div class="ecc-hero">No services yet — create your first one to start building today\'s plan.</div>',
+                        unsafe_allow_html=True)
+    with hero_r:
+        new_col, tmpl_col = st.columns(2)
+        with new_col:
+            if st.button("➕ New", use_container_width=True, help="Start a new blank service"):
+                sid = create_service("New Service", str(datetime.date.today()), "10:00 AM")
+                st.session_state.active_service_id = sid
+                st.rerun()
+        with tmpl_col:
+            templates = get_conn().execute("SELECT * FROM templates").fetchall()
+            tnames = {t["id"]: t["name"] for t in templates}
+            if tnames and st.button("📋 Template", use_container_width=True, help="Start from a saved template"):
+                t = templates[0]
+                structure = json.loads(t["structure"])
+                items = []
+                for step in structure:
+                    if step == "Song":
+                        items.append(make_announcement_item("(choose a song)"))
+                    elif step == "Scripture Reading":
+                        items.append(make_announcement_item("(choose a passage)"))
+                    else:
+                        items.append(make_custom_item(step, step))
+                sid = create_service(t["name"], str(datetime.date.today()), "10:00 AM", items)
+                st.session_state.active_service_id = sid
+                st.rerun()
 
     sid = ensure_active_service()
     if not sid:
@@ -4058,97 +4384,132 @@ def page_service_builder():
     service = get_service(sid)
     items = json.loads(service["items"])
 
-    with st.form("service_meta"):
-        c1, c2, c3 = st.columns(3)
-        name = c1.text_input("Service name", value=service["name"])
-        date = c2.text_input("Date", value=service["service_date"])
-        time_ = c3.text_input("Time", value=service["service_time"] or "")
-        if st.form_submit_button("Save details"):
-            conn = get_conn()
-            conn.execute("UPDATE services SET name=?, service_date=?, service_time=?, updated_at=? WHERE id=?", (name, date, time_, now(), sid))
-            conn.commit(); conn.close()
-            st.rerun()
-
-    if turso_configured():
-        if st.button("☁️ Save Service to Cloud", help="Pushes this service to Turso so it survives an app restart — only runs when you click it."):
-            try:
-                turso_push_service(sid, name, date, time_, json.dumps(items))
-                st.toast(f"Saved \"{name}\" to Turso.", icon="☁️")
-            except Exception as e:
-                st.error(f"Cloud save failed: {e}")
-    else:
-        st.caption("Set up Turso (Church Settings) to make saved services survive an app restart.")
-
-    st.markdown("#### Add to the service")
-    a1, a2, a3, a4 = st.columns(4)
-    with a1.popover("🎵 Add Song"):
-        song_search = st.text_input("Search songs", key="add_song_search", placeholder="Search by title, artist, or lyrics")
-        song_options = {s["id"]: dict(s) for s in get_songs(search=song_search)}
-        if song_options:
-            pick_id = st.selectbox(
-                "Song", list(song_options.keys()),
-                format_func=lambda i: f"{song_options[i]['title']} — {song_options[i]['artist']}"
-                if song_options[i]['artist'] else song_options[i]['title'],
-                key="pick_song")
-            picked = song_options[pick_id]
-            if picked.get("artist"):
-                st.caption(f"by {picked['artist']}")
-            if st.button("Add", key="add_song_btn", use_container_width=True):
-                items.append(make_song_item(picked))
-                update_service_items(sid, items)
-                st.toast(f"Added \"{picked['title']}\" — pick another or close when done.", icon="✅")
+    # --- Service details card ---
+    with st.container(border=True):
+        with st.form("service_meta", border=False):
+            c1, c2, c3 = st.columns(3)
+            name = c1.text_input("Service name", value=service["name"])
+            date = c2.text_input("Date", value=service["service_date"])
+            time_ = c3.text_input("Time", value=service["service_time"] or "")
+            if st.form_submit_button("Save details", use_container_width=True):
+                conn = get_conn()
+                conn.execute("UPDATE services SET name=?, service_date=?, service_time=?, updated_at=? WHERE id=?", (name, date, time_, now(), sid))
+                conn.commit(); conn.close()
                 st.rerun()
-        elif song_search:
-            st.caption("No songs match that search.")
+
+    cloud_l, cloud_r = st.columns([3, 2])
+    with cloud_l:
+        n_items = len(items)
+        st.markdown(
+            f'<span class="ecc-pill">{n_items} item{"s" if n_items != 1 else ""}</span> '
+            f'<span class="ecc-muted">in this service</span>',
+            unsafe_allow_html=True
+        )
+    with cloud_r:
+        if turso_configured():
+            if st.button("☁️ Save Service to Cloud", use_container_width=True,
+                         help="Pushes this service to Turso so it survives an app restart — only runs when you click it."):
+                try:
+                    turso_push_service(sid, name, date, time_, json.dumps(items))
+                    st.toast(f"Saved \"{name}\" to Turso.", icon="☁️")
+                except Exception as e:
+                    st.error(f"Cloud save failed: {e}")
         else:
-            st.caption("No songs yet — add one from the Songs tab.")
+            st.caption("Set up Turso (Church Settings) to make saved services survive an app restart.")
+
+    st.write("")
+    st.markdown('<div class="ecc-label">Add to the Service</div>', unsafe_allow_html=True)
+    a1, a2, a3, a4 = st.columns(4)
+    with a1:
+        render_html('<div class="ecc-sb-add-card"><div class="ecc-sb-add-icon">🎵</div><div class="ecc-sb-add-label">Song</div></div>')
+        with st.popover("Add Song", use_container_width=True):
+            song_search = st.text_input("Search songs", key="add_song_search", placeholder="Search by title, artist, or lyrics")
+            song_options = {s["id"]: dict(s) for s in get_songs(search=song_search)}
+            if song_options:
+                pick_id = st.selectbox(
+                    "Song", list(song_options.keys()),
+                    format_func=lambda i: f"{song_options[i]['title']} — {song_options[i]['artist']}"
+                    if song_options[i]['artist'] else song_options[i]['title'],
+                    key="pick_song")
+                picked = song_options[pick_id]
+                if picked.get("artist"):
+                    st.caption(f"by {picked['artist']}")
+                if st.button("Add", key="add_song_btn", use_container_width=True, type="primary"):
+                    items.append(make_song_item(picked))
+                    update_service_items(sid, items)
+                    st.toast(f"Added \"{picked['title']}\" — pick another or close when done.", icon="✅")
+                    st.rerun()
+            elif song_search:
+                st.caption("No songs match that search.")
+            else:
+                st.caption("No songs yet — add one from the Songs tab.")
     with a2:
         staging = st.session_state.get("bible_staging", [])
-        if st.button(f"📖 Add Staged Bible ({len(staging)})", disabled=not staging, use_container_width=True):
+        render_html(f'<div class="ecc-sb-add-card"><div class="ecc-sb-add-icon">📖</div><div class="ecc-sb-add-label">Bible ({len(staging)} staged)</div></div>')
+        if st.button("Add Staged Bible", disabled=not staging, use_container_width=True, key="add_staged_bible"):
             for (b, c, vs, tr, tr2, cmb) in staging:
                 items.append(make_bible_item(b, c, list(vs), tr, tr2, combine=cmb))
             st.session_state.bible_staging = []
             update_service_items(sid, items); st.rerun()
-    with a3.popover("📣 Add Announcement"):
-        title = st.text_input("Title", key="ann_title")
-        if st.button("Add", key="add_ann_btn") and title:
-            items.append(make_announcement_item(title))
-            update_service_items(sid, items); st.rerun()
-    with a4.popover("🖼 Add Custom Slide"):
-        title = st.text_input("Title", key="cust_title")
-        body = st.text_area("Text", key="cust_body")
-        if st.button("Add", key="add_cust_btn") and title:
-            items.append(make_custom_item(title, body))
-            update_service_items(sid, items); st.rerun()
+    with a3:
+        render_html('<div class="ecc-sb-add-card"><div class="ecc-sb-add-icon">📣</div><div class="ecc-sb-add-label">Announcement</div></div>')
+        with st.popover("Add Announcement", use_container_width=True):
+            title = st.text_input("Title", key="ann_title")
+            if st.button("Add", key="add_ann_btn", use_container_width=True, type="primary") and title:
+                items.append(make_announcement_item(title))
+                update_service_items(sid, items); st.rerun()
+    with a4:
+        render_html('<div class="ecc-sb-add-card"><div class="ecc-sb-add-icon">🖼</div><div class="ecc-sb-add-label">Custom Slide</div></div>')
+        with st.popover("Add Custom Slide", use_container_width=True):
+            title = st.text_input("Title", key="cust_title")
+            body = st.text_area("Text", key="cust_body")
+            if st.button("Add", key="add_cust_btn", use_container_width=True, type="primary") and title:
+                items.append(make_custom_item(title, body))
+                update_service_items(sid, items); st.rerun()
 
-    st.markdown("#### Order of Service")
+    st.write("")
+    st.markdown('<div class="ecc-label">Order of Service</div>', unsafe_allow_html=True)
+    ICON = {"song": "🎵", "bible": "📖", "custom": "🖼", "announcement": "📣", "imagedeck": "🖼"}
     if not items:
-        st.caption("Nothing added yet — build the flow above.")
+        render_html(
+            '<div class="ecc-sb-empty"><div class="ecc-sb-empty-icon">📋</div>'
+            'Nothing added yet — use the cards above to build today\'s flow.</div>'
+        )
     else:
-        st.caption("Use ↑/↓ to reorder — instant, reliable, no dragging required.")
-        with st.container(key="service_items"):
-            for i, item in enumerate(items):
-                icon = {"song": "🎵", "bible": "📖", "custom": "🖼", "announcement": "📣", "imagedeck": "🖼"}.get(item["type"], "•")
-                with st.container(border=True):
-                    c1, c2 = st.columns([5, 2])
-                    c1.markdown(f"**{i+1:02d} — {icon} {item['title']}**")
-                    with c2:
-                        b1, b2, b3 = st.columns(3)
-                        if b1.button("↑", key=f"up_{i}") and i > 0:
-                            items[i-1], items[i] = items[i], items[i-1]
-                            update_service_items(sid, items); st.rerun()
-                        if b2.button("↓", key=f"down_{i}") and i < len(items) - 1:
-                            items[i+1], items[i] = items[i], items[i+1]
-                            update_service_items(sid, items); st.rerun()
-                        with b3.container(key=f"del_wrap_{i}"):
-                            if st.button("🗑", key=f"del_{i}"):
-                                items.pop(i)
-                                update_service_items(sid, items); st.rerun()
+        st.caption("Use ▲/▼ to reorder — instant, reliable, no dragging required.")
+        for i, item in enumerate(items):
+            item_type = item["type"]
+            icon = ICON.get(item_type, "•")
+            n_slides = len(item.get("slides", []) or item.get("images", []) or [])
+            row_badge, row_title, row_up, row_down, row_del = st.columns([0.6, 5, 0.6, 0.6, 0.6])
+            with row_badge:
+                render_html(
+                    f'<div style="display:flex;align-items:center;height:2.4rem;">'
+                    f'<span class="ecc-sb-badge ecc-sb-type-{item_type}">{icon}</span></div>'
+                )
+            with row_title:
+                render_html(
+                    f'<div style="display:flex;flex-direction:column;justify-content:center;height:2.4rem;">'
+                    f'<span class="ecc-sb-row-title">{i+1:02d} — {item["title"]}</span>'
+                    f'<span class="ecc-sb-row-meta">{n_slides} slide{"s" if n_slides != 1 else ""}</span></div>'
+                )
+            with row_up.container(key=f"sb_updn_up_{i}"):
+                if st.button("▲", key=f"up_{i}", use_container_width=True, disabled=(i == 0)):
+                    items[i-1], items[i] = items[i], items[i-1]
+                    update_service_items(sid, items); st.rerun()
+            with row_down.container(key=f"sb_updn_down_{i}"):
+                if st.button("▼", key=f"down_{i}", use_container_width=True, disabled=(i == len(items) - 1)):
+                    items[i+1], items[i] = items[i], items[i+1]
+                    update_service_items(sid, items); st.rerun()
+            with row_del.container(key=f"del_wrap_{i}"):
+                if st.button("🗑", key=f"del_{i}", use_container_width=True):
+                    items.pop(i)
+                    update_service_items(sid, items); st.rerun()
 
     if items:
         st.write("")
         st.markdown('<div class="ecc-primary">', unsafe_allow_html=True)
-        if st.button("▶ START SERVICE", use_container_width=True):
+        if st.button("▶  START SERVICE", use_container_width=True):
             set_state(service_id=sid, item_index=0, slide_index=0, black=0, cleared=0, live=1,
                       theme=get_settings()["default_theme"], background=get_settings().get("default_background"))
             st.session_state.page = "Presentation"
@@ -4411,7 +4772,7 @@ def _render_slide_grid(entries, adhoc, item_index, slide_index, cols_per_row=4, 
 
 def _render_operator_keyboard_shortcuts():
     st.caption("⌨️ Shortcuts: Space, → or ↑ = Next · ← or ↓ = Prev · B = toggle Black screen")
-    components.html(
+    st.iframe(
         """
         <script>
         (function() {
@@ -4498,7 +4859,7 @@ def _render_presentation_mode_launch_banner():
         )
         bcol1, bcol2 = st.columns([3, 1])
         with bcol1:
-            components.html(
+            st.iframe(
                 """
                 <div style="font-family:'Inter',sans-serif;">
                   <button id="ecc-launch-btn" onclick="eccLaunchPresentationMode()"
@@ -4830,9 +5191,14 @@ def _page_presentation_body():
 
 
 def render_import_lyrics_form(key_prefix="lyrics"):
-    """The paste-lyrics importer: paste, click Apply to parse it into slides
-    (packed to a character budget sized for a TV screen — see
-    MAX_SLIDE_CHARS — never splitting a line mid-way), review, then Save.
+    """The paste-lyrics importer: paste, and it parses into slides live as
+    you type/paste (packed to at most LYRICS_MAX_LINES_PER_SLIDE lines per
+    slide — never splitting a word — see pack_lyrics_into_slides), review,
+    then Save. Apply is an explicit "lock this in" action but isn't
+    required for the preview to update — parsing happens on every run
+    where there's text in the box, which is also what fixes the old "have
+    to click Apply twice" issue: a button click and a fresh paste landing
+    in the same script run could otherwise have the click see stale text.
     Shared as-is by the Import Lyrics page and the Song Library's inline
     "Import Songs" section, so there's exactly one text box and one set of
     rules to keep in sync.
@@ -4853,15 +5219,37 @@ def render_import_lyrics_form(key_prefix="lyrics"):
     category = st.selectbox("Category", ["Worship", "Hymn", "Christmas", "Youth", "Other"], key=f"{key_prefix}_category")
     tags = st.text_input("Tags (optional)", key=f"{key_prefix}_tags")
 
-    if st.button("✅ Apply", key=f"{key_prefix}_apply", use_container_width=True, disabled=not raw.strip()):
+    # Parses on every run where there's text in the box — not only when
+    # Apply is clicked. This is the fix for "I have to click Apply twice":
+    # a text_area's newly-typed/pasted value and a button click landing in
+    # the SAME script run can, in some Streamlit versions/timings, have the
+    # button's disabled= check and its "if clicked" body see the value from
+    # slightly different moments — so the first click could silently parse
+    # stale (often empty) text while the box visually already showed the
+    # new paste. Auto-parsing on every run removes that race entirely: by
+    # the time Apply is even clickable, the preview below is already
+    # showing this exact text's result. The button is kept as an explicit,
+    # always-safe "yes, use this" action (also handy for re-parsing after
+    # editing category/tags), not as the only way parsing happens.
+    auto_parsed = None
+    if raw.strip():
         title, artist, year, slides = parse_pasted_lyrics(raw)
-        st.session_state[f"{key_prefix}_parsed"] = {"title": title, "artist": artist, "year": year, "slides": slides}
+        auto_parsed = {"title": title, "artist": artist, "year": year, "slides": slides}
 
-    parsed = st.session_state.get(f"{key_prefix}_parsed")
+    apply_clicked = st.button("✅ Apply", key=f"{key_prefix}_apply", use_container_width=True, disabled=not raw.strip())
+    if apply_clicked and auto_parsed:
+        st.session_state[f"{key_prefix}_parsed"] = auto_parsed
+
+    # Show the live auto-parsed preview once there's something to show, even
+    # before Apply is ever clicked — Apply's only remaining job is to lock
+    # this in as "parsed" so it survives if the operator keeps editing the
+    # text box afterward. If they haven't clicked Apply yet but there's
+    # text in the box, show the auto-parsed version so nothing looks stuck.
+    parsed = st.session_state.get(f"{key_prefix}_parsed") or auto_parsed
     if parsed:
         st.write("")
         st.markdown(f"**{parsed['title']}**" + (f" — {parsed['artist']}" if parsed['artist'] else "") + (f" ({parsed['year']})" if parsed['year'] else ""))
-        st.caption(f"{len(parsed['slides'])} slide(s) — packed to fit a TV screen, lines are never cut mid-way.")
+        st.caption(f"{len(parsed['slides'])} slide(s) — up to {LYRICS_MAX_LINES_PER_SLIDE} lines each, lines are never cut mid-word.")
         with st.expander("Preview slides", expanded=True):
             for i, s in enumerate(parsed["slides"]):
                 st.markdown(f'<div class="ecc-card"><b>Slide {i+1}</b><br>{s}</div>'.replace("\n", "<br>"), unsafe_allow_html=True)
@@ -4881,7 +5269,7 @@ def render_import_lyrics_form(key_prefix="lyrics"):
             st.session_state[counter_key] += 1
             st.rerun()
     else:
-        st.info("Paste lyrics above, then click Apply to see the slide preview.")
+        st.info("Paste lyrics above to see the slide preview.")
 
 
 def page_import_slides():
@@ -5710,14 +6098,14 @@ def _render_meeting_transition(meeting_name):
     rapidly scales up to cover the entire screen — rounded corners
     unrounding as it grows, per the "overlay the whole screen with rounded
     edges" + "expand quick" ask — holds briefly showing the meeting name,
-    then fades out to reveal the dashboard underneath. Same components.html()
+    then fades out to reveal the dashboard underneath. Same st.iframe()
     injection technique as _render_splash_screen/_render_welcome_screen (see
     that docstring for why: it paints immediately instead of waiting on the
     rest of the page's component tree to reconcile) — this one is one-time
     per sign-in, not per session, since it should replay every time a
     meeting is (re)selected."""
     safe_name = meeting_name.replace("`", "").replace("</", "<\\/")
-    components.html(
+    st.iframe(
         f"""
         <script>
         (function() {{

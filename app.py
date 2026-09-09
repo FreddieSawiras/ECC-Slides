@@ -52,7 +52,7 @@ except ImportError:
     PYMUPDF_AVAILABLE = False
 
 # ---------------------------------------------------------------------------
-
+# CONFIG / CONSTANTS
 # ---------------------------------------------------------------------------
 
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ecc_worship.db")
@@ -3848,7 +3848,7 @@ def sidebar():
         for label in ["Dashboard", "Service Builder", "Presentation"]:
             nav_button(label)
         st.markdown("###### LIBRARY")
-        for label in ["Song Library", "Import Slides", "Bible", "Saved Services"]:
+        for label in ["Song Library", "Import Slides", "Bible", "NLT Bible Demo", "Saved Services"]:
             nav_button(label)
         st.markdown("###### SETTINGS")
         for label in ["Church Settings", "Display Settings", "Database"]:
@@ -4202,6 +4202,130 @@ def page_song_workspace():
             st.session_state.active_service_id = temp_service_id
             st.session_state.page = "Presentation"
             st.rerun()
+
+
+
+def _get_nlt_api_key():
+    """Read the NLT API license key from Streamlit secrets or an environment variable."""
+    try:
+        return (st.secrets.get("NLT_API_KEY") or os.environ.get("NLT_API_KEY") or "").strip()
+    except Exception:
+        return os.environ.get("NLT_API_KEY", "").strip()
+
+
+def _strip_html_for_projector(html):
+    """Convert the NLT API's HTML excerpt into clean plain text for slides."""
+    if not html:
+        return ""
+    # The API returns HTML. Decode entities first, remove scripts/styles, then
+    # turn common block/line tags into newlines before stripping the rest.
+    text = re.sub(r"<\s*(script|style)[^>]*>.*?<\s*/\s*\1\s*>", "", html, flags=re.I | re.S)
+    text = re.sub(r"<\s*(br|/p|/div|/li|/h[1-6])\s*/?\s*>", "\n", text, flags=re.I)
+    text = re.sub(r"<li[^>]*>", "", text, flags=re.I)
+    text = re.sub(r"<[^>]+>", "", text)
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    try:
+        import html as _html
+        text = _html.unescape(text)
+    except Exception:
+        pass
+    return text.strip()
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def _fetch_nlt_passage(ref, version, api_key):
+    """Fetch one NLT API passage. Returns the API's HTML excerpt."""
+    url = "https://api.nlt.to/api/passages"
+    response = requests.get(
+        url,
+        params={"ref": ref, "version": version, "key": api_key},
+        timeout=15,
+    )
+    response.raise_for_status()
+    return response.text
+
+
+def page_nlt_bible_demo():
+    st.markdown("### NLT Bible Demo")
+    st.caption("Live NLT lookup through the NLT API. The NLT text is fetched when you request a passage rather than imported into your local Bible database.")
+
+    api_key = _get_nlt_api_key()
+    if not api_key:
+        st.warning("NLT API is not configured yet. Add NLT_API_KEY to Streamlit Secrets, then reload the app.")
+
+    left, right = st.columns([2.2, 1])
+    with left:
+        reference = st.text_input(
+            "Bible reference",
+            value="John 3:16",
+            placeholder="John 3:16 or Genesis 1:1-3",
+            key="nlt_demo_reference",
+        )
+    with right:
+        version = st.selectbox(
+            "Version",
+            ["NLT", "NLTUK", "NTV", "KJV"],
+            index=0,
+            key="nlt_demo_version",
+            help="NLT API versions documented by the API you provided.",
+        )
+
+    fetch_col, present_col = st.columns(2)
+    with fetch_col:
+        fetch = st.button("Fetch Passage", use_container_width=True, type="primary", disabled=not api_key)
+    with present_col:
+        present = st.button("▶ Present on Projector", use_container_width=True, disabled=not api_key)
+
+    if (fetch or present) and reference.strip():
+        try:
+            with st.spinner("Fetching passage…"):
+                html_excerpt = _fetch_nlt_passage(reference.strip(), version, api_key)
+            clean_text = _strip_html_for_projector(html_excerpt)
+            if not clean_text:
+                st.warning("The API returned no readable passage text. Check the reference and API key.")
+                return
+
+            st.session_state["nlt_demo_last_html"] = html_excerpt
+            st.session_state["nlt_demo_last_text"] = clean_text
+            st.session_state["nlt_demo_last_ref"] = reference.strip()
+            st.session_state["nlt_demo_last_version"] = version
+
+            if present:
+                slide_ref = f"{reference.strip()} · {version}"
+                present_adhoc_now([(slide_ref, clean_text, None, None)])
+                st.toast(f"Presenting {reference.strip()} ({version})", icon="▶️")
+                st.rerun()
+        except requests.HTTPError as e:
+            status = e.response.status_code if e.response is not None else "unknown"
+            st.error(f"NLT API request failed (HTTP {status}). Check your API key, reference, and API access.")
+        except requests.RequestException as e:
+            st.error(f"Could not reach the NLT API: {e}")
+        except Exception as e:
+            st.error(f"NLT lookup failed: {e}")
+
+    last_text = st.session_state.get("nlt_demo_last_text", "")
+    last_ref = st.session_state.get("nlt_demo_last_ref", "")
+    last_version = st.session_state.get("nlt_demo_last_version", "")
+    last_html = st.session_state.get("nlt_demo_last_html", "")
+
+    if last_text:
+        st.markdown("#### Retrieved passage")
+        st.markdown(f"**{last_ref} · {last_version}**")
+        from html import escape as _html_escape
+        safe_last_text = _html_escape(last_text).replace("\n", "<br>")
+        st.markdown(
+            f'<div class="ecc-card" style="font-size:1.15rem; line-height:1.7;">{safe_last_text}</div>',
+            unsafe_allow_html=True,
+        )
+        with st.expander("API response (HTML)"):
+            st.code(last_html, language="html")
+
+    st.write("")
+    st.markdown("#### What to add to Streamlit Secrets")
+    st.caption("Copy this into `.streamlit/secrets.toml` locally, or into your Streamlit Cloud app Secrets. Replace the placeholder with the NLT API license key you were issued.")
+    st.code('NLT_API_KEY = "PASTE_YOUR_NLT_API_KEY_HERE"', language="toml")
+    st.caption("Do not put the real key directly in app.py or commit your secrets.toml file to GitHub.")
 
 
 def page_bible():
@@ -5884,6 +6008,7 @@ def main():
         "Dashboard": page_dashboard,
         "Song Workspace": page_song_workspace,
         "Bible": page_bible,
+        "NLT Bible Demo": page_nlt_bible_demo,
         "Service Builder": page_service_builder,
         "Presentation": page_presentation,
         "Song Library": page_song_library,
@@ -6253,3 +6378,8 @@ if __name__ == "__main__":
     main()
 
 #git status ; git add . ; git commit -m "Your commit message" ; git push
+
+# ---------------------------------------------------------------------------
+# NLT API SECRET (COPY INTO .streamlit/secrets.toml — DO NOT COMMIT THE REAL KEY)
+# ---------------------------------------------------------------------------
+# NLT_API_KEY = "PASTE_YOUR_NLT_API_KEY_HERE"

@@ -4246,54 +4246,107 @@ def _fetch_nlt_passage(ref, version, api_key):
     return response.text
 
 
+def _parse_nlt_reference(reference):
+    """Parse a simple NLT reference into book, chapter, first verse, last verse."""
+    cleaned = re.sub(r"\s+", " ", (reference or "").strip())
+    m = re.match(r"^(.+?)\s+(\d+):(\d+)(?:\s*[-–]\s*(\d+))?$", cleaned)
+    if not m:
+        return None
+    book = m.group(1).strip()
+    chapter = int(m.group(2))
+    first_verse = int(m.group(3))
+    last_verse = int(m.group(4) or first_verse)
+    if last_verse < first_verse:
+        return None
+    return book, chapter, first_verse, last_verse
+
+
+def _build_nlt_slides(reference, version, api_key):
+    """Fetch NLT and turn it into the same ref/text slide shape used by Bible."""
+    parsed = _parse_nlt_reference(reference)
+    if not parsed:
+        raise ValueError("Use a reference like John 3:16 or John 3:16-18.")
+    book, chapter, first_verse, last_verse = parsed
+    slides = []
+    for verse in range(first_verse, last_verse + 1):
+        verse_ref = f"{book} {chapter}:{verse}"
+        html_excerpt = _fetch_nlt_passage(verse_ref, version, api_key)
+        text = _strip_html_for_projector(html_excerpt)
+        if text:
+            slides.append((verse_ref, text, None, None))
+    if not slides:
+        raise ValueError("The API returned no readable verse text. Check the reference and API key.")
+    return slides
+
+
+def _nlt_item_from_slides(reference, version, slides):
+    return {
+        "type": "bible",
+        "ref_id": None,
+        "title": f"{reference} ({version})",
+        "slides": [{"ref": ref, "text": text} for ref, text, _text2, _ref2 in slides],
+    }
+
+
+def _render_nlt_slide_preview(slides, selected_index=0):
+    """Render operator-side previews using the same visual hierarchy as the projector."""
+    st.markdown("#### Slide Preview")
+    st.caption("These are the actual slides that will be sent to the projector. Each verse gets its own slide, matching the regular Bible presentation format.")
+    if not slides:
+        return
+    for i, (ref, text, _text2, _ref2) in enumerate(slides):
+        active = "box-shadow: 0 0 0 2px #C8A24A;" if i == selected_index else ""
+        safe_ref = re.sub(r"[<&>]", "", ref or "")
+        safe_text = re.sub(r"[<&>]", "", text or "").replace("\n", "<br>")
+        render_html(f"""<div style="margin:0 0 14px 0;border:1px solid {CARD_BORDER};border-radius:{RADIUS_MD};background:{BG};padding:28px 24px;min-height:170px;text-align:center;{active}">
+            <div style="font-size:0.9rem;font-weight:700;letter-spacing:.03em;color:{ACCENT};margin-bottom:20px;">{safe_ref}</div>
+            <div style="font-size:1.35rem;line-height:1.55;font-weight:600;color:{TEXT_PRIMARY};">{safe_text}</div>
+        </div>""")
+
+
 def page_nlt_bible_demo():
     st.markdown("### NLT Bible Demo")
-    st.caption("Live NLT lookup through the NLT API. The NLT text is fetched when you request a passage rather than imported into your local Bible database.")
-
+    st.caption("Live NLT lookup through the NLT API. The NLT text is fetched on demand and is not imported into your local Bible database.")
     api_key = _get_nlt_api_key()
     if not api_key:
         st.warning("NLT API is not configured yet. Add NLT_API_KEY to Streamlit Secrets, then reload the app.")
 
     left, right = st.columns([2.2, 1])
     with left:
-        reference = st.text_input(
-            "Bible reference",
-            value="John 3:16",
-            placeholder="John 3:16 or Genesis 1:1-3",
-            key="nlt_demo_reference",
-        )
+        reference = st.text_input("Bible reference", value="John 3:16", placeholder="John 3:16 or John 3:16-18", key="nlt_demo_reference")
     with right:
-        version = st.selectbox(
-            "Version",
-            ["NLT", "NLTUK", "NTV", "KJV"],
-            index=0,
-            key="nlt_demo_version",
-            help="NLT API versions documented by the API you provided.",
-        )
+        version = st.selectbox("Version", ["NLT", "NLTUK", "NTV", "KJV"], index=0, key="nlt_demo_version", help="NLT API versions documented by the API you provided.")
 
-    fetch_col, present_col = st.columns(2)
+    fetch_col, present_col, service_col = st.columns(3)
     with fetch_col:
         fetch = st.button("Fetch Passage", use_container_width=True, type="primary", disabled=not api_key)
     with present_col:
         present = st.button("▶ Present on Projector", use_container_width=True, disabled=not api_key)
+    with service_col:
+        add_service = st.button("＋ Add to Service", use_container_width=True, disabled=not api_key)
 
-    if (fetch or present) and reference.strip():
+    if (fetch or present or add_service) and reference.strip():
         try:
             with st.spinner("Fetching passage…"):
-                html_excerpt = _fetch_nlt_passage(reference.strip(), version, api_key)
-            clean_text = _strip_html_for_projector(html_excerpt)
-            if not clean_text:
-                st.warning("The API returned no readable passage text. Check the reference and API key.")
-                return
-
-            st.session_state["nlt_demo_last_html"] = html_excerpt
-            st.session_state["nlt_demo_last_text"] = clean_text
+                slides = _build_nlt_slides(reference.strip(), version, api_key)
+            item = _nlt_item_from_slides(reference.strip(), version, slides)
+            st.session_state["nlt_demo_slides"] = slides
+            st.session_state["nlt_demo_item"] = item
             st.session_state["nlt_demo_last_ref"] = reference.strip()
             st.session_state["nlt_demo_last_version"] = version
-
+            if add_service:
+                sid = ensure_active_service()
+                if not sid:
+                    st.warning("No active service yet — create one in Service Builder first.")
+                else:
+                    service = get_service(sid)
+                    items = json.loads(service["items"]) if service else []
+                    items.append(item)
+                    update_service_items(sid, items)
+                    st.toast(f"Added {reference.strip()} ({version}) to the active service.", icon="✅")
+                    st.rerun()
             if present:
-                slide_ref = f"{reference.strip()} · {version}"
-                present_adhoc_now([(slide_ref, clean_text, None, None)])
+                present_adhoc_now(slides)
                 st.toast(f"Presenting {reference.strip()} ({version})", icon="▶️")
                 st.rerun()
         except requests.HTTPError as e:
@@ -4304,22 +4357,31 @@ def page_nlt_bible_demo():
         except Exception as e:
             st.error(f"NLT lookup failed: {e}")
 
-    last_text = st.session_state.get("nlt_demo_last_text", "")
+    slides = st.session_state.get("nlt_demo_slides", [])
     last_ref = st.session_state.get("nlt_demo_last_ref", "")
     last_version = st.session_state.get("nlt_demo_last_version", "")
-    last_html = st.session_state.get("nlt_demo_last_html", "")
-
-    if last_text:
-        st.markdown("#### Retrieved passage")
-        st.markdown(f"**{last_ref} · {last_version}**")
-        from html import escape as _html_escape
-        safe_last_text = _html_escape(last_text).replace("\n", "<br>")
-        st.markdown(
-            f'<div class="ecc-card" style="font-size:1.15rem; line-height:1.7;">{safe_last_text}</div>',
-            unsafe_allow_html=True,
-        )
-        with st.expander("API response (HTML)"):
-            st.code(last_html, language="html")
+    if slides:
+        st.markdown(f"#### {last_ref} · {last_version}")
+        preview_index = st.number_input("Preview slide", min_value=1, max_value=len(slides), value=1, step=1, key="nlt_demo_preview_index")
+        _render_nlt_slide_preview(slides, selected_index=preview_index - 1)
+        pc1, pc2 = st.columns(2)
+        with pc1:
+            if st.button("▶ Present This Passage", use_container_width=True):
+                present_adhoc_now(slides)
+                st.toast(f"Presenting {last_ref} ({last_version})", icon="▶️")
+                st.rerun()
+        with pc2:
+            if st.button("＋ Add Passage to Service", use_container_width=True):
+                sid = ensure_active_service()
+                if not sid:
+                    st.warning("No active service yet — create one in Service Builder first.")
+                else:
+                    service = get_service(sid)
+                    items = json.loads(service["items"]) if service else []
+                    items.append(st.session_state.get("nlt_demo_item") or _nlt_item_from_slides(last_ref, last_version, slides))
+                    update_service_items(sid, items)
+                    st.toast(f"Added {last_ref} ({last_version}) to the active service.", icon="✅")
+                    st.rerun()
 
     st.write("")
     st.markdown("#### What to add to Streamlit Secrets")

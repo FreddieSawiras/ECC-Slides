@@ -587,6 +587,22 @@ BIBLE_TRANSLATION_LABEL = "KJV (Public Domain)"  # legacy label — used only to
 BIBLE_BOOK_NUMBERS = {"Psalm": 19, "John": 43, "Romans": 45, "Philippians": 50}
 BIBLE_NUMBER_TO_BOOK = {v: k for k, v in BIBLE_BOOK_NUMBERS.items()}
 
+# Standard chapter counts for all 66 books, keyed by the same canonical
+# 1-66 book number as LOCALIZED_BOOK_NAMES. This is just how many chapters
+# each book has (a structural fact, not copyrighted text) — it's what lets
+# the NLT tab offer a "pick a chapter" dropdown up front, before any text
+# has been fetched from the API, the same way the local Bible tab offers a
+# chapter dropdown backed by the imported database.
+BIBLE_CHAPTER_COUNTS = {
+    1: 50, 2: 40, 3: 27, 4: 36, 5: 34, 6: 24, 7: 21, 8: 4, 9: 31, 10: 24,
+    11: 22, 12: 25, 13: 29, 14: 36, 15: 10, 16: 13, 17: 10, 18: 42, 19: 150,
+    20: 31, 21: 12, 22: 8, 23: 66, 24: 52, 25: 5, 26: 48, 27: 12, 28: 14,
+    29: 3, 30: 9, 31: 1, 32: 4, 33: 7, 34: 3, 35: 3, 36: 3, 37: 2, 38: 14,
+    39: 4, 40: 28, 41: 16, 42: 24, 43: 21, 44: 28, 45: 16, 46: 16, 47: 13,
+    48: 6, 49: 6, 50: 4, 51: 4, 52: 5, 53: 3, 54: 6, 55: 4, 56: 3, 57: 1,
+    58: 13, 59: 5, 60: 5, 61: 3, 62: 5, 63: 1, 64: 1, 65: 1, 66: 22,
+}
+
 # Standard canonical book titles by language, keyed by the same 1-66 book
 # number used above. These are just conventional book titles (facts, not
 # copyrighted creative text — unlike the verse text itself), used so a
@@ -629,6 +645,22 @@ LOCALIZED_BOOK_NAMES = {
     63: {"en": "2 John", "ar": "يوحنا الثانية"}, 64: {"en": "3 John", "ar": "يوحنا الثالثة"},
     65: {"en": "Jude", "ar": "يهوذا"}, 66: {"en": "Revelation", "ar": "الرؤيا"},
 }
+
+# The 66 canonical book names in order — used as the book list for
+# API-backed translations (like NLT) that have no local table to read a
+# book list from. Local/imported translations keep reading their own book
+# list from the database, in whatever order they were imported in (see
+# get_bible_books); this is only the fallback list for API translations.
+BIBLE_CANONICAL_BOOKS = [LOCALIZED_BOOK_NAMES[i]["en"] for i in range(1, 67)]
+# Reverse lookup (English book name -> canonical 1-66 number), used to look
+# up chapter counts and to build the ref string the NLT API expects.
+BIBLE_BOOK_NUMBERS_BY_NAME = {LOCALIZED_BOOK_NAMES[i]["en"]: i for i in range(1, 67)}
+# And the other direction (canonical number -> English book name), covering
+# all 66 books — unlike the legacy BIBLE_NUMBER_TO_BOOK (built from the old
+# 4-book BIBLE_BOOK_NUMBERS sample map). Used when pairing NLT with a
+# secondary translation, to turn that translation's book_number back into
+# the English name NLT's API expects in its reference string.
+BIBLE_NUMBER_TO_BOOK_ALL = {i: LOCALIZED_BOOK_NAMES[i]["en"] for i in range(1, 67)}
 
 # ---------------------------------------------------------------------------
 # DATABASE
@@ -1781,7 +1813,7 @@ def make_song_item(song_row):
     }
 
 
-def localized_book_name(book, translation, sample_text=""):
+def localized_book_name(book, translation, sample_text="", book_number=None):
     """
     Pick the right-language heading for a book, using the canonical book
     number to cross-reference LOCALIZED_BOOK_NAMES — so the projector can
@@ -1789,8 +1821,16 @@ def localized_book_name(book, translation, sample_text=""):
     labeled that book "Genesis". Falls back to whatever name the source
     file used if there's no book number or no entry for the detected
     language.
+
+    book_number can be passed in directly when the caller already knows it
+    (e.g. from the PRIMARY translation, when looking up a heading for a
+    SECONDARY translation whose own book-name spelling — Arabic script, an
+    NLT-API English name, etc. — wouldn't resolve back to a book_number by
+    re-deriving it from `book` here). If omitted, it's looked up the normal
+    way via get_book_number(book, translation).
     """
-    book_number = get_book_number(book, translation)
+    if book_number is None:
+        book_number = get_book_number(book, translation)
     lang = "ar" if _looks_arabic(sample_text) else "en"
     names = LOCALIZED_BOOK_NAMES.get(book_number) if book_number else None
     return (names.get(lang) or book) if names else book
@@ -1807,7 +1847,14 @@ def _secondary_ref(book, chapter, verse_nums, translation, secondary_translation
     numbers to Arabic-Indic digits too.
     """
     sample = get_verse_in_translation(book, chapter, verse_nums[0], secondary_translation, book_number)
-    heading_book2 = localized_book_name(book, secondary_translation, sample)
+    # Pass the PRIMARY translation's book_number straight through instead of
+    # re-deriving it from `book` (the primary's own spelling of the book
+    # name) — re-deriving would look up get_book_number(book,
+    # secondary_translation), which fails whenever the two translations
+    # spell the book differently (e.g. primary is Arabic script, secondary
+    # is NLT's English "John"), silently leaving the secondary heading in
+    # the primary's language instead of its own.
+    heading_book2 = localized_book_name(book, secondary_translation, sample, book_number=book_number)
     if len(verse_nums) == 1:
         ref2 = f"{heading_book2} {chapter}:{verse_nums[0]}"
     else:
@@ -1876,10 +1923,19 @@ def make_announcement_item(title):
 # ---------------------------------------------------------------------------
 
 def get_bible_translations():
+    """Locally imported translations, plus the live NLT-API versions
+    appended at the end (only if an API key is configured — no point
+    offering them if they'll just fail on first use). NLT entries use their
+    display label (e.g. "NLT (via NLT API — live)") as the value everywhere
+    downstream; is_nlt_translation()/nlt version lookups unwrap that back to
+    the bare API version string ("NLT")."""
     conn = get_conn()
     rows = conn.execute("SELECT DISTINCT translation FROM bible_verses ORDER BY translation").fetchall()
     conn.close()
-    return [r["translation"] for r in rows] or [BIBLE_TRANSLATION_LABEL]
+    local = [r["translation"] for r in rows]
+    nlt_options = list(NLT_TRANSLATION_LABELS.values()) if _get_nlt_api_key() else []
+    combined = local + nlt_options
+    return combined or [BIBLE_TRANSLATION_LABEL]
 
 
 def delete_bible_translation(translation):
@@ -1898,6 +1954,11 @@ def delete_bible_translation(translation):
 
 
 def get_bible_books(translation=None):
+    if is_nlt_translation(translation):
+        # No local table to read from — the canonical 66-book list stands
+        # in as the book menu, same role get_bible_books plays for a local
+        # translation's radio list.
+        return BIBLE_CANONICAL_BOOKS
     conn = get_conn()
     if translation:
         rows = conn.execute(
@@ -1910,6 +1971,13 @@ def get_bible_books(translation=None):
 
 
 def get_bible_chapters(book, translation=None):
+    if is_nlt_translation(translation):
+        # Chapter count comes from the standard table (BIBLE_CHAPTER_COUNTS),
+        # not from any fetched text — so the chapter dropdown is available
+        # immediately, before a single API call has been made.
+        book_number = BIBLE_BOOK_NUMBERS_BY_NAME.get(book)
+        n = BIBLE_CHAPTER_COUNTS.get(book_number, 0)
+        return list(range(1, n + 1))
     conn = get_conn()
     if translation:
         rows = conn.execute(
@@ -1926,6 +1994,9 @@ def get_bible_chapters(book, translation=None):
 
 def get_bible_verses(book, chapter, translation=None):
     """Returns an ordered dict-like list of (verse_number, text)."""
+    if is_nlt_translation(translation):
+        version = NLT_LABEL_TO_VERSION[translation]
+        return get_nlt_chapter_verses(book, chapter, version)
     conn = get_conn()
     if translation:
         rows = conn.execute(
@@ -1948,6 +2019,11 @@ def get_verse_text(book, chapter, verse, translation=None):
 
 def get_book_number(book, translation):
     """Look up the canonical book_number stored against a book in a given translation."""
+    if is_nlt_translation(translation):
+        # NLT books are already named/ordered per BIBLE_CANONICAL_BOOKS, so
+        # the canonical number is a straight dictionary lookup — no table
+        # to query.
+        return BIBLE_BOOK_NUMBERS_BY_NAME.get(book)
     conn = get_conn()
     r = conn.execute(
         "SELECT book_number FROM bible_verses WHERE book=? AND translation=? AND book_number IS NOT NULL LIMIT 1",
@@ -1966,6 +2042,12 @@ def get_verse_in_translation(book, chapter, verse, translation, book_number=None
     translations use the same naming, e.g. two English translations).
     Returns "" if no match is found.
     """
+    if is_nlt_translation(translation):
+        version = NLT_LABEL_TO_VERSION[translation]
+        # book_number (canonical 1-66) maps straight back to the English
+        # book name NLT expects in its reference string.
+        nlt_book = BIBLE_NUMBER_TO_BOOK_ALL.get(book_number) if book_number is not None else book
+        return get_nlt_chapter_verses(nlt_book or book, chapter, version).get(verse, "")
     conn = get_conn()
     if book_number is not None:
         r = conn.execute(
@@ -1981,6 +2063,196 @@ def get_verse_in_translation(book, chapter, verse, translation, book_number=None
     ).fetchone()
     conn.close()
     return r["text"] if r else ""
+
+
+# ---------------------------------------------------------------------------
+# NLT API — live-lookup translation, integrated into the regular Bible tab
+# ---------------------------------------------------------------------------
+# Unlike an imported translation (rows sitting in the local bible_verses
+# table), NLT has no local text at all — every chapter is fetched from the
+# NLT API on demand. To let the operator select Book → Chapter → Verse the
+# same way as any local translation (instead of typing a reference like
+# "Matthew 3:3-14"), _fetch_nlt_chapter() below fetches the WHOLE chapter in
+# one request and parses out each individual verse, then get_bible_verses()
+# is taught to hand that back in the exact same {verse_num: text} shape a
+# local translation returns. Everything downstream — the book radio, the
+# chapter dropdown, the verse checkboxes, "Present Now", "Add to Service",
+# staging — is then literally the same code path as any other translation.
+
+NLT_API_VERSIONS = ["NLT", "NLTUK", "NTV", "KJV"]  # versions documented by the NLT API
+NLT_TRANSLATION_LABELS = {v: f"{v} (via NLT API — live)" for v in NLT_API_VERSIONS}
+NLT_LABEL_TO_VERSION = {label: v for v, label in NLT_TRANSLATION_LABELS.items()}
+
+
+def is_nlt_translation(translation):
+    """True if `translation` is one of the live NLT-API-backed entries in the
+    Translation dropdown, rather than a locally imported translation."""
+    return translation in NLT_LABEL_TO_VERSION
+
+
+def _get_nlt_api_key():
+    """Read the NLT API license key from Streamlit secrets or an environment variable."""
+    try:
+        return (st.secrets.get("NLT_API_KEY") or os.environ.get("NLT_API_KEY") or "").strip()
+    except Exception:
+        return os.environ.get("NLT_API_KEY", "").strip()
+
+
+def _strip_balanced_span(text, class_name):
+    """Remove every <span class="{class_name}">...</span> block ENTIRELY —
+    the opening tag, everything inside it, and its true matching closing
+    tag — tracking nesting depth across any <span>/</span> pairs found
+    along the way. This is needed because the NLT API's footnote span is
+    itself NESTED (<span class="tn"><span class="tn-ref">3:16</span> Or
+    ...</span>): a plain non-greedy regex like <span class="tn">.*?</span>
+    stops at the FIRST </span> it sees, which is the inner tn-ref span's
+    closing tag, not the outer footnote's — that under-matches and leaves
+    the footnote's actual wording sitting in the verse text. Walking the
+    depth by hand instead finds the real matching close, so the whole
+    footnote (reference + note text) comes out together."""
+    open_re = re.compile(rf'<span\s+class="{re.escape(class_name)}"[^>]*>', re.I)
+    tag_re = re.compile(r'</span\s*>|<span\b[^>]*>', re.I)
+    out = []
+    pos = 0
+    while True:
+        m = open_re.search(text, pos)
+        if not m:
+            out.append(text[pos:])
+            break
+        out.append(text[pos:m.start()])
+        depth = 1
+        cursor = m.end()
+        while depth > 0:
+            tm = tag_re.search(text, cursor)
+            if not tm:
+                cursor = len(text)  # unbalanced/malformed — drop the remainder as content removed
+                break
+            depth += -1 if tm.group(0).lower().startswith("</span") else 1
+            cursor = tm.end()
+        pos = cursor
+    return "".join(out)
+
+
+def _strip_nlt_html_to_verse_text(html):
+    """Convert one verse's NLT API HTML into clean plain text, formatted to
+    match a plain locally-imported translation (e.g. a KJV JSON dump) as
+    closely as possible — just the verse's words, nothing else:
+      - The verse-number marker (<span class="vn">16</span>) is removed
+        entirely, tag AND its number text — a local import's verse text
+        never repeats its own verse number inline, so NLT's shouldn't either.
+      - Footnote markers/content (<a class="a-tn">*</a> and the whole
+        <span class="tn">...</span> footnote body it points to — the actual
+        footnote wording, not just its tags) are dropped completely, not
+        just un-tagged — otherwise footnote text like "Or For God loved the
+        world so much that he gave." would leak into the middle of the
+        verse as if it were part of it.
+      - Red-letter/formatting wrapper tags (<span class="red">, <em>, etc.)
+        are unwrapped, keeping their text (Jesus's words are still part of
+        the verse) but dropping the styling markup itself, since the
+        projector applies its own styling.
+      - Curly quotes/apostrophes and other typographic punctuation are
+        normalized to plain ASCII, matching the plain-text style of typical
+        public-domain Bible JSON dumps (straight quotes, not curly ones).
+    """
+    if not html:
+        return ""
+    text = html
+    # Remove scripts/styles outright.
+    text = re.sub(r"<\s*(script|style)[^>]*>.*?<\s*/\s*\1\s*>", "", text, flags=re.I | re.S)
+    # Drop the verse-number marker completely (tag + its digit content) —
+    # done BEFORE the generic tag-stripper below so the digits never reach
+    # the plain-text stage and glue onto the next word.
+    text = re.sub(r'<span\s+class="vn">\s*\d+\s*</span>', "", text, flags=re.I)
+    # Drop footnote markers and their full content — the "*" callout link
+    # AND the footnote body it points to (reference + note text, handled
+    # with proper nesting via _strip_balanced_span — see its docstring for
+    # why a plain regex under-matches here), since a footnote is not part
+    # of the verse itself.
+    text = re.sub(r'<a\s+class="a-tn"[^>]*>.*?</a>', "", text, flags=re.I | re.S)
+    text = _strip_balanced_span(text, "tn")
+    # Block/line tags become newlines before the rest is stripped.
+    text = re.sub(r"<\s*(br|/p|/div|/li|/h[1-6])\s*/?\s*>", "\n", text, flags=re.I)
+    text = re.sub(r"<li[^>]*>", "", text, flags=re.I)
+    # Every remaining tag (red-letter spans, <em>, <p class="body">, etc.)
+    # is unwrapped — its text stays, the markup goes.
+    text = re.sub(r"<[^>]+>", "", text)
+    try:
+        import html as _html
+        text = _html.unescape(text)
+    except Exception:
+        pass
+    # Normalize typographic punctuation to plain ASCII, matching the plain
+    # style of a typical local Bible JSON import.
+    text = (text.replace("\u2018", "'").replace("\u2019", "'")
+                .replace("\u201c", '"').replace("\u201d", '"')
+                .replace("\u2013", "-").replace("\u2014", "-")
+                .replace("\u00a0", " "))
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r" *\n *", "\n", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _fetch_nlt_passage_html(ref, version, api_key):
+    """Fetch one NLT API passage/chapter. Returns the API's raw HTML.
+    Cached for an hour (keyed on ref+version) so picking the same chapter
+    again in the same session — or letting several people jump to a popular
+    verse — doesn't re-hit the network every time."""
+    url = "https://api.nlt.to/api/passages"
+    response = requests.get(
+        url,
+        params={"ref": ref, "version": version, "key": api_key},
+        timeout=15,
+    )
+    response.raise_for_status()
+    return response.text
+
+
+def _parse_nlt_chapter_html(html_excerpt):
+    """Split one NLT API chapter response into {verse_num: text}, using the
+    API's own <verse_export ... vn="16"> markers to find where each verse
+    starts — so this works for any chapter without needing to already know
+    how many verses it has. Falls back to an empty dict if the markers
+    aren't found (e.g. an unexpected response shape)."""
+    if not html_excerpt:
+        return {}
+    verse_starts = list(re.finditer(r'<verse_export\b[^>]*\bvn="(\d+)"[^>]*>', html_excerpt, flags=re.I))
+    verses = {}
+    for i, m in enumerate(verse_starts):
+        vnum = int(m.group(1))
+        start = m.end()
+        end = verse_starts[i + 1].start() if i + 1 < len(verse_starts) else len(html_excerpt)
+        chunk = html_excerpt[start:end]
+        chunk = re.sub(r"</verse_export>", "", chunk, flags=re.I)
+        text = _strip_nlt_html_to_verse_text(chunk)
+        if text:
+            verses[vnum] = text
+    return verses
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _fetch_nlt_chapter_cached(book, chapter, version, api_key):
+    """Fetch + parse one whole chapter, cached together so repeat visits to
+    the same book/chapter/version this session are instant. Returns
+    {verse_num: text}, or raises on a network/API error (caller shows it)."""
+    html_excerpt = _fetch_nlt_passage_html(f"{book} {chapter}", version, api_key)
+    return _parse_nlt_chapter_html(html_excerpt)
+
+
+def get_nlt_chapter_verses(book, chapter, version):
+    """Same shape/contract as get_bible_verses(), but for a live NLT-API
+    version. Returns {} (instead of raising) if the API key is missing or
+    the request fails — callers already show "no verses" the same way they
+    would for an empty local chapter, so no separate error path is needed
+    on the selection UI itself."""
+    api_key = _get_nlt_api_key()
+    if not api_key:
+        return {}
+    try:
+        return _fetch_nlt_chapter_cached(book, chapter, version, api_key)
+    except Exception:
+        return {}
 
 
 def parse_bible_reference(text, translation):
@@ -3848,7 +4120,7 @@ def sidebar():
         for label in ["Dashboard", "Service Builder", "Presentation"]:
             nav_button(label)
         st.markdown("###### LIBRARY")
-        for label in ["Song Library", "Import Slides", "Bible", "NLT Bible Demo", "Saved Services"]:
+        for label in ["Song Library", "Import Slides", "Bible", "Saved Services"]:
             nav_button(label)
         st.markdown("###### SETTINGS")
         for label in ["Church Settings", "Display Settings", "Database"]:
@@ -4205,191 +4477,6 @@ def page_song_workspace():
 
 
 
-def _get_nlt_api_key():
-    """Read the NLT API license key from Streamlit secrets or an environment variable."""
-    try:
-        return (st.secrets.get("NLT_API_KEY") or os.environ.get("NLT_API_KEY") or "").strip()
-    except Exception:
-        return os.environ.get("NLT_API_KEY", "").strip()
-
-
-def _strip_html_for_projector(html):
-    """Convert the NLT API's HTML excerpt into clean plain text for slides."""
-    if not html:
-        return ""
-    # The API returns HTML. Decode entities first, remove scripts/styles, then
-    # turn common block/line tags into newlines before stripping the rest.
-    text = re.sub(r"<\s*(script|style)[^>]*>.*?<\s*/\s*\1\s*>", "", html, flags=re.I | re.S)
-    text = re.sub(r"<\s*(br|/p|/div|/li|/h[1-6])\s*/?\s*>", "\n", text, flags=re.I)
-    text = re.sub(r"<li[^>]*>", "", text, flags=re.I)
-    text = re.sub(r"<[^>]+>", "", text)
-    text = re.sub(r"[ \t]+", " ", text)
-    text = re.sub(r"\n{3,}", "\n\n", text)
-    try:
-        import html as _html
-        text = _html.unescape(text)
-    except Exception:
-        pass
-    return text.strip()
-
-
-@st.cache_data(ttl=60, show_spinner=False)
-def _fetch_nlt_passage(ref, version, api_key):
-    """Fetch one NLT API passage. Returns the API's HTML excerpt."""
-    url = "https://api.nlt.to/api/passages"
-    response = requests.get(
-        url,
-        params={"ref": ref, "version": version, "key": api_key},
-        timeout=15,
-    )
-    response.raise_for_status()
-    return response.text
-
-
-def _parse_nlt_reference(reference):
-    """Parse a simple NLT reference into book, chapter, first verse, last verse."""
-    cleaned = re.sub(r"\s+", " ", (reference or "").strip())
-    m = re.match(r"^(.+?)\s+(\d+):(\d+)(?:\s*[-–]\s*(\d+))?$", cleaned)
-    if not m:
-        return None
-    book = m.group(1).strip()
-    chapter = int(m.group(2))
-    first_verse = int(m.group(3))
-    last_verse = int(m.group(4) or first_verse)
-    if last_verse < first_verse:
-        return None
-    return book, chapter, first_verse, last_verse
-
-
-def _build_nlt_slides(reference, version, api_key):
-    """Fetch NLT and turn it into the same ref/text slide shape used by Bible."""
-    parsed = _parse_nlt_reference(reference)
-    if not parsed:
-        raise ValueError("Use a reference like John 3:16 or John 3:16-18.")
-    book, chapter, first_verse, last_verse = parsed
-    slides = []
-    for verse in range(first_verse, last_verse + 1):
-        verse_ref = f"{book} {chapter}:{verse}"
-        html_excerpt = _fetch_nlt_passage(verse_ref, version, api_key)
-        text = _strip_html_for_projector(html_excerpt)
-        if text:
-            slides.append((verse_ref, text, None, None))
-    if not slides:
-        raise ValueError("The API returned no readable verse text. Check the reference and API key.")
-    return slides
-
-
-def _nlt_item_from_slides(reference, version, slides):
-    return {
-        "type": "bible",
-        "ref_id": None,
-        "title": f"{reference} ({version})",
-        "slides": [{"ref": ref, "text": text} for ref, text, _text2, _ref2 in slides],
-    }
-
-
-def _render_nlt_slide_preview(slides, selected_index=0):
-    """Render operator-side previews using the same visual hierarchy as the projector."""
-    st.markdown("#### Slide Preview")
-    st.caption("These are the actual slides that will be sent to the projector. Each verse gets its own slide, matching the regular Bible presentation format.")
-    if not slides:
-        return
-    for i, (ref, text, _text2, _ref2) in enumerate(slides):
-        active = "box-shadow: 0 0 0 2px #C8A24A;" if i == selected_index else ""
-        safe_ref = re.sub(r"[<&>]", "", ref or "")
-        safe_text = re.sub(r"[<&>]", "", text or "").replace("\n", "<br>")
-        render_html(f"""<div style="margin:0 0 14px 0;border:1px solid {CARD_BORDER};border-radius:{RADIUS_MD};background:{BG};padding:28px 24px;min-height:170px;text-align:center;{active}">
-            <div style="font-size:0.9rem;font-weight:700;letter-spacing:.03em;color:{ACCENT};margin-bottom:20px;">{safe_ref}</div>
-            <div style="font-size:1.35rem;line-height:1.55;font-weight:600;color:{TEXT_PRIMARY};">{safe_text}</div>
-        </div>""")
-
-
-def page_nlt_bible_demo():
-    st.markdown("### NLT Bible Demo")
-    st.caption("Live NLT lookup through the NLT API. The NLT text is fetched on demand and is not imported into your local Bible database.")
-    api_key = _get_nlt_api_key()
-    if not api_key:
-        st.warning("NLT API is not configured yet. Add NLT_API_KEY to Streamlit Secrets, then reload the app.")
-
-    left, right = st.columns([2.2, 1])
-    with left:
-        reference = st.text_input("Bible reference", value="John 3:16", placeholder="John 3:16 or John 3:16-18", key="nlt_demo_reference")
-    with right:
-        version = st.selectbox("Version", ["NLT", "NLTUK", "NTV", "KJV"], index=0, key="nlt_demo_version", help="NLT API versions documented by the API you provided.")
-
-    fetch_col, present_col, service_col = st.columns(3)
-    with fetch_col:
-        fetch = st.button("Fetch Passage", use_container_width=True, type="primary", disabled=not api_key)
-    with present_col:
-        present = st.button("▶ Present on Projector", use_container_width=True, disabled=not api_key)
-    with service_col:
-        add_service = st.button("＋ Add to Service", use_container_width=True, disabled=not api_key)
-
-    if (fetch or present or add_service) and reference.strip():
-        try:
-            with st.spinner("Fetching passage…"):
-                slides = _build_nlt_slides(reference.strip(), version, api_key)
-            item = _nlt_item_from_slides(reference.strip(), version, slides)
-            st.session_state["nlt_demo_slides"] = slides
-            st.session_state["nlt_demo_item"] = item
-            st.session_state["nlt_demo_last_ref"] = reference.strip()
-            st.session_state["nlt_demo_last_version"] = version
-            if add_service:
-                sid = ensure_active_service()
-                if not sid:
-                    st.warning("No active service yet — create one in Service Builder first.")
-                else:
-                    service = get_service(sid)
-                    items = json.loads(service["items"]) if service else []
-                    items.append(item)
-                    update_service_items(sid, items)
-                    st.toast(f"Added {reference.strip()} ({version}) to the active service.", icon="✅")
-                    st.rerun()
-            if present:
-                present_adhoc_now(slides)
-                st.toast(f"Presenting {reference.strip()} ({version})", icon="▶️")
-                st.rerun()
-        except requests.HTTPError as e:
-            status = e.response.status_code if e.response is not None else "unknown"
-            st.error(f"NLT API request failed (HTTP {status}). Check your API key, reference, and API access.")
-        except requests.RequestException as e:
-            st.error(f"Could not reach the NLT API: {e}")
-        except Exception as e:
-            st.error(f"NLT lookup failed: {e}")
-
-    slides = st.session_state.get("nlt_demo_slides", [])
-    last_ref = st.session_state.get("nlt_demo_last_ref", "")
-    last_version = st.session_state.get("nlt_demo_last_version", "")
-    if slides:
-        st.markdown(f"#### {last_ref} · {last_version}")
-        preview_index = st.number_input("Preview slide", min_value=1, max_value=len(slides), value=1, step=1, key="nlt_demo_preview_index")
-        _render_nlt_slide_preview(slides, selected_index=preview_index - 1)
-        pc1, pc2 = st.columns(2)
-        with pc1:
-            if st.button("▶ Present This Passage", use_container_width=True):
-                present_adhoc_now(slides)
-                st.toast(f"Presenting {last_ref} ({last_version})", icon="▶️")
-                st.rerun()
-        with pc2:
-            if st.button("＋ Add Passage to Service", use_container_width=True):
-                sid = ensure_active_service()
-                if not sid:
-                    st.warning("No active service yet — create one in Service Builder first.")
-                else:
-                    service = get_service(sid)
-                    items = json.loads(service["items"]) if service else []
-                    items.append(st.session_state.get("nlt_demo_item") or _nlt_item_from_slides(last_ref, last_version, slides))
-                    update_service_items(sid, items)
-                    st.toast(f"Added {last_ref} ({last_version}) to the active service.", icon="✅")
-                    st.rerun()
-
-    st.write("")
-    st.markdown("#### What to add to Streamlit Secrets")
-    st.caption("Copy this into `.streamlit/secrets.toml` locally, or into your Streamlit Cloud app Secrets. Replace the placeholder with the NLT API license key you were issued.")
-    st.code('NLT_API_KEY = "PASTE_YOUR_NLT_API_KEY_HERE"', language="toml")
-    st.caption("Do not put the real key directly in app.py or commit your secrets.toml file to GitHub.")
-
-
 def page_bible():
     st.markdown("### Bible")
 
@@ -4411,27 +4498,47 @@ def page_bible():
                                  help="Shows a second translation stacked underneath the first on the projector — e.g. Arabic on top, English on the bottom.")
     secondary_translation = None
     if bilingual:
-        other_options = [t for t in translations if t != translation] or translations
+        # Two live NLT-API versions paired together isn't offered as a
+        # secondary option — it would double the API calls behind every
+        # single verse pick for a pairing nobody's asked for. NLT can still
+        # be the PRIMARY translation and paired with any locally imported
+        # one (or vice versa); only "NLT + another live NLT version" is
+        # excluded here.
+        if is_nlt_translation(translation):
+            other_options = [t for t in translations if t != translation and not is_nlt_translation(t)]
+        else:
+            other_options = [t for t in translations if t != translation]
+        other_options = other_options or [t for t in translations if t != translation] or translations
         secondary_translation = st.selectbox("Second translation (shown on the bottom half)", other_options, key="bible_secondary_translation")
     st.caption(f"Browsing {translation}" + (f" · paired with {secondary_translation}" if secondary_translation else "") +
                ". Import more (public-domain or licensed) in Church Settings.")
 
-    with st.form("bible_jump_form"):
-        jc1, jc2 = st.columns([4, 1])
-        jump_text = jc1.text_input("Quick jump", placeholder='e.g. "John 3:16" or "Genesis 1:1-3"',
-                                    label_visibility="collapsed")
-        jump_go = jc2.form_submit_button("Go →", use_container_width=True)
-    if jump_go and jump_text.strip():
-        parsed = parse_bible_reference(jump_text, translation)
-        if parsed:
-            jb, jc, jverses = parsed
-            st.session_state.bible_book = jb
-            st.session_state.bible_chapter = jc
-            st.session_state.bible_nav_key = (jb, jc, translation)
-            st.session_state.bible_selected_verses = jverses
-            st.rerun()
-        else:
-            st.warning(f"Couldn't find \"{jump_text}\" — try a format like \"Book Chapter:Verse\".")
+    using_nlt = is_nlt_translation(translation)
+    if using_nlt and not _get_nlt_api_key():
+        st.warning("NLT API is not configured yet. Add NLT_API_KEY to Streamlit Secrets, then reload the app.")
+        return
+
+    # The typed "Quick jump" search only applies to locally imported
+    # translations — for NLT the whole point is picking chapter, then
+    # verse, with no reference-typing involved, so the box is left out
+    # entirely rather than shown-but-broken.
+    if not using_nlt:
+        with st.form("bible_jump_form"):
+            jc1, jc2 = st.columns([4, 1])
+            jump_text = jc1.text_input("Quick jump", placeholder='e.g. "John 3:16" or "Genesis 1:1-3"',
+                                        label_visibility="collapsed")
+            jump_go = jc2.form_submit_button("Go →", use_container_width=True)
+        if jump_go and jump_text.strip():
+            parsed = parse_bible_reference(jump_text, translation)
+            if parsed:
+                jb, jc, jverses = parsed
+                st.session_state.bible_book = jb
+                st.session_state.bible_chapter = jc
+                st.session_state.bible_nav_key = (jb, jc, translation)
+                st.session_state.bible_selected_verses = jverses
+                st.rerun()
+            else:
+                st.warning(f"Couldn't find \"{jump_text}\" — try a format like \"Book Chapter:Verse\".")
 
     books = get_bible_books(translation)
     if not books:
@@ -4447,7 +4554,6 @@ def page_bible():
         chapters = get_bible_chapters(book, translation)
         st.markdown("**Chapter**")
         chapter = st.selectbox("Chapter", chapters, key="bible_chapter", label_visibility="collapsed")
-        verses = get_bible_verses(book, chapter, translation)
 
         # If book/chapter/translation changed since the selection was made,
         # old verse numbers might not exist in this new set at all — that
@@ -4458,7 +4564,19 @@ def page_bible():
             st.session_state.bible_nav_key = nav_key
             st.session_state.bible_selected_verses = []
 
+        # For NLT, fetching a chapter is a live network call — show a
+        # spinner so picking a chapter doesn't look like it silently did
+        # nothing while the request is in flight (locally imported
+        # translations resolve this instantly, so no spinner needed there).
+        if using_nlt:
+            with st.spinner(f"Fetching {book} {chapter}…"):
+                verses = get_bible_verses(book, chapter, translation)
+        else:
+            verses = get_bible_verses(book, chapter, translation)
+
         st.markdown("**Verses**")
+        if using_nlt and not verses:
+            st.caption("Couldn't load this chapter from the NLT API. Check your connection or API key and try again.")
         chosen = st.session_state.setdefault("bible_selected_verses", [])
         for vnum, text in verses.items():
             checked = vnum in chosen
@@ -4495,7 +4613,7 @@ def page_bible():
                 if secondary_translation:
                     st.caption("↳ " + get_verse_in_translation(book, chapter, v, secondary_translation, book_number))
         else:
-            st.caption("Select verses on the left.")
+            st.caption("Select a chapter, then tap verses on the left.")
 
         combine = st.checkbox(
             "Combine into one slide", value=True, key="bible_combine",
@@ -5699,7 +5817,10 @@ def page_church_settings():
 
     st.write("")
     st.markdown("#### Delete a Translation")
-    existing_translations = get_bible_translations()
+    # Only locally imported translations are listed here — the live
+    # NLT-API entries (e.g. "KJV (via NLT API — live)") aren't rows in this
+    # database at all, so there's nothing here to delete for them.
+    existing_translations = [t for t in get_bible_translations() if not is_nlt_translation(t)]
     if not existing_translations:
         st.caption("No translations imported yet.")
     else:
@@ -6070,7 +6191,6 @@ def main():
         "Dashboard": page_dashboard,
         "Song Workspace": page_song_workspace,
         "Bible": page_bible,
-        "NLT Bible Demo": page_nlt_bible_demo,
         "Service Builder": page_service_builder,
         "Presentation": page_presentation,
         "Song Library": page_song_library,
@@ -6269,11 +6389,15 @@ def _apply_meeting_bible_default(meeting):
     Bible (if one has been imported). Matching is by translation name
     (loose, case-insensitive), since translation names are whatever the
     operator typed in when importing them, not a fixed set of choices.
-    Only sets bible_translation in session_state — st.selectbox with
-    key="bible_translation" then picks it up as its initial value the
-    next time the Bible page renders. Silently does nothing if no
-    matching translation has been imported yet."""
-    translations = get_bible_translations()
+    Only ever matches a LOCALLY IMPORTED translation, never a live
+    NLT-API entry (e.g. "KJV (via NLT API — live)") — a meeting default is
+    something the operator expects to just work with no network dependency,
+    so this never silently switches someone onto a live lookup that could
+    fail mid-service. Only sets bible_translation in session_state —
+    st.selectbox with key="bible_translation" then picks it up as its
+    initial value the next time the Bible page renders. Silently does
+    nothing if no matching local translation has been imported yet."""
+    translations = [t for t in get_bible_translations() if not is_nlt_translation(t)]
     if not translations:
         return
     if meeting == "Sanctuary Arabic":

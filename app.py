@@ -4738,8 +4738,18 @@ def page_bible():
                 jb, jc, jverses = parsed
                 st.session_state.bible_book = jb
                 st.session_state.bible_chapter = jc
-                st.session_state.bible_nav_key = (jb, jc, translation)
-                st.session_state.bible_selected_verses = jverses
+                # Merge in — replacing only this book/chapter's own prior
+                # picks, if any — rather than wiping out selections already
+                # made elsewhere (e.g. a verse picked in a different book),
+                # matching the "picks from different books/chapters all
+                # stay selected together" behavior below.
+                existing = st.session_state.get("bible_selected_verses", [])
+                if st.session_state.get("bible_selection_translation") != translation:
+                    existing = []
+                existing = [t for t in existing if t[:2] != (jb, jc)]
+                existing.extend((jb, jc, v) for v in jverses)
+                st.session_state.bible_selection_translation = translation
+                st.session_state.bible_selected_verses = existing
                 st.rerun()
             else:
                 st.warning(f"Couldn't find \"{jump_text}\" — try a format like \"Book Chapter:Verse\".")
@@ -4750,6 +4760,19 @@ def page_bible():
         return
     left, center, right = st.columns([1, 1.3, 1.3])
 
+    # --- Cross-book/cross-chapter verse selection -----------------------
+    # Selections are stored as (book, chapter, verse) triples, not bare
+    # verse numbers — so picking a verse in Genesis and then a different
+    # verse in Psalms keeps BOTH, instead of Psalms silently wiping out
+    # Genesis's pick. The only thing that still clears the whole selection
+    # is switching TRANSLATION (a triple's verse text depends on which
+    # translation it was picked in, so carrying triples across a
+    # translation switch could silently show the wrong text) — switching
+    # book or chapter no longer clears anything.
+    if st.session_state.get("bible_selection_translation") != translation:
+        st.session_state["bible_selection_translation"] = translation
+        st.session_state["bible_selected_verses"] = []
+
     with left:
         st.markdown("**Books**")
         book = st.radio("Books", books, label_visibility="collapsed", key="bible_book")
@@ -4758,15 +4781,6 @@ def page_bible():
         chapters = get_bible_chapters(book, translation)
         st.markdown("**Chapter**")
         chapter = st.selectbox("Chapter", chapters, key="bible_chapter", label_visibility="collapsed")
-
-        # If book/chapter/translation changed since the selection was made,
-        # old verse numbers might not exist in this new set at all — that
-        # mismatch is what caused the KeyError crash. Clear the stale
-        # selection instead of trying to carry it across.
-        nav_key = (book, chapter, translation)
-        if st.session_state.get("bible_nav_key") != nav_key:
-            st.session_state.bible_nav_key = nav_key
-            st.session_state.bible_selected_verses = []
 
         # For NLT, fetching a chapter is a live network call — show a
         # spinner so picking a chapter doesn't look like it silently did
@@ -4783,15 +4797,16 @@ def page_bible():
             st.caption("Couldn't load this chapter from the NLT API. Check your connection or API key and try again.")
         chosen = st.session_state.setdefault("bible_selected_verses", [])
         for vnum, text in verses.items():
-            checked = vnum in chosen
+            triple = (book, chapter, vnum)
+            checked = triple in chosen
             vcol, pcol = st.columns([0.87, 0.13])
             with vcol:
                 if st.checkbox(f"{vnum}. {text}", value=checked, key=f"v_{book}_{chapter}_{vnum}"):
-                    if vnum not in chosen:
-                        chosen.append(vnum)
+                    if triple not in chosen:
+                        chosen.append(triple)
                 else:
-                    if vnum in chosen:
-                        chosen.remove(vnum)
+                    if triple in chosen:
+                        chosen.remove(triple)
             with pcol:
                 # One click, no service needed — builds the same slide shape
                 # a service item would use and pushes it straight to the
@@ -4805,22 +4820,45 @@ def page_bible():
 
     with right:
         st.markdown("**Selected**")
-        # Only keep verse numbers that actually exist in the currently
-        # displayed chapter — belt-and-suspenders alongside the nav_key
-        # reset above, in case selection state gets out of sync some other way.
-        chosen_sorted = sorted(v for v in st.session_state.get("bible_selected_verses", []) if v in verses)
-        book_number = get_book_number(book, translation) if secondary_translation else None
-        if chosen_sorted:
-            for v in chosen_sorted:
-                st.markdown(f"**{book} {chapter}:{v}**")
-                st.caption(verses.get(v, ""))
-                if secondary_translation:
-                    st.caption("↳ " + get_verse_in_translation(book, chapter, v, secondary_translation, book_number))
+        # Group the (book, chapter, verse) triples by (book, chapter) so
+        # every selection across every book/chapter is shown — not just
+        # whatever's currently on screen in the center column — in the
+        # same order the groups were first picked in.
+        all_chosen = st.session_state.get("bible_selected_verses", [])
+        groups_order = []
+        groups = {}
+        for b, c, v in all_chosen:
+            key = (b, c)
+            if key not in groups:
+                groups[key] = []
+                groups_order.append(key)
+            groups[key].append(v)
+        for key in groups_order:
+            groups[key].sort()
+
+        if groups_order:
+            for (b, c) in groups_order:
+                group_verses = groups[(b, c)]
+                # Only look up the actual verse text for the group that
+                # matches what's currently displayed in the center column
+                # (`verses`, already fetched above) — fetching every other
+                # selected chapter's text too, just to show a preview here,
+                # would mean extra NLT API calls on every single rerun.
+                group_verse_texts = verses if (b, c) == (book, chapter) else get_bible_verses(b, c, translation)
+                for v in group_verses:
+                    st.markdown(f"**{b} {c}:{v}**")
+                    st.caption(group_verse_texts.get(v, ""))
+                    if secondary_translation:
+                        gbn = get_book_number(b, translation)
+                        st.caption("↳ " + get_verse_in_translation(b, c, v, secondary_translation, gbn))
         else:
-            st.caption("Select a chapter, then tap verses on the left.")
+            st.caption("Select a chapter, then tap verses on the left. Picks from different books or chapters all stay selected together.")
 
         if "bible_combine_mode_saved" not in st.session_state:
-            st.session_state["bible_combine_mode_saved"] = "Combine into one slide"
+            # Matches _apply_meeting_bible_default's per-meeting default —
+            # this fallback only matters for a session that somehow reaches
+            # the Bible page without ever going through meeting selection.
+            st.session_state["bible_combine_mode_saved"] = "One slide per verse"
         combine_mode_options = ["One slide per verse", "Combine into one slide", "Max words per slide"]
         combine_mode = st.radio(
             "Slide layout", combine_mode_options,
@@ -4828,7 +4866,9 @@ def page_bible():
             key="bible_combine_mode",
             help="\"Max words per slide\" packs verses onto as few slides as possible without going over "
                  "the word limit, and never splits a single verse across two slides — a verse longer than "
-                 "the limit still gets a whole slide to itself.",
+                 "the limit still gets a whole slide to itself. Combining or word-limiting only groups "
+                 "verses together within the SAME book/chapter — a selection spanning multiple books or "
+                 "chapters always gets one slide (or slide-group) per book/chapter, never merged across them.",
         )
         st.session_state["bible_combine_mode_saved"] = combine_mode
         max_words = None
@@ -4847,23 +4887,33 @@ def page_bible():
         st.write("")
         scol1, scol2 = st.columns(2)
         with scol1:
-            if st.button("▶ Present Now", disabled=not chosen_sorted, use_container_width=True,
+            if st.button("▶ Present Now", disabled=not groups_order, use_container_width=True,
                          help="Show these verses on the projector immediately — no service needed."):
-                item = make_bible_item(book, chapter, chosen_sorted, translation, secondary_translation,
-                                        combine=combine, max_words_per_slide=max_words)
-                present_adhoc_now(item_slides(item))
-                label = f"{book} {chapter}:{chosen_sorted[0]}" + (f"-{chosen_sorted[-1]}" if len(chosen_sorted) > 1 else "")
+                all_slides = []
+                for (b, c) in groups_order:
+                    item = make_bible_item(b, c, groups[(b, c)], translation, secondary_translation,
+                                            combine=combine, max_words_per_slide=max_words)
+                    all_slides.extend(item_slides(item))
+                present_adhoc_now(all_slides)
+                if len(groups_order) == 1:
+                    b, c = groups_order[0]
+                    vs = groups[(b, c)]
+                    label = f"{b} {c}:{vs[0]}" + (f"-{vs[-1]}" if len(vs) > 1 else "")
+                else:
+                    label = f"{len(groups_order)} passages"
                 st.session_state.bible_selected_verses = []
                 st.toast(f"Presenting {label}")
                 st.rerun()
         with scol2:
-            if st.button("+ Add to Service", disabled=not chosen_sorted, use_container_width=True):
+            if st.button("+ Add to Service", disabled=not groups_order, use_container_width=True):
                 st.session_state.setdefault("bible_staging", [])
-                st.session_state.bible_staging.append(
-                    (book, chapter, tuple(chosen_sorted), translation, secondary_translation, combine, max_words)
-                )
+                for (b, c) in groups_order:
+                    st.session_state.bible_staging.append(
+                        (b, c, tuple(groups[(b, c)]), translation, secondary_translation, combine, max_words)
+                    )
                 st.session_state.bible_selected_verses = []
-                st.toast("Added to staging — attach it in Service Builder.", icon="✅")
+                n = len(groups_order)
+                st.toast(f"Added {n} passage{'s' if n != 1 else ''} to staging — attach {'them' if n != 1 else 'it'} in Service Builder.", icon="✅")
                 st.rerun()
 
         staging = st.session_state.get("bible_staging", [])
@@ -6674,22 +6724,43 @@ def _find_translation_by_hint(translations, hints):
 
 
 def _apply_meeting_bible_default(meeting):
-    """Sets the default Bible translation for the session based on which
-    meeting was just picked: Sanctuary Arabic -> the Van Dyke Arabic Bible
-    (if one has been imported), any other meeting -> the KJV English
-    Bible (if one has been imported). Matching is by translation name
-    (loose, case-insensitive), since translation names are whatever the
-    operator typed in when importing them, not a fixed set of choices.
-    Only ever matches a LOCALLY IMPORTED translation, never a live
-    NLT-API entry ("New Living Translation (NLT)") — a meeting default is
-    something the operator expects to just work with no network dependency,
-    so this never silently switches someone onto a live lookup that could
-    fail mid-service. Sets bible_translation_saved in session_state — the
-    Bible page seeds its Translation dropdown's initial value from that
-    mirror key on every render (see page_bible), not from Streamlit's own
-    widget-remembered state, since that gets cleared out whenever the Bible
-    tab isn't the one currently on screen. Silently does nothing if no
-    matching local translation has been imported yet."""
+    """Sets the Bible tab's defaults for the session based on which meeting
+    was just picked — translation, bilingual on/off, and slide layout.
+    Sets the *_saved mirror keys in session_state (bible_translation_saved,
+    bible_bilingual_saved, bible_combine_mode_saved) — the Bible page seeds
+    each widget's initial value from its own mirror key on every render
+    (see page_bible), not from Streamlit's own widget-remembered state,
+    since that gets cleared out whenever the Bible tab isn't the one
+    currently on screen.
+
+    Slide layout: EVERY meeting defaults to "One slide per verse" — this
+    was previously hard-defaulted to "Combine into one slide" regardless
+    of meeting, which is what this fixes.
+
+    Translation + bilingual, per meeting:
+      - Saturday: NLT as the main Bible, bilingual OFF.
+      - Sanctuary Arabic: the Van Dyke Arabic Bible (if imported), bilingual
+        left as whatever it already was — Arabic-only services don't have
+        an obvious bilingual default to force one way or the other.
+      - Sunday / Sanctuary English / anything else: the KJV English Bible
+        (if imported), bilingual left as-is, same reasoning.
+    Sunday/Sanctuary Arabic/Sanctuary English matching is by translation
+    name (loose, case-insensitive) against locally imported translations
+    only — a meeting default shouldn't silently switch someone onto a live
+    lookup that could fail mid-service UNLESS the operator has explicitly
+    asked for that meeting to use NLT, which is exactly the Saturday case:
+    that's a deliberate choice being honored, not an accidental one.
+    Silently does nothing for translation/bilingual if there's nothing to
+    match — the slide-layout default is still applied either way."""
+    st.session_state["bible_combine_mode_saved"] = "One slide per verse"
+
+    if meeting == "Saturday":
+        nlt_label = NLT_TRANSLATION_LABELS.get("NLT")
+        if nlt_label and _get_nlt_api_key():
+            st.session_state["bible_translation_saved"] = nlt_label
+            st.session_state["bible_bilingual_saved"] = False
+        return
+
     translations = [t for t in get_bible_translations() if not is_nlt_translation(t)]
     if not translations:
         return

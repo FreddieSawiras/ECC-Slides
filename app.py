@@ -1,3 +1,5 @@
+#git status ; git add . ; git commit -m "Your commit message" ; git push
+
 """
 ECC Worship — Premium Church Presentation Platform
 ====================================================
@@ -3510,18 +3512,29 @@ def render_projector():
 
         if text.startswith(IMG_SLIDE_PREFIX):
             img_src = text[len(IMG_SLIDE_PREFIX):]
-            # Imported slide-deck photos (e.g. Google Slides exports) now
-            # fill the entire screen edge-to-edge (object-fit: cover)
-            # instead of letterboxing with black bars top/bottom
-            # (object-fit: contain). Since these images are typically
-            # already the right aspect ratio (full slide exports), cover
-            # crops only the rare mismatched edge rather than shrinking
-            # the whole image to fit inside black bars.
+            # Imported slide-deck/PDF pages always show the ENTIRE page
+            # (object-fit: contain) — never cropped. A landscape deck
+            # already close to the screen's own aspect ratio ends up
+            # filling edge-to-edge under `contain` anyway, so this looks
+            # identical to before for that case; the fix is for a
+            # PORTRAIT PDF page, which under the old `object-fit: cover`
+            # got zoomed into its vertical middle strip with the top and
+            # bottom cropped off to force it to fill a landscape screen.
+            # The space beside/around a portrait page (or any page whose
+            # aspect ratio doesn't match the screen) is filled with a
+            # blurred, darkened copy of the SAME image as the backdrop —
+            # rather than plain black bars — so it still reads as one
+            # deliberate, cohesive look instead of an empty letterbox.
             render_html(
-                f"""<div style="height:100vh;width:100vw;display:flex;align-items:center;
-                justify-content:center;background:#000;animation: eccFadeIn 0.45s ease;
-                overflow:hidden;">
-                <img src="{img_src}" style="width:100%;height:100%;object-fit:cover;" />
+                f"""<div style="height:100vh;width:100vw;position:relative;overflow:hidden;
+                background:#000;animation: eccFadeIn 0.45s ease;">
+                <div style="position:absolute;inset:0;background-image:url('{img_src}');
+                background-size:cover;background-position:center;filter:blur(38px) brightness(0.35) saturate(1.15);
+                transform:scale(1.15);"></div>
+                <div style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;">
+                <img src="{img_src}" style="max-width:100%;max-height:100%;object-fit:contain;
+                box-shadow:0 12px 48px rgba(0,0,0,0.55);position:relative;z-index:1;" />
+                </div>
                 </div>"""
             )
         elif text2:
@@ -3688,18 +3701,31 @@ def render_stage_display():
             f'<img src="{cur_img_src}" class="stage-current-img" />' if (cur_is_img and not hidden)
             else ("(hidden from projector)" if hidden else (cur_text or "Nothing live"))
         )
-        # "Up Next" is a real miniature of the actual next slide (live
-        # theme background, font, text color — see _render_mini_slide) for
-        # text slides, and the actual imported image for image slides —
-        # not a generic placeholder or a plain text label either way.
+        # "Up Next" text (lyrics, Bible verses, custom text items) shows as
+        # plain readable text — same visual language as the "Now" section
+        # above it — NOT a shrunk-down simulated slide (theme background,
+        # centered/clamped text). That mini-slide treatment reads fine at
+        # thumbnail size in the Presentation tab's slide grid, but here it
+        # was cramming full verses into a small fixed-height box, forcing
+        # the text down to a tiny size and clipping it at the box's bottom
+        # edge — exactly what showed up looking broken on Stage Display.
+        # Image slides (including PDF/PPTX imports, which are always
+        # stored as page images — see IMG_SLIDE_PREFIX) are the one
+        # exception and still get the real imported picture.
         if nxt_img:
             next_html = f'<div class="stage-next-img-wrap"><img src="{nxt_img}" class="stage-next-img" onerror="this.replaceWith(Object.assign(document.createElement(\'div\'),{{textContent:\'(image failed to load)\',style:\'color:#B0463F;font-size:0.9rem;\'}}))" /></div>'
         elif nxt_text:
-            next_html = _render_mini_slide(
-                nxt_text, nxt_ref, nxt_text2,
-                theme_name=state.get("theme"), background_key=state.get("background"),
-                height_px=180, ref2=nxt_ref2
-            )
+            safe_next_ref = re.sub(r"[<&>]", "", nxt_ref or "")
+            safe_next_text = re.sub(r"[<&>]", "", nxt_text or "").replace("\n", "<br>")
+            ref_html = f'<div class="stage-next-ref">{safe_next_ref}</div>' if safe_next_ref else ""
+            if nxt_text2:
+                safe_next_text2 = re.sub(r"[<&>]", "", nxt_text2 or "").replace("\n", "<br>")
+                safe_next_ref2 = re.sub(r"[<&>]", "", nxt_ref2 or "")
+                ref2_html = f'<div class="stage-next-ref">{safe_next_ref2}</div>' if safe_next_ref2 else ""
+                next_html = (f'{ref_html}<div>{safe_next_text}</div>'
+                             f'<div style="margin-top:1.2vh;">{ref2_html}<div>{safe_next_text2}</div></div>')
+            else:
+                next_html = f'{ref_html}<div>{safe_next_text}</div>'
         else:
             next_html = nxt_label
         # Elapsed time computed server-side from meeting_timer_start (set
@@ -3745,6 +3771,8 @@ def render_stage_display():
         .stage-current-img {{ display:block; width:100%; max-height:34vh; object-fit:contain; border-radius:8px; }}
         .stage-next {{ color:#C9CBD1; font-family:'Inter',sans-serif; font-size: clamp(1rem,2vw,1.6rem);
                       line-height:1.4; display:block; width:100%; }}
+        .stage-next-ref {{ color:{ACCENT}; font-family:'Inter',sans-serif; font-weight:700; letter-spacing:.05em;
+                           text-transform:uppercase; font-size: clamp(0.7rem,1.1vw,0.95rem); margin-bottom:0.4vh; }}
         /* This markdown block is the actual containing box that .stage-next
            (and its child .stage-next-img-wrap) resolve their percentage
            widths against. Streamlit's markdown wrapper doesn't always
@@ -3904,8 +3932,110 @@ def _remote_scroll_preserve_js():
     )
 
 
+def _remote_go_prev(state):
+    """Advance the live slide backward by one — shared by the normal PREV
+    button and Simple mode's full-screen bottom tap zone, so both trigger
+    literally the same logic. Crosses back into the previous service item's
+    last slide when already on an item's first slide, mirroring what going
+    forward already does at the end of an item. No-op at the very start of
+    the service/ad-hoc set."""
+    adhoc = bool(state.get("adhoc_active"))
+    if adhoc:
+        slides = json.loads(state["adhoc_slides"]) if state.get("adhoc_slides") else []
+        si = state.get("adhoc_index") or 0
+        if si > 0:
+            set_state(adhoc_index=si - 1, cleared=0)
+        return
+    service, items = (get_service_items_cached(state["service_id"])
+                       if state.get("service_id") else (None, []))
+    idx = state.get("item_index") or 0
+    si = state.get("slide_index") or 0
+    if si > 0:
+        set_state(slide_index=si - 1, cleared=0)
+    elif idx > 0:
+        prev_slides = item_slides(items[idx - 1], state.get("font_scale") or 1.0)
+        set_state(item_index=idx - 1, slide_index=max(0, len(prev_slides) - 1), cleared=0)
+
+
+def _remote_go_next(state):
+    """Advance the live slide forward by one — shared by the normal NEXT
+    button and Simple mode's full-screen top tap zone. Crosses forward into
+    the next service item's first slide when already on an item's last
+    slide. No-op at the very end of the service/ad-hoc set."""
+    adhoc = bool(state.get("adhoc_active"))
+    if adhoc:
+        slides = json.loads(state["adhoc_slides"]) if state.get("adhoc_slides") else []
+        si = state.get("adhoc_index") or 0
+        if si < len(slides) - 1:
+            set_state(adhoc_index=si + 1, cleared=0)
+        return
+    service, items = (get_service_items_cached(state["service_id"])
+                       if state.get("service_id") else (None, []))
+    idx = state.get("item_index") or 0
+    slides = item_slides(items[idx], state.get("font_scale") or 1.0) if 0 <= idx < len(items) else []
+    si = state.get("slide_index") or 0
+    if si < len(slides) - 1:
+        set_state(slide_index=si + 1, cleared=0)
+    elif idx + 1 < len(items):
+        set_state(item_index=idx + 1, slide_index=0, cleared=0)
+
+
+def _render_remote_simple_mode(state):
+    """Full-screen two-zone remote: tap the top half to go to the NEXT
+    slide, tap the bottom half to go PREV — no other controls visible, for
+    a volunteer who just needs to advance slides without reading labels.
+    Each zone is a real st.button (so taps register the same reliable way
+    as every other button in this app) stretched to fill half the browser
+    viewport height via CSS scoped to this container's own key — not a
+    custom JS tap-anywhere overlay, which would be one more thing to keep
+    working across phone browsers for no real benefit over a plain button.
+    A small "Exit Simple Mode" circle stays reachable at the very bottom so
+    the volunteer can always get back to the normal controls."""
+    render_html(f"""
+    <style>
+    #MainMenu, footer, header {{visibility: hidden;}}
+    section[data-testid="stSidebar"] {{display:none;}}
+    .block-container {{ padding: 0 !important; max-width: 100% !important; }}
+    div[class*="st-key-remote_simple_next"] .stButton>button,
+    div[class*="st-key-remote_simple_prev"] .stButton>button {{
+        width: 100%; height: 44vh; border-radius: 0; border: none;
+        font-size: 2.6rem; font-weight: 800; letter-spacing: 0.05em;
+        display:flex; align-items:center; justify-content:center;
+    }}
+    div[class*="st-key-remote_simple_next"] .stButton>button {{
+        background: linear-gradient(160deg, {ACCENT}, #A9803A) !important; color: #1A1400 !important;
+    }}
+    div[class*="st-key-remote_simple_prev"] .stButton>button {{
+        background: {CARD} !important; color: {TEXT_PRIMARY} !important; border-top: 1px solid {CARD_BORDER} !important;
+    }}
+    div[class*="st-key-remote_simple_exit"] .stButton>button {{
+        width: 64px; height: 64px; border-radius: 50%; margin: 8px auto; display:flex;
+        align-items:center; justify-content:center; font-size:0.7rem; font-weight:700;
+        background: {BG} !important; color: {TEXT_PRIMARY} !important; border: 1px solid {CARD_BORDER} !important;
+        letter-spacing: 0.04em; text-transform: uppercase;
+    }}
+    </style>
+    """)
+    with st.container(key="remote_simple_next"):
+        if st.button("NEXT", key="remote_simple_next_btn", use_container_width=True):
+            _remote_go_next(state)
+            _fragment_rerun()
+    with st.container(key="remote_simple_prev"):
+        if st.button("PREV", key="remote_simple_prev_btn", use_container_width=True):
+            _remote_go_prev(state)
+            _fragment_rerun()
+    with st.container(key="remote_simple_exit"):
+        if st.button("Exit", key="remote_simple_exit_btn"):
+            st.session_state["remote_simple_mode"] = False
+            _fragment_rerun()
+
+
 def _render_remote_body():
     st.session_state.setdefault("remote_grid_mode", False)
+    st.session_state.setdefault("remote_simple_mode", False)
+    if st.session_state["remote_simple_mode"]:
+        _render_remote_simple_mode(get_state())
+        return
     if st.session_state["remote_grid_mode"]:
         render_remote_grid()
         return
@@ -3954,46 +4084,13 @@ def _render_remote_body():
         st.caption(nxt_label)
     st.write("")
 
-    adhoc = bool(state.get("adhoc_active"))
-    if adhoc:
-        slides = json.loads(state["adhoc_slides"]) if state.get("adhoc_slides") else []
-        si = state.get("adhoc_index") or 0
-    else:
-        # get_service_items_cached: avoids re-parsing the items JSON (which
-        # can embed multi-MB base64 images for imported slide decks) on
-        # every 0.4s poll tick — this is what made the remote feel slow.
-        service, items = (get_service_items_cached(state["service_id"])
-                           if state.get("service_id") else (None, []))
-        idx = state.get("item_index") or 0
-        slides = item_slides(items[idx], state.get("font_scale") or 1.0) if 0 <= idx < len(items) else []
-        si = state.get("slide_index") or 0
-
     c1, c2 = st.columns(2)
     if c1.button("◀ PREV", use_container_width=True, key="remote_prev"):
-        if si > 0:
-            if adhoc:
-                set_state(adhoc_index=si - 1, cleared=0)
-            else:
-                set_state(slide_index=si - 1, cleared=0)
-            _fragment_rerun()
-        elif not adhoc and idx > 0:
-            # Was on the first slide of this item — cross back into the
-            # PREVIOUS item's last slide, mirroring what NEXT already does
-            # going forward. Without this, PREV silently did nothing the
-            # moment you crossed into a new item, which looked broken.
-            prev_slides = item_slides(items[idx - 1], state.get("font_scale") or 1.0)
-            set_state(item_index=idx - 1, slide_index=max(0, len(prev_slides) - 1), cleared=0)
-            _fragment_rerun()
+        _remote_go_prev(state)
+        _fragment_rerun()
     if c2.button("NEXT ▶", use_container_width=True, key="remote_next"):
-        if si < len(slides) - 1:
-            if adhoc:
-                set_state(adhoc_index=si + 1, cleared=0)
-            else:
-                set_state(slide_index=si + 1, cleared=0)
-            _fragment_rerun()
-        elif not adhoc and idx + 1 < len(items):
-            set_state(item_index=idx + 1, slide_index=0, cleared=0)
-            _fragment_rerun()
+        _remote_go_next(state)
+        _fragment_rerun()
     st.write("")
     is_black = bool(state.get("black"))
     black_label = "🔆 Show Display (currently Black)" if is_black else "⬛ Black Screen"
@@ -4001,9 +4098,23 @@ def _render_remote_body():
         set_state(black=0 if is_black else 1)
         _fragment_rerun()
     st.write("")
-    if st.button("🎬 Slide Grid", use_container_width=True, key="remote_open_grid"):
+    gcol, scol = st.columns([3, 1])
+    if gcol.button("🎬 Slide Grid", use_container_width=True, key="remote_open_grid"):
         st.session_state["remote_grid_mode"] = True
         _fragment_rerun()
+    with scol:
+        render_html(f"""<style>
+        div[class*="st-key-remote_simple_toggle"] .stButton>button {{
+            width: 100%; aspect-ratio: 1; border-radius: 50%; padding: 0;
+            font-size: 0.62rem; font-weight: 700; letter-spacing: 0.02em; text-transform: uppercase;
+            background: {CARD} !important; color: {TEXT_PRIMARY} !important; border: 1px solid {CARD_BORDER} !important;
+        }}
+        </style>""")
+        with st.container(key="remote_simple_toggle"):
+            if st.button("Simple", key="remote_simple_toggle_btn", use_container_width=True,
+                         help="Full-screen mode: tap the top half for Next, the bottom half for Prev."):
+                st.session_state["remote_simple_mode"] = True
+                _fragment_rerun()
 
 
 def render_remote_grid():
@@ -6926,8 +7037,6 @@ def _render_meeting_transition(meeting_name):
 
 if __name__ == "__main__":
     main()
-
-#git status ; git add . ; git commit -m "Your commit message" ; git push
 
 # ---------------------------------------------------------------------------
 # NLT API SECRET (COPY INTO .streamlit/secrets.toml — DO NOT COMMIT THE REAL KEY)

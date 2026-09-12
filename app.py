@@ -2270,6 +2270,15 @@ def _strip_nlt_html_to_verse_text(html):
     """Convert one verse's NLT API HTML into clean plain text, formatted to
     match a plain locally-imported translation (e.g. a KJV JSON dump) as
     closely as possible — just the verse's words, nothing else:
+      - Headings (<h1>-<h6>) — the chapter/book heading NLT includes
+        ("John 3:16-18, NLT") and any section subheading a chapter opens
+        with ("The Account of Creation") — are removed entirely, tag AND
+        content, not just unwrapped. The app already renders its own gold
+        reference heading separately; leaving NLT's heading text in would
+        show the reference twice, once correctly and once mangled in with
+        verse 1's text.
+      - A bare chapter-number marker some chapters open verse 1 with is
+        dropped the same way as the verse-number marker below.
       - The verse-number marker (<span class="vn">16</span>) is removed
         entirely, tag AND its number text — a local import's verse text
         never repeats its own verse number inline, so NLT's shouldn't either.
@@ -2292,6 +2301,25 @@ def _strip_nlt_html_to_verse_text(html):
     text = html
     # Remove scripts/styles outright.
     text = re.sub(r"<\s*(script|style)[^>]*>.*?<\s*/\s*\1\s*>", "", text, flags=re.I | re.S)
+    # Drop any heading entirely — tag AND its content, not just the tag —
+    # BEFORE the verse-number/footnote handling below. A chapter's HTML
+    # commonly carries a chapter/book heading (<h2 class="bk_ch_vs_header">
+    # John 3:16-18, NLT</h2>) and, for chapters that have one, a section
+    # subheading right before the text it introduces (e.g. Genesis 1 opens
+    # with an <h3>The Account of Creation</h3> ahead of verse 1). Neither
+    # is part of the verse itself — a local plain-text import never carries
+    # a heading inside a verse's text — so both must be removed completely,
+    # not just unwrapped, or their words end up glued onto the start of the
+    # slide (this was showing up on the projector as a fake second title
+    # like "1 Genesis 1 / The Account of Creation" sitting above the actual
+    # verse text, doubling the reference that the app's own gold heading
+    # already shows).
+    text = re.sub(r"<h[1-6][^>]*>.*?</h[1-6]>", "", text, flags=re.I | re.S)
+    # Drop a bare chapter-number marker some chapters open verse 1 with
+    # (<p class="chapter-number">1</p> or similar) — same reasoning as the
+    # verse-number span below: it's not part of the verse's actual words.
+    text = re.sub(r'<span\s+class="chapter-number"[^>]*>\s*\d+\s*</span>', "", text, flags=re.I)
+    text = re.sub(r'<p\s+class="chapter-number"[^>]*>\s*\d+\s*</p>', "", text, flags=re.I)
     # Drop the verse-number marker completely (tag + its digit content) —
     # done BEFORE the generic tag-stripper below so the digits never reach
     # the plain-text stage and glue onto the next word.

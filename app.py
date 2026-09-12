@@ -276,6 +276,28 @@ def turso_push_background(default_theme, default_background, custom_background_d
     ])
 
 
+def turso_pull_background():
+    """Read-only pull, used ONLY once at cold-start and only when the local
+    settings row has no custom_background_data yet (see init_db) — restores
+    the uploaded background photo after a host wipes the local filesystem
+    on redeploy/sleep, the same 'songs and services already restored
+    themselves from Turso, but backgrounds had no equivalent path' gap that
+    turso_pull_all_bible_verses fixed for Bible verses. Returns a dict with
+    church_name/default_theme/default_background/custom_background_data, or
+    None if there's nothing saved in Turso yet."""
+    result = turso_pipeline([
+        (TURSO_SETTINGS_SCHEMA, None),
+        ("SELECT church_name, default_theme, default_background, custom_background_data "
+         "FROM settings WHERE id=1", None),
+    ])
+    rows = result["results"][1]["response"]["result"]["rows"]
+    if not rows:
+        return None
+    vals = [cell.get("value") for cell in rows[0]]
+    row = dict(zip(["church_name", "default_theme", "default_background", "custom_background_data"], vals))
+    return row if row.get("custom_background_data") else None
+
+
 def turso_push_slide_deck(deck_id, title, source, slides_json):
     """One explicit push for one imported slide deck — same pattern as
     turso_push_song: fires on that deck's own Save/Sync click, and
@@ -848,9 +870,54 @@ def init_db():
     if c.execute("SELECT COUNT(*) FROM settings").fetchone()[0] == 0:
         c.execute("INSERT INTO settings(id, church_name, default_theme, default_background) "
                   "VALUES (1, 'ECC', 'Modern Worship', 'None (theme color)')")
+        conn.commit()
+        # THE FIX: a custom background photo you'd uploaded and synced to
+        # Turso used to just vanish every time the host wiped local disk
+        # (redeploy, sleep/wake, restart) — it only ever got PUSHED to
+        # Turso, never pulled back down, so a brand-new local settings row
+        # always started with no photo even though one was safely sitting
+        # in Turso the whole time. Same one-time, one-request, cold-start-
+        # only pattern as songs/services/Bible verses above: only runs
+        # when this is a genuinely fresh local settings row.
+        if turso_configured():
+            try:
+                remote = turso_pull_background()
+                if remote and remote.get("custom_background_data"):
+                    restore_ts = now()
+                    c.execute(
+                        "UPDATE settings SET church_name=?, default_theme=?, default_background=?, "
+                        "custom_background_data=? WHERE id=1",
+                        (remote.get("church_name") or "ECC", remote.get("default_theme") or "Modern Worship",
+                         remote.get("default_background") or CUSTOM_BACKGROUND_KEY, remote["custom_background_data"])
+                    )
+                    # Also seed the custom_backgrounds HISTORY table with
+                    # this recovered photo as the active entry — otherwise
+                    # the Display Settings gallery would show it as active
+                    # in settings but missing from "Saved backgrounds"
+                    # below, and the one-time backfill above (which only
+                    # runs when custom_backgrounds is still empty) already
+                    # ran and found nothing, since this INSERT happens
+                    # after it.
+                    if c.execute("SELECT COUNT(*) FROM custom_backgrounds").fetchone()[0] == 0:
+                        c.execute(
+                            "INSERT INTO custom_backgrounds (data, label, is_active, created_at) VALUES (?,?,1,?)",
+                            (remote["custom_background_data"], "Background", restore_ts)
+                        )
+                    conn.commit()
+            except Exception:
+                pass  # Turso unreachable/misconfigured — no background is an OK starting state
     if c.execute("SELECT COUNT(*) FROM presentation_state").fetchone()[0] == 0:
+        # Seed the LIVE projector's background from whatever settings ends
+        # up with at this point (freshly restored from Turso above, or the
+        # plain default if there was nothing to restore) — otherwise a
+        # background successfully recovered into `settings` just now would
+        # still leave the projector itself on 'None (theme color)' until
+        # the operator happened to reopen Display Settings and re-pick it.
+        settings_row = c.execute("SELECT default_theme, default_background FROM settings WHERE id=1").fetchone()
+        restored_theme = settings_row["default_theme"] if settings_row else "Modern Worship"
+        restored_bg = settings_row["default_background"] if settings_row else "None (theme color)"
         c.execute("""INSERT INTO presentation_state(id, service_id, item_index, slide_index, black, cleared, live, theme, background, font_scale, updated_at, adhoc_active, adhoc_slides, adhoc_index)
-                     VALUES (1, NULL, 0, 0, 0, 1, 1, 'Modern Worship', 'None (theme color)', 1.0, ?, 0, NULL, 0)""", (now(),))
+                     VALUES (1, NULL, 0, 0, 0, 1, 1, ?, ?, 1.0, ?, 0, NULL, 0)""", (restored_theme, restored_bg, now()))
     conn.commit()
 
     if c.execute("SELECT COUNT(*) FROM songs").fetchone()[0] == 0:
@@ -1864,7 +1931,41 @@ def _secondary_ref(book, chapter, verse_nums, translation, secondary_translation
     return ref2
 
 
-def make_bible_item(book, chapter, verse_nums, translation=None, secondary_translation=None, combine=False):
+def _group_verses_by_word_limit(verse_nums, verses, max_words):
+    """Groups an ordered list of verse numbers into slide-sized chunks so
+    that no slide's total word count exceeds max_words — WITHOUT ever
+    splitting a single verse's own text across two slides. Verses are
+    added to the current group one at a time; the moment adding the next
+    verse would push the running word count over max_words, that group is
+    closed off and a new one starts with that verse. A verse that is by
+    itself longer than max_words still gets a slide entirely to itself
+    (its own group of one) rather than being cut off partway through —
+    there's no way to keep it under the cap without truncating it, and
+    truncating a verse would be worse than one long slide.
+
+    Returns a list of (first_verse, last_verse, [verse_nums_in_group]) —
+    the group's verse range plus its member verse numbers, so the caller
+    can build both the slide's reference heading (e.g. "Genesis 1:1-4")
+    and its combined text.
+    """
+    groups = []
+    current = []
+    current_words = 0
+    for v in verse_nums:
+        verse_word_count = len((verses.get(v, "") or "").split())
+        if current and current_words + verse_word_count > max_words:
+            groups.append(current)
+            current = []
+            current_words = 0
+        current.append(v)
+        current_words += verse_word_count
+    if current:
+        groups.append(current)
+    return [(g[0], g[-1], g) for g in groups]
+
+
+def make_bible_item(book, chapter, verse_nums, translation=None, secondary_translation=None,
+                     combine=False, max_words_per_slide=None):
     """
     Build a Bible service item. If secondary_translation is given, each slide
     also carries the same verse's text in that translation (looked up by the
@@ -1875,15 +1976,39 @@ def make_bible_item(book, chapter, verse_nums, translation=None, secondary_trans
     to the secondary language (Arabic book name + Arabic-Indic numerals when
     that language is Arabic), so the reference isn't only shown on top.
 
-    If combine=True, all the requested verses are merged into a single slide
-    (e.g. selecting verses 1,2,3 shows them together, referenced as
-    "Genesis 1:1-3") instead of one slide per verse.
+    Three mutually exclusive slide-grouping modes (checked in this order):
+      - max_words_per_slide=<n>: verses are packed onto as few slides as
+        possible without any slide's word count going over <n>, and
+        without ever splitting one verse's text across two slides (see
+        _group_verses_by_word_limit). Use this for a long, arbitrary verse
+        range (e.g. Matthew 3:3-14) where a single "combine" slide would be
+        a wall of text and one-verse-per-slide would be needlessly choppy
+        for short verses.
+      - combine=True: every requested verse goes on ONE slide (e.g.
+        selecting verses 1,2,3 shows them together, referenced as
+        "Genesis 1:1-3"), regardless of length.
+      - neither: one slide per verse (the original/default behavior).
     """
     verses = get_bible_verses(book, chapter, translation)
     book_number = get_book_number(book, translation) if translation else None
     heading_book = localized_book_name(book, translation, next(iter(verses.values()), "")) if translation else book
 
-    if combine:
+    if max_words_per_slide:
+        slides = []
+        for first_v, last_v, group in _group_verses_by_word_limit(verse_nums, verses, max_words_per_slide):
+            combined_text = "\n".join(f"{v} {verses.get(v, '')}".strip() for v in group)
+            ref = f"{heading_book} {chapter}:{first_v}" if first_v == last_v else \
+                f"{heading_book} {chapter}:{first_v}-{last_v}"
+            slide = {"ref": ref, "text": combined_text}
+            if secondary_translation:
+                combined_text2 = "\n".join(
+                    f"{v} {get_verse_in_translation(book, chapter, v, secondary_translation, book_number)}".strip()
+                    for v in group
+                )
+                slide["text2"] = combined_text2
+                slide["ref2"] = _secondary_ref(book, chapter, group, translation, secondary_translation, book_number)
+            slides.append(slide)
+    elif combine:
         combined_text = "\n".join(f"{v} {verses.get(v, '')}".strip() for v in verse_nums)
         ref = f"{heading_book} {chapter}:{verse_nums[0]}" if len(verse_nums) == 1 else \
             f"{heading_book} {chapter}:{verse_nums[0]}-{verse_nums[-1]}"
@@ -1926,7 +2051,7 @@ def get_bible_translations():
     """Locally imported translations, plus the live NLT-API versions
     appended at the end (only if an API key is configured — no point
     offering them if they'll just fail on first use). NLT entries use their
-    display label (e.g. "NLT (via NLT API — live)") as the value everywhere
+    display label ("New Living Translation (NLT)") as the value everywhere
     downstream; is_nlt_translation()/nlt version lookups unwrap that back to
     the bare API version string ("NLT")."""
     conn = get_conn()
@@ -2079,8 +2204,16 @@ def get_verse_in_translation(book, chapter, verse, translation, book_number=None
 # chapter dropdown, the verse checkboxes, "Present Now", "Add to Service",
 # staging — is then literally the same code path as any other translation.
 
-NLT_API_VERSIONS = ["NLT", "NLTUK", "NTV", "KJV"]  # versions documented by the NLT API
-NLT_TRANSLATION_LABELS = {v: f"{v} (via NLT API — live)" for v in NLT_API_VERSIONS}
+# Only the single "NLT" version is exposed as a translation choice — not
+# the other versions the NLT API happens to also serve (NLTUK, NTV, and
+# even a KJV passthrough) — since this app already has its own local KJV
+# import, and one NLT option (not four near-duplicate "via API" entries)
+# is what's actually wanted in the Translation dropdown.
+NLT_API_VERSIONS = ["NLT"]
+# Display label deliberately doesn't say "live" — to the operator this
+# should read exactly like any other translation name in the dropdown,
+# not call out that it's fetched over the network under the hood.
+NLT_TRANSLATION_LABELS = {"NLT": "New Living Translation (NLT)"}
 NLT_LABEL_TO_VERSION = {label: v for v, label in NLT_TRANSLATION_LABELS.items()}
 
 
@@ -4481,21 +4614,57 @@ def page_bible():
     st.markdown("### Bible")
 
     translations = get_bible_translations()
-    # Default the Bilingual checkbox ON whenever a second translation is
-    # available (e.g. Arabic + English), instead of requiring the operator
-    # to remember to switch it on every time. This is only the *default*
-    # for the checkbox's very first value in a session — st.checkbox still
-    # remembers whatever the operator later sets it to via bible_bilingual
-    # in session_state, so turning it off (for an English-only slot) sticks.
-    if "bible_bilingual" not in st.session_state:
-        st.session_state["bible_bilingual"] = len(translations) >= 2
+    # --- Persisting the Translation/Bilingual/Second-translation choices
+    # across tab navigation ---------------------------------------------
+    # Streamlit deletes a widget's session_state entry the moment that
+    # widget isn't rendered on a run (leaving this page for another tab
+    # is exactly that) — this is documented Streamlit behavior, not a bug
+    # in this app: https://docs.streamlit.io/library/advanced-features/widget-semantics
+    # ("When widgets disappear from the page, we clear out their value in
+    # session state."). That's what was causing the Translation dropdown
+    # and Bilingual checkbox to snap back to their defaults (KJV → whatever
+    # sorts first alphabetically, Bilingual → back ON) every time you left
+    # the Bible tab and came back — the widget keys themselves were being
+    # wiped, not just re-defaulted.
+    #
+    # The fix is the standard workaround: mirror each widget's value into
+    # a SEPARATE key (bible_translation_saved / bible_bilingual_saved /
+    # bible_secondary_translation_saved) that nothing ever clears, seed the
+    # widget from that mirror on every render (BEFORE creating the widget,
+    # via its `index=`/`value=` argument), and update the mirror right
+    # after so the next navigation-away-and-back still has it.
+    if translations and st.session_state.get("bible_translation_saved") not in translations:
+        # First-ever visit, or the previously chosen translation was
+        # deleted (Church Settings) since last time — fall back to the
+        # first available translation rather than crash on a stale value.
+        st.session_state["bible_translation_saved"] = translations[0]
+    if "bible_bilingual_saved" not in st.session_state:
+        # Only used the very first time the app has ever seen this
+        # session — defaults Bilingual ON when a second translation
+        # exists, same as before. Every visit after that reads whatever
+        # the operator last set it to, restored from the mirror.
+        st.session_state["bible_bilingual_saved"] = len(translations) >= 2
+
     top1, top2 = st.columns([1, 1])
     with top1:
-        translation = st.selectbox("Translation", translations, key="bible_translation")
+        translation = st.selectbox(
+            "Translation", translations,
+            index=translations.index(st.session_state["bible_translation_saved"]) if translations else 0,
+            key="bible_translation",
+        )
     with top2:
-        bilingual = st.checkbox("Bilingual (split screen)", key="bible_bilingual",
-                                 disabled=len(translations) < 2,
-                                 help="Shows a second translation stacked underneath the first on the projector — e.g. Arabic on top, English on the bottom.")
+        bilingual = st.checkbox(
+            "Bilingual (split screen)",
+            value=st.session_state["bible_bilingual_saved"],
+            key="bible_bilingual",
+            disabled=len(translations) < 2,
+            help="Shows a second translation stacked underneath the first on the projector — e.g. Arabic on top, English on the bottom.",
+        )
+    # Update the mirrors immediately so they're correct even if the
+    # operator navigates away before this function is next called.
+    st.session_state["bible_translation_saved"] = translation
+    st.session_state["bible_bilingual_saved"] = bilingual
+
     secondary_translation = None
     if bilingual:
         # Two live NLT-API versions paired together isn't offered as a
@@ -4509,7 +4678,14 @@ def page_bible():
         else:
             other_options = [t for t in translations if t != translation]
         other_options = other_options or [t for t in translations if t != translation] or translations
-        secondary_translation = st.selectbox("Second translation (shown on the bottom half)", other_options, key="bible_secondary_translation")
+        saved_secondary = st.session_state.get("bible_secondary_translation_saved")
+        default_secondary_index = other_options.index(saved_secondary) if saved_secondary in other_options else 0
+        secondary_translation = st.selectbox(
+            "Second translation (shown on the bottom half)", other_options,
+            index=default_secondary_index,
+            key="bible_secondary_translation",
+        )
+        st.session_state["bible_secondary_translation_saved"] = secondary_translation
     st.caption(f"Browsing {translation}" + (f" · paired with {secondary_translation}" if secondary_translation else "") +
                ". Import more (public-domain or licensed) in Church Settings.")
 
@@ -4615,18 +4791,38 @@ def page_bible():
         else:
             st.caption("Select a chapter, then tap verses on the left.")
 
-        combine = st.checkbox(
-            "Combine into one slide", value=True, key="bible_combine",
-            help="Selected verses show together on a single slide, referenced as e.g. \"Genesis 1:1-3\", "
-                 "instead of one slide per verse."
+        if "bible_combine_mode_saved" not in st.session_state:
+            st.session_state["bible_combine_mode_saved"] = "Combine into one slide"
+        combine_mode_options = ["One slide per verse", "Combine into one slide", "Max words per slide"]
+        combine_mode = st.radio(
+            "Slide layout", combine_mode_options,
+            index=combine_mode_options.index(st.session_state["bible_combine_mode_saved"]),
+            key="bible_combine_mode",
+            help="\"Max words per slide\" packs verses onto as few slides as possible without going over "
+                 "the word limit, and never splits a single verse across two slides — a verse longer than "
+                 "the limit still gets a whole slide to itself.",
         )
+        st.session_state["bible_combine_mode_saved"] = combine_mode
+        max_words = None
+        if combine_mode == "Max words per slide":
+            if "bible_max_words_saved" not in st.session_state:
+                st.session_state["bible_max_words_saved"] = 30
+            max_words = st.number_input(
+                "Max words per slide", min_value=5, max_value=200,
+                value=st.session_state["bible_max_words_saved"], step=5,
+                key="bible_max_words",
+                help="A new slide starts whenever the next verse would push the current slide over this many words.",
+            )
+            st.session_state["bible_max_words_saved"] = max_words
+        combine = (combine_mode == "Combine into one slide")
 
         st.write("")
         scol1, scol2 = st.columns(2)
         with scol1:
             if st.button("▶ Present Now", disabled=not chosen_sorted, use_container_width=True,
                          help="Show these verses on the projector immediately — no service needed."):
-                item = make_bible_item(book, chapter, chosen_sorted, translation, secondary_translation, combine=combine)
+                item = make_bible_item(book, chapter, chosen_sorted, translation, secondary_translation,
+                                        combine=combine, max_words_per_slide=max_words)
                 present_adhoc_now(item_slides(item))
                 label = f"{book} {chapter}:{chosen_sorted[0]}" + (f"-{chosen_sorted[-1]}" if len(chosen_sorted) > 1 else "")
                 st.session_state.bible_selected_verses = []
@@ -4635,7 +4831,9 @@ def page_bible():
         with scol2:
             if st.button("+ Add to Service", disabled=not chosen_sorted, use_container_width=True):
                 st.session_state.setdefault("bible_staging", [])
-                st.session_state.bible_staging.append((book, chapter, tuple(chosen_sorted), translation, secondary_translation, combine))
+                st.session_state.bible_staging.append(
+                    (book, chapter, tuple(chosen_sorted), translation, secondary_translation, combine, max_words)
+                )
                 st.session_state.bible_selected_verses = []
                 st.toast("Added to staging — attach it in Service Builder.", icon="✅")
                 st.rerun()
@@ -4643,8 +4841,16 @@ def page_bible():
         staging = st.session_state.get("bible_staging", [])
         if staging:
             st.markdown("**Staged passages**")
-            for i, (b, c, vs, tr, tr2, cmb) in enumerate(staging):
-                label = f"{b} {c}:{vs[0]}" + (f"-{vs[-1]}" if len(vs) > 1 else "") + f" ({tr}" + (f" + {tr2})" if tr2 else ")") + (" [combined]" if cmb else "")
+            for i, staged in enumerate(staging):
+                # Staged entries are 7-tuples (book, chapter, verses,
+                # translation, secondary_translation, combine, max_words) —
+                # but tolerate older 6-tuples already sitting in a session
+                # from before max_words existed, so a mid-session upgrade
+                # doesn't crash on stale staged items.
+                b, c, vs, tr, tr2, cmb = staged[:6]
+                mw = staged[6] if len(staged) > 6 else None
+                mode_label = f" [max {mw} words/slide]" if mw else (" [combined]" if cmb else "")
+                label = f"{b} {c}:{vs[0]}" + (f"-{vs[-1]}" if len(vs) > 1 else "") + f" ({tr}" + (f" + {tr2})" if tr2 else ")") + mode_label
                 st.caption(label)
             if st.button("Go to Service Builder →"):
                 st.session_state.page = "Service Builder"; st.rerun()
@@ -4827,8 +5033,13 @@ def page_service_builder():
         staging = st.session_state.get("bible_staging", [])
         render_html(f'<div class="ecc-sb-add-card"><div class="ecc-sb-add-icon">📖</div><div class="ecc-sb-add-label">Bible ({len(staging)} staged)</div></div>')
         if st.button("Add Staged Bible", disabled=not staging, use_container_width=True, key="add_staged_bible"):
-            for (b, c, vs, tr, tr2, cmb) in staging:
-                items.append(make_bible_item(b, c, list(vs), tr, tr2, combine=cmb))
+            for staged in staging:
+                # Tolerate both the current 7-tuple shape (...,  max_words)
+                # and older 6-tuples already sitting in session state from
+                # before max-words-per-slide existed.
+                b, c, vs, tr, tr2, cmb = staged[:6]
+                mw = staged[6] if len(staged) > 6 else None
+                items.append(make_bible_item(b, c, list(vs), tr, tr2, combine=cmb, max_words_per_slide=mw))
             st.session_state.bible_staging = []
             update_service_items(sid, items); st.rerun()
     with a3:
@@ -5818,7 +6029,7 @@ def page_church_settings():
     st.write("")
     st.markdown("#### Delete a Translation")
     # Only locally imported translations are listed here — the live
-    # NLT-API entries (e.g. "KJV (via NLT API — live)") aren't rows in this
+    # NLT-API entry ("New Living Translation (NLT)") isn't a row in this
     # database at all, so there's nothing here to delete for them.
     existing_translations = [t for t in get_bible_translations() if not is_nlt_translation(t)]
     if not existing_translations:
@@ -5852,6 +6063,51 @@ def page_church_settings():
         st.markdown('</div>', unsafe_allow_html=True)
         if delete_disabled:
             st.caption("This is your only translation, so it can't be deleted — import another one first if you want to remove it.")
+
+        st.write("")
+        st.markdown("#### Keep Only Specific Translations")
+        st.caption(
+            "Deletes every LOCALLY IMPORTED translation except the ones you keep, in one step — "
+            "e.g. keep only Arabic and KJV and remove everything else you've imported over time. "
+            "The New Living Translation (NLT) entry is never affected here since it's a live lookup, "
+            "not a local import — there's nothing stored locally to delete for it."
+        )
+        keep_translations = st.multiselect(
+            "Translations to KEEP", existing_translations,
+            default=existing_translations, key="bible_keep_only_pick",
+            help="Everything NOT selected here gets deleted when you click the button below.",
+        )
+        to_remove = [t for t in existing_translations if t not in keep_translations]
+        also_delete_remote_bulk = st.checkbox(
+            "Also delete these from Turso", value=False, key="bible_keep_only_remote",
+            disabled=not turso_configured(),
+            help="Unchecked, this only removes them locally." if turso_configured()
+            else "Set up Turso in Church Settings to enable this.",
+        )
+        st.markdown('<div class="ecc-danger">', unsafe_allow_html=True)
+        if to_remove:
+            st.caption("Will delete: " + ", ".join(f"\"{t}\"" for t in to_remove))
+        confirm_bulk = st.checkbox(
+            f"Yes, permanently delete {len(to_remove)} translation(s)", value=False,
+            key="bible_keep_only_confirm", disabled=not to_remove,
+        )
+        if st.button("🗑 Delete Everything Not Kept", key="bible_keep_only_btn",
+                     use_container_width=True, disabled=not to_remove or not confirm_bulk):
+            total_deleted = 0
+            failures = []
+            for t in to_remove:
+                total_deleted += delete_bible_translation(t)
+                if also_delete_remote_bulk and turso_configured():
+                    try:
+                        turso_delete_bible_translation(t)
+                    except Exception as e:
+                        failures.append(f"{t}: {e}")
+            if failures:
+                st.toast(f"Deleted {total_deleted} verses across {len(to_remove)} translation(s), but Turso delete failed for: " + "; ".join(failures), icon="⚠️")
+            else:
+                st.toast(f"Deleted {total_deleted} verses across {len(to_remove)} translation(s). Kept: {', '.join(keep_translations) or '(none)'}.", icon="✅")
+            st.rerun()
+        st.markdown('</div>', unsafe_allow_html=True)
 
     st.write("")
     st.markdown("#### ☁️ Turso Cloud Save")
@@ -6021,6 +6277,13 @@ def page_display_settings():
         "save is kept here — uploading a new one doesn't delete the old ones, so you can always "
         "switch back."
     )
+    if not turso_configured():
+        st.warning(
+            "Turso isn't set up — uploaded photos are only saved to this app's local disk, which most "
+            "hosts (including Streamlit Community Cloud) periodically wipe on redeploys, restarts, or "
+            "after the app sleeps. That's why your background has been disappearing. Add "
+            "TURSO_DATABASE_URL and TURSO_AUTH_TOKEN in Church Settings so uploads survive those resets."
+        )
     if not PIL_AVAILABLE:
         st.warning("This needs the `Pillow` package — add `Pillow` to requirements.txt to enable it.")
     else:
@@ -6390,13 +6653,15 @@ def _apply_meeting_bible_default(meeting):
     (loose, case-insensitive), since translation names are whatever the
     operator typed in when importing them, not a fixed set of choices.
     Only ever matches a LOCALLY IMPORTED translation, never a live
-    NLT-API entry (e.g. "KJV (via NLT API — live)") — a meeting default is
+    NLT-API entry ("New Living Translation (NLT)") — a meeting default is
     something the operator expects to just work with no network dependency,
     so this never silently switches someone onto a live lookup that could
-    fail mid-service. Only sets bible_translation in session_state —
-    st.selectbox with key="bible_translation" then picks it up as its
-    initial value the next time the Bible page renders. Silently does
-    nothing if no matching local translation has been imported yet."""
+    fail mid-service. Sets bible_translation_saved in session_state — the
+    Bible page seeds its Translation dropdown's initial value from that
+    mirror key on every render (see page_bible), not from Streamlit's own
+    widget-remembered state, since that gets cleared out whenever the Bible
+    tab isn't the one currently on screen. Silently does nothing if no
+    matching local translation has been imported yet."""
     translations = [t for t in get_bible_translations() if not is_nlt_translation(t)]
     if not translations:
         return
@@ -6405,7 +6670,7 @@ def _apply_meeting_bible_default(meeting):
     else:
         match = _find_translation_by_hint(translations, ["kjv", "king james"])
     if match:
-        st.session_state["bible_translation"] = match
+        st.session_state["bible_translation_saved"] = match
 
 
 def render_meeting_select():

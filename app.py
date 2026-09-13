@@ -1356,21 +1356,32 @@ def _fuzzy_song_score(query, title, artist=""):
 
 
 def get_top_song_matches(query, limit=8):
-    """Live "as you type" ranked matches for the search box's type-ahead
-    list — scores every song's title/artist against the query with
-    _fuzzy_song_score and returns the top `limit`, best match first. The
-    0.55 cutoff is calibrated so a genuinely typo'd match (which scores
-    0.7-1.0 in testing against a large library) always clears it, while a
-    title that merely shares one short common word with the query (which
-    tops out around 0.3-0.5) does not — see the score-tuning notes on
-    _fuzzy_song_score for why the window-based comparison is what makes
-    that gap reliable."""
+    """Live "as you type" matches for Song Library and Service Builder.
+
+    When the query matches an author/artist, ALL songs by that author are
+    returned in title order. This makes an author search a true library
+    filter instead of limiting the result to the top few fuzzy matches.
+
+    For normal title/artist searches, keep the existing fuzzy ranking and
+    limit so short/common searches stay compact.
+    """
     query = (query or "").strip()
     if not query:
         return []
+
     conn = get_conn()
     rows = conn.execute("SELECT * FROM songs ORDER BY title").fetchall()
     conn.close()
+
+    q = _normalize_for_fuzzy(query)
+    if q:
+        author_matches = [
+            r for r in rows
+            if q in _normalize_for_fuzzy(r["artist"])
+        ]
+        if author_matches:
+            return author_matches
+
     scored = [(r, _fuzzy_song_score(query, r["title"], r["artist"])) for r in rows]
     scored = [(r, s) for r, s in scored if s > 0.55]
     scored.sort(key=lambda pair: pair[1], reverse=True)
@@ -1422,8 +1433,7 @@ def get_songs(search="", category="All Songs"):
 def get_all_songs_with_lyrics():
     """Every song in the library that actually has lyric content (skips
     rows whose only slide is the "(empty)" placeholder add_song() inserts
-    for a blank body) — sorted by title, for the developer-tools export at
-    the bottom of Song Library (copy-all and download-as-PDF)."""
+    for the lyric export)."""
     conn = get_conn()
     rows = conn.execute("SELECT * FROM songs ORDER BY title").fetchall()
     conn.close()
@@ -1433,6 +1443,15 @@ def get_all_songs_with_lyrics():
         if slides and slides != ["(empty)"]:
             out.append(r)
     return out
+
+
+def get_all_songs():
+    """Every song in the library, including songs that do not have lyrics yet.
+    Used for metadata-only library exports such as the song-list PDF."""
+    conn = get_conn()
+    rows = conn.execute("SELECT * FROM songs ORDER BY title").fetchall()
+    conn.close()
+    return rows
 
 
 def build_songs_lyrics_text(songs):
@@ -1450,48 +1469,58 @@ def build_songs_lyrics_text(songs):
 
 
 def build_songs_pdf(songs):
-    """Renders the same title/author/lyrics content as build_songs_lyrics_text
-    into a PDF (one song starting on its own page) using reportlab, and
-    returns the PDF as raw bytes. Raises if reportlab isn't installed —
-    callers check REPORTLAB_AVAILABLE first and disable the button instead
-    of calling this."""
+    """Build a compact song-library PDF containing ONLY each song's title
+    and author/artist — never lyric text."""
     buf = io.BytesIO()
     doc = SimpleDocTemplate(
         buf, pagesize=letter,
-        topMargin=0.75 * inch, bottomMargin=0.75 * inch,
-        leftMargin=0.85 * inch, rightMargin=0.85 * inch,
+        topMargin=0.65 * inch, bottomMargin=0.65 * inch,
+        leftMargin=0.7 * inch, rightMargin=0.7 * inch,
     )
     styles = getSampleStyleSheet()
+    heading_style = ParagraphStyle(
+        "ECCSongLibraryHeading",
+        parent=styles["Title"],
+        fontSize=20,
+        leading=24,
+        spaceAfter=16,
+        alignment=TA_CENTER,
+    )
     title_style = ParagraphStyle(
-        "ECCSongTitle", parent=styles["Title"], fontSize=18, spaceAfter=2, alignment=TA_CENTER,
+        "ECCSongMetadataTitle",
+        parent=styles["Heading3"],
+        fontSize=12,
+        leading=15,
+        spaceAfter=1,
     )
     artist_style = ParagraphStyle(
-        "ECCSongArtist", parent=styles["Normal"], fontSize=11, textColor="#555555",
-        alignment=TA_CENTER, spaceAfter=18,
-    )
-    lyrics_style = ParagraphStyle(
-        "ECCSongLyrics", parent=styles["Normal"], fontSize=12, leading=17,
+        "ECCSongMetadataArtist",
+        parent=styles["Normal"],
+        fontSize=9.5,
+        leading=12,
+        textColor="#666666",
+        spaceAfter=7,
     )
 
     def _escape(text):
-        # Paragraph markup treats <, &, > as XML — escape before wrapping
-        # lyric text in a Paragraph, then convert real newlines to <br/>
-        # (Paragraph doesn't render \n as a line break on its own).
-        return (text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-                    .replace("\n", "<br/>"))
+        return (str(text or "")
+                .replace("&", "&amp;")
+                .replace("<", "&lt;")
+                .replace(">", "&gt;"))
 
-    story = []
+    story = [
+        Paragraph("Song Library", heading_style),
+        Paragraph(f"{len(songs)} song{'s' if len(songs) != 1 else ''}", artist_style),
+    ]
+
     for i, r in enumerate(songs):
-        slides = json.loads(r["slides"]) if r["slides"] else []
-        lyrics = "\n\n".join(slides)
-        if i > 0:
-            story.append(PageBreak())
-        story.append(Paragraph(_escape(r["title"] or "(untitled)"), title_style))
-        if r["artist"]:
-            story.append(Paragraph(_escape(r["artist"]), artist_style))
-        else:
-            story.append(Spacer(1, 18))
-        story.append(Paragraph(_escape(lyrics), lyrics_style))
+        title = r["title"] or "(untitled)"
+        artist = r["artist"] or "Author not specified"
+        story.append(Paragraph(_escape(title), title_style))
+        story.append(Paragraph(f"Author: {_escape(artist)}", artist_style))
+        if i < len(songs) - 1:
+            story.append(Spacer(1, 2))
+
     doc.build(story)
     return buf.getvalue()
 
@@ -4994,10 +5023,12 @@ def page_songs():
     st.write("")
     with st.expander("🛠 Developer Tools"):
         songs_with_lyrics = get_all_songs_with_lyrics()
+        all_library_songs = get_all_songs()
         st.caption(
-            f"Export every song's title, author, and lyrics — {len(songs_with_lyrics)} song"
-            f"{'s' if len(songs_with_lyrics) != 1 else ''} in the library have lyric content "
-            "(songs with no lyrics yet are skipped)."
+            f"Copy exports include lyrics for {len(songs_with_lyrics)} song"
+            f"{'s' if len(songs_with_lyrics) != 1 else ''}. "
+            f"The PDF includes all {len(all_library_songs)} song"
+            f"{'s' if len(all_library_songs) != 1 else ''} with title + author only."
         )
         dev_col1, dev_col2 = st.columns(2)
         with dev_col1:
@@ -5037,12 +5068,12 @@ def page_songs():
         with dev_col2:
             if not REPORTLAB_AVAILABLE:
                 st.warning("PDF export needs the `reportlab` package — add `reportlab` to requirements.txt to enable it.")
-            elif not songs_with_lyrics:
-                st.button("⬇ Download All Songs (PDF)", disabled=True, use_container_width=True)
+            elif not all_library_songs:
+                st.button("⬇ Download Song Library (PDF)", disabled=True, use_container_width=True)
             else:
-                pdf_bytes = build_songs_pdf(songs_with_lyrics)
+                pdf_bytes = build_songs_pdf(all_library_songs)
                 st.download_button(
-                    "⬇ Download All Songs (PDF)", data=pdf_bytes,
+                    "⬇ Download Song Library (PDF)", data=pdf_bytes,
                     file_name=f"song_library_{datetime.datetime.now().strftime('%Y-%m-%d')}.pdf",
                     mime="application/pdf", use_container_width=True,
                 )

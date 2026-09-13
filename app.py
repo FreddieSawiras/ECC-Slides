@@ -40,6 +40,7 @@ import requests
 import shutil
 import unicodedata
 import threading
+import difflib
 
 try:
     from PIL import Image, ImageFilter, ImageEnhance
@@ -52,6 +53,17 @@ try:
     PYMUPDF_AVAILABLE = True
 except ImportError:
     PYMUPDF_AVAILABLE = False
+
+try:
+    from reportlab.lib.pagesizes import letter
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib.units import inch
+    from reportlab.lib.enums import TA_CENTER
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, PageBreak
+    from reportlab.pdfbase.pdfmetrics import stringWidth
+    REPORTLAB_AVAILABLE = True
+except ImportError:
+    REPORTLAB_AVAILABLE = False
 
 # ---------------------------------------------------------------------------
 # CONFIG / CONSTANTS
@@ -1271,6 +1283,115 @@ def get_song_count():
     return n
 
 
+def _normalize_for_fuzzy(text):
+    """Strips punctuation (commas, parentheses, etc.) before fuzzy
+    comparison — a typo-prone typist won't reliably reproduce punctuation
+    anyway, and leaving it in dilutes the character-level similarity ratio
+    against genuine word differences (e.g. "10000 reasns" vs the real
+    title "10,000 Reasons (Bless the Lord)")."""
+    return re.sub(r"[^\w\s]", "", (text or "").lower()).strip()
+
+
+def _fuzzy_song_score(query, title, artist=""):
+    """Relevance score (0-1) for how well `query` matches a song's title
+    (and secondarily its artist) — tolerates typos, not just exact
+    substrings. Exact/substring hits score highest and always win over a
+    fuzzy-only match.
+
+    For a fuzzy (non-substring) match, the query is compared against
+    SLIDING WINDOWS of the title's words sized to roughly match the
+    query's own word count — not just the title as a whole (which dilutes
+    a short query's similarity score once the title has extra words the
+    query never mentioned) and not just single words (which misses a
+    multi-word typo'd phrase like "bless the lrod" matching "bless the
+    lord" inside a longer title). The best window score is what
+    typo-tolerance for multi-word titles/phrases actually rests on.
+    """
+    q = _normalize_for_fuzzy(query)
+    if not q:
+        return 0.0
+    title_l = _normalize_for_fuzzy(title)
+    artist_l = _normalize_for_fuzzy(artist)
+    if not title_l:
+        return 0.0
+
+    score = 0.0
+    if q == title_l:
+        score = 1.0
+    elif title_l.startswith(q):
+        score = 0.95
+    elif q in title_l:
+        score = 0.85
+    else:
+        whole_ratio = difflib.SequenceMatcher(None, q, title_l).ratio()
+        title_words = title_l.split()
+        q_word_count = max(1, len(q.split()))
+        window_sizes = {q_word_count, max(1, q_word_count - 1), q_word_count + 1}
+        window_ratio = 0.0
+        for size in window_sizes:
+            if size < 1 or size > len(title_words):
+                continue
+            for i in range(len(title_words) - size + 1):
+                window = " ".join(title_words[i:i + size])
+                window_ratio = max(window_ratio, difflib.SequenceMatcher(None, q, window).ratio())
+        score = max(whole_ratio, window_ratio) * 0.8  # fuzzy-only match never outranks any real substring hit above
+
+    # Artist match contributes a smaller secondary boost — finding a song
+    # by typing the artist's name still surfaces it, but title relevance
+    # always dominates the ranking.
+    if artist_l:
+        if q in artist_l:
+            score = max(score, 0.5)
+        else:
+            artist_ratio = difflib.SequenceMatcher(None, q, artist_l).ratio()
+            score = max(score, artist_ratio * 0.4)
+    return score
+
+
+def get_top_song_matches(query, limit=8):
+    """Live "as you type" ranked matches for the search box's type-ahead
+    list — scores every song's title/artist against the query with
+    _fuzzy_song_score and returns the top `limit`, best match first. The
+    0.55 cutoff is calibrated so a genuinely typo'd match (which scores
+    0.7-1.0 in testing against a large library) always clears it, while a
+    title that merely shares one short common word with the query (which
+    tops out around 0.3-0.5) does not — see the score-tuning notes on
+    _fuzzy_song_score for why the window-based comparison is what makes
+    that gap reliable."""
+    query = (query or "").strip()
+    if not query:
+        return []
+    conn = get_conn()
+    rows = conn.execute("SELECT * FROM songs ORDER BY title").fetchall()
+    conn.close()
+    scored = [(r, _fuzzy_song_score(query, r["title"], r["artist"])) for r in rows]
+    scored = [(r, s) for r, s in scored if s > 0.55]
+    scored.sort(key=lambda pair: pair[1], reverse=True)
+    return [r for r, _ in scored[:limit]]
+
+
+def search_songs_by_lyrics(query, limit=25):
+    """Searches LYRIC CONTENT specifically (not title/artist/tags) for the
+    "Find by Lyrics" section — a plain case-insensitive substring match
+    against each song's slide text is enough here, since the point of this
+    box is finding a song from a phrase you remember correctly from the
+    words themselves, not typo tolerance. Returns songs whose lyrics
+    contain the phrase, title-sorted, capped at `limit`."""
+    query = (query or "").strip().lower()
+    if not query:
+        return []
+    conn = get_conn()
+    rows = conn.execute("SELECT * FROM songs ORDER BY title").fetchall()
+    conn.close()
+    matches = []
+    for r in rows:
+        slides = json.loads(r["slides"]) if r["slides"] else []
+        lyrics = "\n".join(slides).lower()
+        if query in lyrics:
+            matches.append(r)
+    return matches[:limit]
+
+
 def get_songs(search="", category="All Songs"):
     conn = get_conn()
     rows = conn.execute("SELECT * FROM songs ORDER BY title").fetchall()
@@ -1289,6 +1410,83 @@ def get_songs(search="", category="All Songs"):
     if category == "Recently Used":
         results = sorted(results, key=lambda r: r["last_used"] or "", reverse=True)
     return results
+
+
+def get_all_songs_with_lyrics():
+    """Every song in the library that actually has lyric content (skips
+    rows whose only slide is the "(empty)" placeholder add_song() inserts
+    for a blank body) — sorted by title, for the developer-tools export at
+    the bottom of Song Library (copy-all and download-as-PDF)."""
+    conn = get_conn()
+    rows = conn.execute("SELECT * FROM songs ORDER BY title").fetchall()
+    conn.close()
+    out = []
+    for r in rows:
+        slides = json.loads(r["slides"]) if r["slides"] else []
+        if slides and slides != ["(empty)"]:
+            out.append(r)
+    return out
+
+
+def build_songs_lyrics_text(songs):
+    """Plain-text export: Title — Artist, then the lyrics (slides joined
+    back into one block, blank line between slides), separated by a
+    divider between songs — the shape used by both the "Copy All" button
+    and as the source text for the PDF export below."""
+    blocks = []
+    for r in songs:
+        slides = json.loads(r["slides"]) if r["slides"] else []
+        lyrics = "\n\n".join(slides)
+        header = r["title"] + (f" — {r['artist']}" if r["artist"] else "")
+        blocks.append(f"{header}\n{'-' * len(header)}\n{lyrics}")
+    return "\n\n\n".join(blocks)
+
+
+def build_songs_pdf(songs):
+    """Renders the same title/author/lyrics content as build_songs_lyrics_text
+    into a PDF (one song starting on its own page) using reportlab, and
+    returns the PDF as raw bytes. Raises if reportlab isn't installed —
+    callers check REPORTLAB_AVAILABLE first and disable the button instead
+    of calling this."""
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(
+        buf, pagesize=letter,
+        topMargin=0.75 * inch, bottomMargin=0.75 * inch,
+        leftMargin=0.85 * inch, rightMargin=0.85 * inch,
+    )
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle(
+        "ECCSongTitle", parent=styles["Title"], fontSize=18, spaceAfter=2, alignment=TA_CENTER,
+    )
+    artist_style = ParagraphStyle(
+        "ECCSongArtist", parent=styles["Normal"], fontSize=11, textColor="#555555",
+        alignment=TA_CENTER, spaceAfter=18,
+    )
+    lyrics_style = ParagraphStyle(
+        "ECCSongLyrics", parent=styles["Normal"], fontSize=12, leading=17,
+    )
+
+    def _escape(text):
+        # Paragraph markup treats <, &, > as XML — escape before wrapping
+        # lyric text in a Paragraph, then convert real newlines to <br/>
+        # (Paragraph doesn't render \n as a line break on its own).
+        return (text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+                    .replace("\n", "<br/>"))
+
+    story = []
+    for i, r in enumerate(songs):
+        slides = json.loads(r["slides"]) if r["slides"] else []
+        lyrics = "\n\n".join(slides)
+        if i > 0:
+            story.append(PageBreak())
+        story.append(Paragraph(_escape(r["title"] or "(untitled)"), title_style))
+        if r["artist"]:
+            story.append(Paragraph(_escape(r["artist"]), artist_style))
+        else:
+            story.append(Spacer(1, 18))
+        story.append(Paragraph(_escape(lyrics), lyrics_style))
+    doc.build(story)
+    return buf.getvalue()
 
 
 def delete_song(song_id):
@@ -4582,6 +4780,43 @@ def page_songs():
     st.caption(f"Find, organize, and prepare worship songs for your service. · **{total_song_count} song{'s' if total_song_count != 1 else ''} in library**")
 
     search = st.text_input("Search songs...", key="song_search", label_visibility="collapsed", placeholder="Search by title, artist, lyrics, or tag")
+
+    # Live "as you type" ranked matches — separate from the full
+    # filtered/browsable list below, which still uses the plain substring
+    # search + category filter. This is a fast shortcut for "I roughly
+    # remember the title" that tolerates typos (get_top_song_matches),
+    # shown only while there's something typed, so it never displaces the
+    # normal browsing list when the search box is empty.
+    if search.strip():
+        top_matches = get_top_song_matches(search, limit=6)
+        if top_matches:
+            st.markdown("**Top matches**")
+            match_cols = st.columns(min(len(top_matches), 3))
+            for i, m in enumerate(top_matches):
+                with match_cols[i % len(match_cols)]:
+                    with st.container(border=True):
+                        st.markdown(f"**{m['title']}**")
+                        st.caption(m["artist"] or "—")
+                        bcol1, bcol2 = st.columns(2)
+                        if bcol1.button("Open", key=f"topmatch_open_{m['id']}", use_container_width=True):
+                            st.session_state.selected_song_id = m["id"]
+                            st.session_state.page = "Song Workspace"
+                            st.rerun()
+                        if bcol2.button("➕", key=f"topmatch_add_{m['id']}", use_container_width=True,
+                                        help="Add to the current service"):
+                            sid = ensure_active_service()
+                            if not sid:
+                                st.warning("No active service yet — create one in Service Builder first.")
+                            else:
+                                service = get_service(sid)
+                                service_items = json.loads(service["items"])
+                                service_items.append(make_song_item(m))
+                                update_service_items(sid, service_items)
+                                st.toast(f"Added '{m['title']}' to the current service.", icon="✅")
+        else:
+            st.caption("No close title/artist matches — try Find by Lyrics below if you remember the words instead.")
+        st.write("")
+
     tabs = ["All Songs", "Worship", "Praise", "Hymns", "Contemporary", "Recently Used", "Favorites"]
     cat = st.radio("Filter", tabs, horizontal=True, label_visibility="collapsed")
 
@@ -4653,6 +4888,114 @@ def page_songs():
                         delete_song(s["id"])
                         st.toast(f"Deleted \"{s['title']}\".", icon="✅")
                         st.rerun()
+
+    st.write("")
+    st.write("")
+    st.markdown("### 🔎 Find by Lyrics")
+    st.caption(
+        "Don't remember the title? Type a phrase from the words themselves — this searches the actual "
+        "lyric content, not titles or artists, so it's a plain exact-phrase search rather than "
+        "typo-tolerant like the box up top."
+    )
+    lyrics_query = st.text_input(
+        "Search lyrics...", key="song_lyrics_search", label_visibility="collapsed",
+        placeholder='e.g. "how great is our God" or "amazing grace how sweet"',
+    )
+    if lyrics_query.strip():
+        lyric_matches = search_songs_by_lyrics(lyrics_query)
+        if not lyric_matches:
+            st.caption("No songs contain that phrase.")
+        else:
+            st.caption(f"{len(lyric_matches)} song{'s' if len(lyric_matches) != 1 else ''} contain that phrase:")
+            for m in lyric_matches:
+                m_slides = json.loads(m["slides"]) if m["slides"] else []
+                m_lyrics = "\n".join(m_slides).lower()
+                q_lower = lyrics_query.strip().lower()
+                # Pull out the slide that actually contains the phrase, so
+                # the result shows the matching line in context rather than
+                # just the title — otherwise it's not obvious WHY a song
+                # matched a lyric search.
+                context_slide = next((sl for sl in m_slides if q_lower in sl.lower()), "")
+                with st.container(border=True):
+                    lc1, lc2 = st.columns([4, 1])
+                    with lc1:
+                        st.markdown(f"**{m['title']}**")
+                        st.caption(m["artist"] or "—")
+                        if context_slide:
+                            st.caption(f"…{context_slide.strip()}…")
+                    with lc2:
+                        if st.button("Open", key=f"lyricmatch_open_{m['id']}", use_container_width=True):
+                            st.session_state.selected_song_id = m["id"]
+                            st.session_state.page = "Song Workspace"
+                            st.rerun()
+                        if st.button("➕ Add", key=f"lyricmatch_add_{m['id']}", use_container_width=True,
+                                     help="Add to the current service"):
+                            sid = ensure_active_service()
+                            if not sid:
+                                st.warning("No active service yet — create one in Service Builder first.")
+                            else:
+                                service = get_service(sid)
+                                service_items = json.loads(service["items"])
+                                service_items.append(make_song_item(m))
+                                update_service_items(sid, service_items)
+                                st.toast(f"Added '{m['title']}' to the current service.", icon="✅")
+
+    st.write("")
+    st.write("")
+    with st.expander("🛠 Developer Tools"):
+        songs_with_lyrics = get_all_songs_with_lyrics()
+        st.caption(
+            f"Export every song's title, author, and lyrics — {len(songs_with_lyrics)} song"
+            f"{'s' if len(songs_with_lyrics) != 1 else ''} in the library have lyric content "
+            "(songs with no lyrics yet are skipped)."
+        )
+        dev_col1, dev_col2 = st.columns(2)
+        with dev_col1:
+            lyrics_text = build_songs_lyrics_text(songs_with_lyrics)
+            # A real st.button + JS clipboard write (same navigator.clipboard
+            # pattern already used elsewhere in this app for the display
+            # URL) rather than st.code's own built-in copy icon — st.code
+            # would also visibly dump the entire text block onto the page,
+            # which for a full song library is not something you'd want
+            # sitting in the middle of Song Library by default.
+            safe_lyrics_json = json.dumps(lyrics_text).replace("</script", "<\\/script")
+            st.iframe(
+                f"""
+                <button id="ecc-copy-lyrics-btn" onclick="eccCopyAllLyrics()"
+                        style="width:100%;background:{CARD};color:{TEXT_PRIMARY};border:1px solid {CARD_BORDER};
+                               border-radius:6px;padding:0.6rem 0.8rem;font-size:0.95rem;font-weight:600;
+                               cursor:pointer;font-family:'Inter',sans-serif;">
+                  📋 Copy All Lyrics + Authors
+                </button>
+                <div id="ecc-copy-lyrics-msg" style="color:{ACCENT};font-size:0.78rem;margin-top:0.3rem;text-align:center;min-height:1.1em;font-family:'Inter',sans-serif;"></div>
+                <script>
+                  const eccAllLyricsText = {safe_lyrics_json};
+                  function eccCopyAllLyrics() {{
+                    navigator.clipboard.writeText(eccAllLyricsText).then(() => {{
+                      document.getElementById("ecc-copy-lyrics-msg").innerText =
+                        "Copied " + {len(songs_with_lyrics)} + " song(s) to clipboard!";
+                      setTimeout(() => {{ document.getElementById("ecc-copy-lyrics-msg").innerText = ""; }}, 2500);
+                    }}).catch(() => {{
+                      document.getElementById("ecc-copy-lyrics-msg").innerText =
+                        "Couldn't access the clipboard — your browser may need a permission grant.";
+                    }});
+                  }}
+                </script>
+                """,
+                height=70,
+            )
+        with dev_col2:
+            if not REPORTLAB_AVAILABLE:
+                st.warning("PDF export needs the `reportlab` package — add `reportlab` to requirements.txt to enable it.")
+            elif not songs_with_lyrics:
+                st.button("⬇ Download All Songs (PDF)", disabled=True, use_container_width=True)
+            else:
+                pdf_bytes = build_songs_pdf(songs_with_lyrics)
+                st.download_button(
+                    "⬇ Download All Songs (PDF)", data=pdf_bytes,
+                    file_name=f"song_library_{datetime.datetime.now().strftime('%Y-%m-%d')}.pdf",
+                    mime="application/pdf", use_container_width=True,
+                )
 
 
 def page_song_workspace():

@@ -1,3 +1,4 @@
+#pip install -r requirements.txt
 #git status ; git add . ; git commit -m "Your commit message" ; git push
 
 """
@@ -64,6 +65,12 @@ try:
     REPORTLAB_AVAILABLE = True
 except ImportError:
     REPORTLAB_AVAILABLE = False
+
+try:
+    from st_keyup import st_keyup  # live "top matches" search box — updates while typing, not just on Enter/blur
+    ST_KEYUP_AVAILABLE = True
+except ImportError:
+    ST_KEYUP_AVAILABLE = False
 
 # ---------------------------------------------------------------------------
 # CONFIG / CONSTANTS
@@ -4774,12 +4781,68 @@ def page_dashboard():
                 st.session_state.active_service_id = s["id"]; st.session_state.page = "Service Builder"; st.rerun()
 
 
+def _live_search_input(label, key, placeholder=""):
+    """Text input for the song-title search boxes that updates its value
+    WHILE TYPING, not just on Enter/blur like a plain st.text_input — that
+    Enter/blur-only behavior is a real, long-standing core-Streamlit
+    limitation (there's no built-in way around it), so this uses the
+    st_keyup component when it's installed, with a short debounce so it
+    doesn't re-score the whole library on every single keystroke while
+    someone is still mid-word. Falls back to a plain st.text_input (the
+    old Enter/blur behavior, label collapsed to match how this box always
+    looked before) if st_keyup isn't installed, so the page still works —
+    just without the type-ahead responsiveness — rather than crashing.
+    st_keyup's own parameter set doesn't include label_visibility, so its
+    label stays visible rather than risking an unsupported-kwarg error by
+    passing one through.
+    """
+    if ST_KEYUP_AVAILABLE:
+        return st_keyup(label, key=key, placeholder=placeholder, debounce=200) or ""
+    return st.text_input(label, key=key, placeholder=placeholder, label_visibility="collapsed")
+
+
+def _render_top_song_matches(query, key_prefix, on_add=None):
+    """Renders the "Top matches" row of ranked fuzzy title/artist matches
+    for `query` — shared between Song Library and Service Builder so both
+    get identical matching/ranking behavior from one implementation rather
+    than two copies that could drift apart. `on_add(song_row)` is called
+    when the operator clicks the add button on a match; Song Library and
+    Service Builder each pass in their own "add this song" action (Song
+    Library adds straight to the active service same as its other Add
+    buttons; Service Builder adds to whichever service is open there).
+    Returns True if at least one match was shown (so callers can decide
+    whether to also show a "no matches" fallback message).
+    """
+    top_matches = get_top_song_matches(query, limit=6)
+    if not top_matches:
+        return False
+    st.markdown("**Top matches**")
+    match_cols = st.columns(min(len(top_matches), 3))
+    for i, m in enumerate(top_matches):
+        with match_cols[i % len(match_cols)]:
+            with st.container(border=True):
+                st.markdown(f"**{m['title']}**")
+                st.caption(m["artist"] or "—")
+                bcol1, bcol2 = st.columns(2)
+                if bcol1.button("Open", key=f"{key_prefix}_open_{m['id']}", use_container_width=True):
+                    st.session_state.selected_song_id = m["id"]
+                    st.session_state.page = "Song Workspace"
+                    st.rerun()
+                if bcol2.button("➕", key=f"{key_prefix}_add_{m['id']}", use_container_width=True,
+                                help="Add to the current service"):
+                    if on_add:
+                        on_add(m)
+    return True
+
+
 def page_songs():
     st.markdown("### Songs")
     total_song_count = get_song_count()
     st.caption(f"Find, organize, and prepare worship songs for your service. · **{total_song_count} song{'s' if total_song_count != 1 else ''} in library**")
 
-    search = st.text_input("Search songs...", key="song_search", label_visibility="collapsed", placeholder="Search by title, artist, lyrics, or tag")
+    search = _live_search_input("Search songs...", key="song_search", placeholder="Search by title, artist, lyrics, or tag")
+    if not ST_KEYUP_AVAILABLE:
+        st.caption("Tip: add `streamlit-keyup` to requirements.txt so Top Matches updates while you type instead of after Enter.")
 
     # Live "as you type" ranked matches — separate from the full
     # filtered/browsable list below, which still uses the plain substring
@@ -4788,32 +4851,19 @@ def page_songs():
     # shown only while there's something typed, so it never displaces the
     # normal browsing list when the search box is empty.
     if search.strip():
-        top_matches = get_top_song_matches(search, limit=6)
-        if top_matches:
-            st.markdown("**Top matches**")
-            match_cols = st.columns(min(len(top_matches), 3))
-            for i, m in enumerate(top_matches):
-                with match_cols[i % len(match_cols)]:
-                    with st.container(border=True):
-                        st.markdown(f"**{m['title']}**")
-                        st.caption(m["artist"] or "—")
-                        bcol1, bcol2 = st.columns(2)
-                        if bcol1.button("Open", key=f"topmatch_open_{m['id']}", use_container_width=True):
-                            st.session_state.selected_song_id = m["id"]
-                            st.session_state.page = "Song Workspace"
-                            st.rerun()
-                        if bcol2.button("➕", key=f"topmatch_add_{m['id']}", use_container_width=True,
-                                        help="Add to the current service"):
-                            sid = ensure_active_service()
-                            if not sid:
-                                st.warning("No active service yet — create one in Service Builder first.")
-                            else:
-                                service = get_service(sid)
-                                service_items = json.loads(service["items"])
-                                service_items.append(make_song_item(m))
-                                update_service_items(sid, service_items)
-                                st.toast(f"Added '{m['title']}' to the current service.", icon="✅")
-        else:
+        def _add_to_service(song_row):
+            sid = ensure_active_service()
+            if not sid:
+                st.warning("No active service yet — create one in Service Builder first.")
+            else:
+                service = get_service(sid)
+                service_items = json.loads(service["items"])
+                service_items.append(make_song_item(song_row))
+                update_service_items(sid, service_items)
+                st.toast(f"Added '{song_row['title']}' to the current service.", icon="✅")
+
+        found = _render_top_song_matches(search, key_prefix="songlib_topmatch", on_add=_add_to_service)
+        if not found:
             st.caption("No close title/artist matches — try Find by Lyrics below if you remember the words instead.")
         st.write("")
 
@@ -5541,7 +5591,19 @@ def page_service_builder():
     with a1:
         render_html('<div class="ecc-sb-add-card"><div class="ecc-sb-add-icon">🎵</div><div class="ecc-sb-add-label">Song</div></div>')
         with st.popover("Add Song", use_container_width=True):
-            song_search = st.text_input("Search songs", key="add_song_search", placeholder="Search by title, artist, or lyrics")
+            song_search = _live_search_input("Search songs", key="add_song_search", placeholder="Search by title, artist, or lyrics")
+
+            def _add_song_to_this_service(song_row):
+                items.append(make_song_item(song_row))
+                update_service_items(sid, items)
+                st.toast(f"Added \"{song_row['title']}\" — pick another or close when done.", icon="✅")
+                st.rerun()
+
+            if song_search.strip():
+                found = _render_top_song_matches(song_search, key_prefix="sb_topmatch", on_add=_add_song_to_this_service)
+                if found:
+                    st.write("")
+                    st.caption("Not the one? Pick from the full filtered list below instead.")
             song_options = {s["id"]: dict(s) for s in get_songs(search=song_search)}
             if song_options:
                 pick_id = st.selectbox(
@@ -7385,3 +7447,10 @@ if __name__ == "__main__":
 # NLT API SECRET (COPY INTO .streamlit/secrets.toml — DO NOT COMMIT THE REAL KEY)
 # ---------------------------------------------------------------------------
 # NLT_API_KEY = "PASTE_YOUR_NLT_API_KEY_HERE"
+
+# ---------------------------------------------------------------------------
+# OPTIONAL PACKAGES (ADD TO requirements.txt TO ENABLE)
+# ---------------------------------------------------------------------------
+# reportlab        — needed for Song Library's "Download All Songs (PDF)"
+# streamlit-keyup  — needed for "Top matches" to update while typing
+#                    instead of only after pressing Enter/clicking away

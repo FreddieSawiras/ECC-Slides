@@ -42,6 +42,7 @@ import shutil
 import unicodedata
 import threading
 import difflib
+import secrets
 
 try:
     from PIL import Image, ImageFilter, ImageEnhance
@@ -521,6 +522,14 @@ LOGIN_USERNAME = "ECC"
 LOGIN_PASSWORD = "5015"
 
 _DB_INITIALIZED = False  # see main() — makes init_db() run once per process, not once per click
+
+# Login tokens issued this server run — see main()'s refresh-survives-but-
+# close-doesn't login persistence. A plain in-process set (not the DB):
+# it deliberately does NOT survive an actual server restart/redeploy,
+# which is the same "front door locks again" behavior a closed tab gets,
+# just extended to cover the server-restart case too rather than leaving
+# a stale token in the URL silently work forever.
+_ACTIVE_LOGIN_TOKENS = set()
 BG = "#0D0C0A"               # warm near-black (cinematic warm dark vs. cold tech dark)
 CARD = "#17161A"             # charcoal card, warmed to match BG
 CARD_BORDER = "#26252A"
@@ -1290,6 +1299,36 @@ def get_song_count():
     return n
 
 
+def compute_song_usage():
+    """Scans every saved service's items once and returns, per song id:
+    play_count (how many services it appears in) and last_played
+    (that song's most recent service_date, as a string). This is the
+    source of truth for "how often / how recently has this song
+    actually been used" — the songs table's own last_used column is
+    never written to anywhere in the app, so it can't be trusted for
+    this; a song's real usage history only exists as its appearances
+    inside services.items. Used by both the Analytics page and the
+    dashboard's rotation-suggestion section, so both read identical
+    numbers from one pass over the data instead of two slightly
+    different queries drifting apart."""
+    services = get_services()
+    usage = {}  # song_id -> {"play_count": int, "last_played": str or None}
+    for s in services:
+        items = json.loads(s["items"])
+        service_date = s["service_date"] or ""
+        for item in items:
+            if item.get("type") != "song":
+                continue
+            sid = item.get("ref_id")
+            if sid is None:
+                continue
+            entry = usage.setdefault(sid, {"play_count": 0, "last_played": None})
+            entry["play_count"] += 1
+            if entry["last_played"] is None or service_date > entry["last_played"]:
+                entry["last_played"] = service_date
+    return usage
+
+
 def _normalize_for_fuzzy(text):
     """Strips punctuation (commas, parentheses, etc.) before fuzzy
     comparison — a typo-prone typist won't reliably reproduce punctuation
@@ -1564,6 +1603,61 @@ def delete_songs(song_ids):
     conn.executemany("DELETE FROM songs WHERE id=?", [(sid,) for sid in song_ids])
     conn.commit()
     conn.close()
+
+
+def restore_song(song_dict):
+    """Re-inserts a song from a dict previously captured via dict(row) —
+    used by the undo-delete affordance. Deliberately does NOT force the
+    old id back (the id column is AUTOINCREMENT and the row may already
+    be gone from any cache); a fresh id is fine since nothing else
+    references a deleted song's id by the time undo is clicked."""
+    conn = get_conn()
+    conn.execute(
+        "INSERT INTO songs(title, artist, category, tags, slides, favorite, last_used) VALUES (?,?,?,?,?,?,?)",
+        (song_dict.get("title"), song_dict.get("artist"), song_dict.get("category"),
+         song_dict.get("tags"), song_dict.get("slides"), song_dict.get("favorite", 0),
+         song_dict.get("last_used")),
+    )
+    conn.commit()
+    conn.close()
+
+
+def _stash_undo(kind, payload, label):
+    """Stashes ONE undo-able deletion in session state (a single slot, not
+    a stack — a second delete before undoing the first simply replaces it,
+    same as most apps' "last action" undo). Rendered as an inline banner
+    by render_undo_banner() at the top of the page that triggered the
+    delete, since st.toast can't host a clickable button."""
+    st.session_state["_ecc_undo"] = {"kind": kind, "payload": payload, "label": label}
+
+
+def render_undo_banner():
+    """Shows a one-line 'Deleted X. [Undo]' banner if something was just
+    deleted on THIS page and hasn't been undone (or dismissed by any other
+    action) yet. Call this near the top of any page that stashes an undo
+    via _stash_undo. Clicking Undo restores the row(s) and clears the
+    stash; anything else that touches the page's normal buttons naturally
+    clears it too since every button click triggers a rerun and the stash
+    is only re-shown if still present — callers that want it to persist
+    across unrelated reruns simply don't clear it, so by default it stays
+    until Undo is clicked or the browser tab is closed."""
+    pending = st.session_state.get("_ecc_undo")
+    if not pending:
+        return
+    banner_cols = st.columns([5, 1])
+    with banner_cols[0]:
+        st.markdown(
+            f'<div class="ecc-undo-banner">{pending["label"]}</div>',
+            unsafe_allow_html=True,
+        )
+    with banner_cols[1]:
+        if st.button("Undo", key="ecc_undo_btn", use_container_width=True):
+            if pending["kind"] == "songs":
+                for song_dict in pending["payload"]:
+                    restore_song(song_dict)
+                st.toast(f"Restored {len(pending['payload'])} song(s).", icon="↩️")
+            st.session_state["_ecc_undo"] = None
+            st.rerun()
 
 
 def get_song(song_id):
@@ -1974,6 +2068,27 @@ def update_service_items(service_id, items):
 def duplicate_service(service_id):
     s = get_service(service_id)
     return create_service(f"{s['name']} (Copy)", s["service_date"], s["service_time"], json.loads(s["items"]))
+
+
+def duplicate_service_next_week(service_id):
+    """Same as duplicate_service, but shifts the date forward 7 days
+    instead of copying it verbatim — the common case is "build next
+    Sunday off of this Sunday's plan". service_date is free-text (see
+    page_service_builder's date field), so this only shifts it when it
+    actually parses as YYYY-MM-DD; otherwise it falls back to an exact
+    copy rather than guessing or raising, and the caller's toast makes
+    clear which happened."""
+    s = get_service(service_id)
+    original_date = s["service_date"] or ""
+    try:
+        parsed = datetime.date.fromisoformat(original_date.strip())
+        new_date = str(parsed + datetime.timedelta(days=7))
+        shifted = True
+    except ValueError:
+        new_date = original_date
+        shifted = False
+    new_id = create_service(f"{s['name']} (Copy)", new_date, s["service_time"], json.loads(s["items"]))
+    return new_id, shifted
 
 
 # ---------------- Presentation state (shared between operator + projector) ----------------
@@ -3243,6 +3358,16 @@ def inject_css():
         box-shadow: 0 0 0 3px {BLACK_RED}22 !important;
     }}
 
+    /* Undo banner — shown by render_undo_banner() right after a delete,
+       paired with an inline "Undo" button in the caller. Amber (not gold,
+       not the destructive red) so it reads as "you can still act on
+       this" rather than either a brand action or a warning. */
+    .ecc-undo-banner {{
+        background: {PAUSE_AMBER}14; border: 1px solid {PAUSE_AMBER}55; border-radius: {RADIUS_SM};
+        padding: 0.55rem 0.9rem; color: {TEXT_PRIMARY}; font-size: 0.88rem;
+        display: flex; align-items: center; height: 100%;
+    }}
+
     /* Active nav item — sidebar() adds .ecc-nav-active to the button
        wrapper for whichever label matches st.session_state.page. */
     .ecc-nav-active .stButton>button {{
@@ -3252,6 +3377,99 @@ def inject_css():
     section[data-testid="stSidebar"] .stMarkdown h6 {{
         letter-spacing: 0.16em; font-size: 0.68rem; color: {TEXT_MUTED} !important;
         text-transform: uppercase; margin-top: 0.6rem;
+    }}
+
+    /* ---- Dashboard: stat tiles, quick-action tiles, service grid ---- */
+    /* Stat strip — small metric cards under the hero. Reuses .ecc-num for
+       the figure itself so the numbers read as data (tabular, monospace)
+       against the Inter/Manrope prose everywhere else. */
+    .ecc-stat {{
+        background: linear-gradient(160deg, {CARD} 0%, #131217 100%);
+        border: 1px solid {CARD_BORDER}; border-radius: {RADIUS_MD};
+        padding: 1rem 1.2rem; box-shadow: {SHADOW_REST};
+        transition: border-color .18s ease, transform .18s ease;
+    }}
+    .ecc-stat:hover {{ border-color: {ACCENT}55; transform: translateY(-1px); }}
+    .ecc-stat-value {{
+        font-family: var(--ecc-num); font-variant-numeric: tabular-nums;
+        font-weight: 700; font-size: 1.6rem; color: {TEXT_PRIMARY}; line-height: 1.1;
+    }}
+    .ecc-stat-label {{
+        text-transform: uppercase; letter-spacing: .1em; font-size: 0.68rem;
+        color: {TEXT_MUTED}; font-weight: 700; margin-top: 0.3rem;
+    }}
+    /* Quick-action tiles — bigger tap target than a plain st.button, icon
+       stacked above label. The wrapping div gets a class via
+       st.container(key=...) -> "st-key-ecc-action-<slug>" (Streamlit
+       mirrors container keys onto the DOM), matching the same pattern
+       already used for .ecc-danger / del_wrap_ buttons above. */
+    div[class*="st-key-ecc-action-"] .stButton>button {{
+        background: linear-gradient(160deg, {CARD} 0%, #131217 100%) !important;
+        border: 1px solid {CARD_BORDER} !important; border-radius: {RADIUS_MD} !important;
+        padding: 1.1rem 0.6rem !important; height: auto !important;
+        font-size: 0.92rem !important; font-weight: 700 !important;
+        white-space: normal !important; line-height: 1.35 !important;
+        box-shadow: {SHADOW_REST} !important;
+        transition: border-color .15s ease, box-shadow .15s ease, transform .15s ease !important;
+    }}
+    div[class*="st-key-ecc-action-"] .stButton>button:hover {{
+        border-color: {ACCENT} !important; color: {ACCENT} !important;
+        box-shadow: 0 6px 20px {ACCENT}22 !important; transform: translateY(-2px) !important;
+    }}
+    /* Recent Services grid card — replaces the old full-width
+       st.container(border=True) rows so cards sit side-by-side instead of
+       stacking into a long scroll. */
+    .ecc-svc-card {{
+        background: linear-gradient(160deg, {CARD} 0%, #131217 100%);
+        border: 1px solid {CARD_BORDER}; border-radius: {RADIUS_MD};
+        padding: 1.1rem 1.2rem 0.9rem; margin-bottom: 0.9rem;
+        box-shadow: {SHADOW_REST}; transition: border-color .18s ease, transform .18s ease;
+        min-height: 92px;
+    }}
+    .ecc-svc-card:hover {{ border-color: {ACCENT}55; transform: translateY(-1px); }}
+    .ecc-svc-name {{ font-weight: 700; font-size: 0.98rem; color: {TEXT_PRIMARY}; }}
+    /* Hero mini progress bar — "X/Y items ready" under the Today's Service
+       headline. Width is set inline per-render via style="width:NN%". */
+    .ecc-progress-track {{
+        width: 100%; height: 6px; border-radius: 999px; background: {CARD_BORDER};
+        margin-top: 0.7rem; overflow: hidden;
+    }}
+    .ecc-progress-fill {{
+        height: 100%; border-radius: 999px;
+        background: linear-gradient(90deg, {ACCENT}, #E8C878);
+        transition: width .3s ease;
+    }}
+
+    /* Next-up ticker (Presentation page, operator screen only) — compact
+       text rows previewing the 2 slides after the one already shown in
+       "Up Next" above it. Deliberately plain/small: this is a lookahead
+       aid, not another slide preview competing with the real one. */
+    .ecc-ticker {{
+        max-width: 520px; margin: 0.6rem auto 0; border: 1px solid {CARD_BORDER};
+        border-radius: {RADIUS_SM}; overflow: hidden; background: {CARD};
+    }}
+    .ecc-ticker-row {{
+        display: flex; align-items: center; gap: 0.6rem;
+        padding: 0.4rem 0.7rem; border-bottom: 1px solid {CARD_BORDER};
+        font-size: 0.8rem;
+    }}
+    .ecc-ticker-row:last-child {{ border-bottom: none; }}
+    .ecc-ticker-n {{
+        font-family: var(--ecc-num); font-variant-numeric: tabular-nums;
+        color: {TEXT_MUTED}; font-weight: 700; min-width: 1.2rem;
+    }}
+    .ecc-ticker-text {{ color: {TEXT_MUTED}; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }}
+
+    /* Command palette (Cmd/Ctrl+K) — the overlay backdrop itself is
+       injected as raw HTML (see _render_command_palette) since it needs
+       to sit behind Streamlit's own centered column at a specific
+       z-index; this panel style covers the actual content column. */
+    .ecc-palette-panel {{
+        position: relative; z-index: 999998;
+        background: linear-gradient(160deg, {CARD} 0%, #131217 100%);
+        border: 1px solid {ACCENT}55; border-radius: {RADIUS_LG};
+        padding: 1.4rem 1.6rem; margin-top: 8vh;
+        box-shadow: 0 8px 40px rgba(0,0,0,0.5);
     }}
 
     /* Semantic status badges — Live / Black / Paused. Apply via
@@ -4626,7 +4844,7 @@ def sidebar():
         for label in ["Dashboard", "Service Builder", "Presentation"]:
             nav_button(label)
         st.markdown("###### LIBRARY")
-        for label in ["Song Library", "Import Slides", "Bible", "Saved Services"]:
+        for label in ["Song Library", "Import Slides", "Bible", "Saved Services", "Analytics"]:
             nav_button(label)
         st.markdown("###### SETTINGS")
         for label in ["Church Settings", "Display Settings", "Database"]:
@@ -4745,6 +4963,67 @@ def sidebar():
 # PAGES
 # ---------------------------------------------------------------------------
 
+def _dashboard_stat(label, value):
+    """One small metric tile for the dashboard stat strip. Kept as a tiny
+    helper (rather than inlined 4x) so the markup for every tile is
+    guaranteed identical."""
+    render_html(f"""
+    <div class="ecc-stat">
+        <div class="ecc-stat-value ecc-num">{value}</div>
+        <div class="ecc-stat-label">{label}</div>
+    </div>
+    """)
+
+
+def _dashboard_service_card(s):
+    """One card in the Recent Services grid: name, date, counts, and a
+    Live/Black/Paused-style status pill when this is the service currently
+    loaded into presentation_state (reuses the same semantic status colors
+    as render_status_badge on the Presentation page, so 'this is the one
+    that's live right now' reads identically in both places)."""
+    items = json.loads(s["items"])
+    n_songs = sum(1 for i in items if i["type"] == "song")
+    n_bible = sum(1 for i in items if i["type"] == "bible")
+
+    state = get_state()
+    is_loaded = state.get("service_id") == s["id"]
+    if is_loaded and bool(state.get("black")):
+        status_html = '<span class="ecc-status ecc-status-black">Black</span>'
+    elif is_loaded and bool(state.get("cleared")):
+        status_html = '<span class="ecc-status ecc-status-paused">Paused</span>'
+    elif is_loaded and bool(state.get("live")):
+        status_html = '<span class="ecc-status ecc-status-live">Live</span>'
+    else:
+        status_html = ""
+
+    render_html(f"""
+    <div class="ecc-svc-card">
+        <div style="display:flex; align-items:flex-start; justify-content:space-between; gap:0.5rem;">
+            <div class="ecc-svc-name">{s['name']}</div>
+            {status_html}
+        </div>
+        <div class="ecc-muted" style="margin-top:0.2rem;">
+            {s['service_date']} · {n_songs} song{'s' if n_songs != 1 else ''} ·
+            {n_bible} Bible passage{'s' if n_bible != 1 else ''}
+        </div>
+    </div>
+    """)
+    b1, b2, b3 = st.columns(3)
+    if b1.button("Open", key=f"open_{s['id']}", use_container_width=True):
+        st.session_state.active_service_id = s["id"]; st.session_state.page = "Presentation"; st.rerun()
+    if b2.button("Edit", key=f"edit_{s['id']}", use_container_width=True):
+        st.session_state.active_service_id = s["id"]; st.session_state.page = "Service Builder"; st.rerun()
+    if b3.button("Duplicate", key=f"dup_{s['id']}", use_container_width=True):
+        duplicate_service(s["id"]); st.rerun()
+    if st.button("📅 Duplicate → Next Sunday", key=f"dupnext_{s['id']}", use_container_width=True):
+        _, shifted = duplicate_service_next_week(s["id"])
+        if shifted:
+            st.toast(f"Created a copy of '{s['name']}' dated one week later.", icon="📅")
+        else:
+            st.toast(f"Created a copy of '{s['name']}' — couldn't parse the original date, so it copied as-is.", icon="⚠️")
+        st.rerun()
+
+
 def page_dashboard():
     settings = get_settings()
     st.markdown(f"### Good morning, {settings['church_name']}.")
@@ -4752,19 +5031,37 @@ def page_dashboard():
     services = get_services()
     upcoming = services[0] if services else None
 
+    # ---- Hero: today's service, with a small progress bar showing how
+    # much of the service is actually built out (items present) rather
+    # than just a static "Ready / Not yet built" line of text. ----
     st.markdown('<div class="ecc-hero">', unsafe_allow_html=True)
     if upcoming:
         items = json.loads(upcoming["items"])
         n_songs = sum(1 for i in items if i["type"] == "song")
         n_bible = sum(1 for i in items if i["type"] == "bible")
+        n_items = len(items)
+        # "Readiness" is a simple proxy: a service with at least a handful
+        # of items prepared reads as further along than an empty shell.
+        # Capped at 8 items = 100% so the bar isn't perpetually near-empty
+        # for a normal-sized service.
+        pct = min(100, round((n_items / 8) * 100)) if n_items else 0
+
         st.markdown('<div class="ecc-label">Today\'s Service</div>', unsafe_allow_html=True)
         st.markdown(f"## {upcoming['name']}")
         st.markdown(
             f'<span class="ecc-muted">{upcoming["service_date"]} · {upcoming["service_time"] or "TBD"} · '
-            f'{n_songs} songs prepared · {n_bible} passages prepared · '
-            f'{"Ready to present" if items else "Not yet built"}</span>',
+            f'{n_songs} songs prepared · {n_bible} passages prepared</span>',
             unsafe_allow_html=True,
         )
+        render_html(f"""
+        <div class="ecc-progress-track">
+            <div class="ecc-progress-fill" style="width:{pct}%;"></div>
+        </div>
+        <div class="ecc-muted" style="margin-top:0.35rem; font-size:0.78rem;">
+            {n_items} item{'s' if n_items != 1 else ''} prepared ·
+            {"Ready to present" if items else "Not yet built"}
+        </div>
+        """)
         st.write("")
         col1, _ = st.columns([1, 3])
         with col1:
@@ -4780,34 +5077,134 @@ def page_dashboard():
         st.caption("Create one to get started.")
     st.markdown('</div>', unsafe_allow_html=True)
 
-    st.markdown("#### Quick Actions")
-    c1, c2, c3, c4 = st.columns(4)
-    if c1.button("➕ Create Service", use_container_width=True):
-        st.session_state.page = "Service Builder"; st.rerun()
-    if c2.button("🎵 Add Song", use_container_width=True):
-        st.session_state.page = "Song Library"; st.session_state.show_add_song = True; st.rerun()
-    if c3.button("📖 Find Bible Verse", use_container_width=True):
-        st.session_state.page = "Bible"; st.rerun()
-    if c4.button("▶ Start Presentation", use_container_width=True):
-        st.session_state.page = "Presentation"; st.rerun()
+    # ---- Stat strip: at-a-glance numbers, using the same tabular-num
+    # treatment the rest of the app reserves for data (slide counts,
+    # timers). Previously the dashboard showed zero real numbers outside
+    # the hero card. ----
+    total_songs = get_song_count()
+    total_services = len(services)
+    total_service_items = sum(len(json.loads(s["items"])) for s in services) if services else 0
+    avg_items = round(total_service_items / total_services, 1) if total_services else 0
 
+    stat_cols = st.columns(4)
+    with stat_cols[0]:
+        _dashboard_stat("Songs in Library", total_songs)
+    with stat_cols[1]:
+        _dashboard_stat("Saved Services", total_services)
+    with stat_cols[2]:
+        _dashboard_stat("Avg. Items / Service", avg_items)
+    with stat_cols[3]:
+        state = get_state()
+        live_now = bool(state.get("live")) and not bool(state.get("black")) and not bool(state.get("cleared"))
+        _dashboard_stat("Presentation", "Live" if live_now else "Idle")
+
+    st.write("")
+
+    # ---- Quick Actions: icon tiles instead of plain buttons — bigger tap
+    # target, same gold-glow-on-hover language as the meeting-picker
+    # buttons elsewhere in the app, via the .ecc-action-* container keys
+    # wired up in inject_css(). ----
+    st.markdown("#### Quick Actions")
+    a1, a2, a3, a4 = st.columns(4)
+    with a1:
+        with st.container(key="ecc-action-create"):
+            if st.button("➕\n\nCreate Service", use_container_width=True):
+                st.session_state.page = "Service Builder"; st.rerun()
+    with a2:
+        with st.container(key="ecc-action-addsong"):
+            if st.button("🎵\n\nAdd Song", use_container_width=True):
+                st.session_state.page = "Song Library"; st.session_state.show_add_song = True; st.rerun()
+    with a3:
+        with st.container(key="ecc-action-bible"):
+            if st.button("📖\n\nFind Bible Verse", use_container_width=True):
+                st.session_state.page = "Bible"; st.rerun()
+    with a4:
+        with st.container(key="ecc-action-present"):
+            if st.button("▶\n\nStart Presentation", use_container_width=True):
+                st.session_state.page = "Presentation"; st.rerun()
+
+    st.write("")
+
+    # ---- Recent Services: a real grid (2 per row) instead of a vertical
+    # stack, so cards use the page's horizontal space instead of forcing a
+    # long scroll for 5 services. ----
     st.markdown("#### Recent Services")
     if not services:
         st.caption("Nothing here yet — your saved services will appear as cards.")
-    for s in services[:5]:
-        items = json.loads(s["items"])
-        n_songs = sum(1 for i in items if i["type"] == "song")
-        n_bible = sum(1 for i in items if i["type"] == "bible")
-        with st.container(border=True):
-            st.markdown(f"**{s['name']}**")
-            st.markdown(f'<span class="ecc-muted">{s["service_date"]} · {n_songs} songs · {n_bible} Bible passages</span>', unsafe_allow_html=True)
-            b1, b2, b3 = st.columns(3)
-            if b1.button("Open", key=f"open_{s['id']}"):
-                st.session_state.active_service_id = s["id"]; st.session_state.page = "Presentation"; st.rerun()
-            if b2.button("Duplicate", key=f"dup_{s['id']}"):
-                duplicate_service(s["id"]); st.rerun()
-            if b3.button("Edit", key=f"edit_{s['id']}"):
-                st.session_state.active_service_id = s["id"]; st.session_state.page = "Service Builder"; st.rerun()
+    else:
+        recent = services[:6]
+        for row_start in range(0, len(recent), 2):
+            row_services = recent[row_start:row_start + 2]
+            grid_cols = st.columns(2)
+            for col, s in zip(grid_cols, row_services):
+                with col:
+                    _dashboard_service_card(s)
+
+    st.write("")
+    _render_rotation_suggestions()
+
+
+ROTATION_WEEKS_THRESHOLD = 6  # a song is "due for rotation" once it's been
+                               # this many weeks (or more) since it last
+                               # appeared in a saved service — or was never
+                               # used at all.
+
+
+def _render_rotation_suggestions():
+    """Dashboard section: songs that haven't been played in
+    ROTATION_WEEKS_THRESHOLD+ weeks (or ever), so operators building next
+    week's set are reminded of songs sitting unused in the library instead
+    of always reaching for the same recent rotation. Sorted by longest gap
+    first (never-used songs sort to the very top, alongside anything with
+    an unparseable last-played date, since both are equally "definitely
+    due"). Deliberately capped to a handful of songs — this is a nudge,
+    not a full library browse; Song Library already covers that."""
+    all_songs = get_all_songs()
+    if not all_songs:
+        return
+    usage = compute_song_usage()
+    today = datetime.date.today()
+
+    candidates = []  # (sort_key, weeks_ago_or_None, song_row)
+    for song in all_songs:
+        info = usage.get(song["id"])
+        if info is None:
+            candidates.append((999999, None, song))
+            continue
+        try:
+            last_played = datetime.date.fromisoformat((info["last_played"] or "").strip())
+            weeks_ago = (today - last_played).days // 7
+        except ValueError:
+            candidates.append((999998, None, song))
+            continue
+        if weeks_ago >= ROTATION_WEEKS_THRESHOLD:
+            candidates.append((weeks_ago, weeks_ago, song))
+
+    if not candidates:
+        return
+    candidates.sort(key=lambda c: c[0], reverse=True)
+    candidates = candidates[:6]
+
+    st.markdown("#### Due for Rotation")
+    st.caption(f"Songs untouched for {ROTATION_WEEKS_THRESHOLD}+ weeks — worth reconsidering for an upcoming set.")
+    rotation_cols = st.columns(3)
+    for i, (_, weeks_ago, song) in enumerate(candidates):
+        with rotation_cols[i % 3]:
+            with st.container(border=True):
+                st.markdown(f"**{song['title']}**")
+                st.caption(song["artist"] or "—")
+                gap_label = "Never used" if weeks_ago is None else f"{weeks_ago} weeks ago"
+                st.markdown(f'<span class="ecc-muted">{gap_label}</span>', unsafe_allow_html=True)
+                if st.button("➕ Add to Service", key=f"rotation_add_{song['id']}", use_container_width=True):
+                    sid = ensure_active_service()
+                    if not sid:
+                        st.warning("No active service yet — create one in Service Builder first.")
+                    else:
+                        service = get_service(sid)
+                        service_items = json.loads(service["items"])
+                        service_items.append(make_song_item(song))
+                        update_service_items(sid, service_items)
+                        st.toast(f"Added '{song['title']}' to the current service.", icon="✅")
 
 
 def _live_search_input(label, key, placeholder=""):
@@ -4868,6 +5265,7 @@ def page_songs():
     st.markdown("### Songs")
     total_song_count = get_song_count()
     st.caption(f"Find, organize, and prepare worship songs for your service. · **{total_song_count} song{'s' if total_song_count != 1 else ''} in library**")
+    render_undo_banner()
 
     search = _live_search_input("Search songs...", key="song_search", placeholder="Search by title, artist, lyrics, or tag")
     if not ST_KEYUP_AVAILABLE:
@@ -4931,7 +5329,9 @@ def page_songs():
             if dupe_ids:
                 st.markdown('<div class="ecc-danger">', unsafe_allow_html=True)
                 if st.button(f"🗑 Delete Duplicates ({len(dupe_ids)})", use_container_width=True, key="delete_dupes"):
+                    deleted_rows = [dict(get_song(sid)) for sid in dupe_ids]
                     delete_songs(dupe_ids)
+                    _stash_undo("songs", deleted_rows, f"Removed {len(dupe_ids)} duplicate song(s).")
                     st.toast(f"Removed {len(dupe_ids)} duplicate song(s).", icon="✅")
                     st.rerun()
                 st.markdown('</div>', unsafe_allow_html=True)
@@ -4964,7 +5364,9 @@ def page_songs():
                         st.toast(f"Added '{s['title']}' to the current service.", icon="✅")
                 with st.container(key=f"del_wrap_song_{s['id']}"):
                     if st.button("🗑 Delete", key=f"delsong_{s['id']}", use_container_width=True):
+                        deleted_row = dict(s)
                         delete_song(s["id"])
+                        _stash_undo("songs", [deleted_row], f"Deleted \"{s['title']}\".")
                         st.toast(f"Deleted \"{s['title']}\".", icon="✅")
                         st.rerun()
 
@@ -5987,12 +6389,73 @@ def _render_slide_grid(entries, adhoc, item_index, slide_index, cols_per_row=4, 
 
 
 def _render_operator_keyboard_shortcuts():
-    st.caption("⌨️ Shortcuts: Space, → or ↑ = Next · ← or ↓ = Prev · B = toggle Black screen")
+    st.caption("⌨️ Shortcuts: Space, → or ↑ = Next · ← or ↓ = Prev · B = toggle Black screen · ? = show all shortcuts")
     st.iframe(
         """
+        <style>
+        #ecc-shortcuts-overlay {
+            position: fixed; inset: 0; z-index: 999998; display: none;
+            align-items: center; justify-content: center;
+            background: rgba(8,8,10,0.65); backdrop-filter: blur(2px);
+            font-family: 'Inter', sans-serif;
+        }
+        #ecc-shortcuts-panel {
+            background: linear-gradient(160deg, #17161A 0%, #131217 100%);
+            border: 1px solid #C8A24A55; border-radius: 16px;
+            padding: 1.6rem 1.8rem; min-width: 320px; max-width: 92vw;
+            box-shadow: 0 8px 40px rgba(0,0,0,0.5);
+        }
+        #ecc-shortcuts-panel h3 {
+            margin: 0 0 1rem 0; color: #F4F3EF; font-weight: 800; font-size: 1.15rem;
+        }
+        .ecc-shortcut-row {
+            display: flex; justify-content: space-between; align-items: center;
+            gap: 1.5rem; padding: 0.45rem 0; border-bottom: 1px solid #26252A;
+        }
+        .ecc-shortcut-row:last-child { border-bottom: none; }
+        .ecc-shortcut-row span:first-child { color: #9A9CA3; font-size: 0.88rem; }
+        .ecc-shortcut-key {
+            font-family: 'JetBrains Mono', 'SF Mono', monospace; font-size: 0.8rem;
+            background: #0D0C0A; border: 1px solid #26252A; border-radius: 6px;
+            padding: 0.15rem 0.55rem; color: #E8C878;
+        }
+        #ecc-shortcuts-close {
+            margin-top: 1.2rem; width: 100%; background: transparent; color: #9A9CA3;
+            border: 1px solid #26252A; border-radius: 8px; padding: 0.5rem; cursor: pointer;
+            font-family: 'Inter', sans-serif; font-size: 0.85rem;
+        }
+        #ecc-shortcuts-close:hover { border-color: #C8A24A; color: #C8A24A; }
+        </style>
         <script>
         (function() {
             const doc = window.parent.document;
+
+            // The overlay markup only needs to exist once — a second
+            // st.iframe injection (e.g. this function also runs in
+            // full-screen grid mode) would otherwise duplicate the whole
+            // panel and double-bind everything below it.
+            if (!doc.getElementById('ecc-shortcuts-overlay')) {
+                const overlay = doc.createElement('div');
+                overlay.id = 'ecc-shortcuts-overlay';
+                overlay.innerHTML = `
+                    <div id="ecc-shortcuts-panel">
+                        <h3>⌨️ Keyboard Shortcuts</h3>
+                        <div class="ecc-shortcut-row"><span>Next slide</span><span class="ecc-shortcut-key">Space / → / ↑</span></div>
+                        <div class="ecc-shortcut-row"><span>Previous slide</span><span class="ecc-shortcut-key">← / ↓</span></div>
+                        <div class="ecc-shortcut-row"><span>Toggle black screen</span><span class="ecc-shortcut-key">B</span></div>
+                        <div class="ecc-shortcut-row"><span>Show / hide this panel</span><span class="ecc-shortcut-key">?</span></div>
+                        <button id="ecc-shortcuts-close">Close</button>
+                    </div>
+                `;
+                doc.body.appendChild(overlay);
+                overlay.addEventListener('click', function(e) {
+                    if (e.target === overlay) overlay.style.display = 'none';
+                });
+                doc.getElementById('ecc-shortcuts-close').addEventListener('click', function() {
+                    overlay.style.display = 'none';
+                });
+            }
+
             if (doc._eccOperatorKeysBound) return;
             doc._eccOperatorKeysBound = true;
             // Matches by a stable SUBSTRING rather than the full label,
@@ -6011,6 +6474,19 @@ def _render_operator_keyboard_shortcuts():
                 if (tag === 'INPUT' || tag === 'TEXTAREA') return;  // don't hijack typing
                 if (e.ctrlKey || e.metaKey || e.altKey) return;
                 const k = e.key;
+                const overlay = doc.getElementById('ecc-shortcuts-overlay');
+                if (k === '?') {
+                    e.preventDefault();
+                    if (overlay) overlay.style.display = (overlay.style.display === 'flex') ? 'none' : 'flex';
+                    return;
+                }
+                if (k === 'Escape') {
+                    if (overlay && overlay.style.display === 'flex') { overlay.style.display = 'none'; e.preventDefault(); }
+                    return;
+                }
+                // Any navigation key closes the panel first so Space/arrows
+                // don't fire a slide change while the overlay is up.
+                if (overlay && overlay.style.display === 'flex') { overlay.style.display = 'none'; }
                 if (k === 'ArrowRight' || k === 'ArrowUp' || k === ' ') {
                     e.preventDefault();
                     eccClickButtonContaining('NEXT');
@@ -6133,6 +6609,51 @@ def _render_presentation_mode_launch_banner():
             if st.button("Dismiss", key="pres_mode_dismiss", use_container_width=True):
                 st.session_state["_ecc_pres_mode_launched"] = True
                 st.rerun()
+
+
+def _lookahead_slides(items, adhoc, current_slides, item_index, slide_index, font_scale, count=2, skip=1):
+    """Returns up to `count` short text labels for the slides that come
+    AFTER the one at slide_index + skip (skip=1 means 'start one past
+    what Up Next already shows'), walking across item boundaries into
+    following service items when the current item runs out of slides.
+    Ad-hoc (single verse presented outside a service) has no following
+    items to walk into, so lookahead is capped to whatever's left in
+    current_slides. Each label is a short plain-text preview — image
+    slides show a generic placeholder rather than nothing, since a blank
+    ticker row would look like a bug rather than 'this one's a photo'."""
+    labels = []
+    idx_in_item = slide_index + skip
+    walk_item_index = item_index
+
+    while len(labels) < count:
+        slides_here = current_slides if walk_item_index == item_index else (
+            item_slides(items[walk_item_index], font_scale) if (not adhoc and 0 <= walk_item_index < len(items)) else []
+        )
+
+        if idx_in_item < len(slides_here):
+            ref, text, text2, _ = slides_here[idx_in_item]
+            if (text or "").startswith(IMG_SLIDE_PREFIX):
+                label = "🖼 (image slide)"
+            else:
+                flat = (text or "").replace("\n", " ").strip()
+                if text2:
+                    flat = flat or (text2 or "").replace("\n", " ").strip()
+                label = (ref + " — " + flat) if ref else flat
+                label = (label[:70] + "…") if len(label) > 70 else label
+            labels.append(label or "(blank)")
+            idx_in_item += 1
+            continue
+
+        # Ran out of slides in this item — move to the next item, if any.
+        if adhoc or walk_item_index + 1 >= len(items):
+            break
+        walk_item_index += 1
+        idx_in_item = 0
+        next_title = items[walk_item_index].get("title")
+        if next_title:
+            labels.append(f"▸ {next_title}")
+
+    return labels[:count]
 
 
 def _page_presentation_body():
@@ -6336,6 +6857,26 @@ def _page_presentation_body():
                 ) + '</div>'
             )
 
+        # ---- Next-up ticker: a compact text-only strip showing the 2
+        # slides AFTER the one already shown above in "Up Next" — pure
+        # lookahead so the operator never gets surprised by what's coming
+        # after the immediate next slide, especially right before an item
+        # boundary. Operator screen only, by design — deliberately not
+        # rendered on the projector/stage display, which should only ever
+        # show the single live slide to the congregation. Text-only (no
+        # mini slide rendering) so polling this every 0.4s stays cheap.
+        upcoming = _lookahead_slides(items, adhoc, slides, item_index, slide_index,
+                                      state.get("font_scale") or 1.0, count=2, skip=1)
+        if upcoming:
+            ticker_html = "".join(
+                f'<div class="ecc-ticker-row">'
+                f'<span class="ecc-ticker-n">{i + 2}</span>'
+                f'<span class="ecc-ticker-text">{label}</span>'
+                f'</div>'
+                for i, label in enumerate(upcoming)
+            )
+            render_html(f'<div class="ecc-ticker">{ticker_html}</div>')
+
     with right:
         st.markdown("**Controls**")
         render_html(
@@ -6367,10 +6908,23 @@ def _page_presentation_body():
         # could never actually open anything. This renders the real
         # clickable button (Window Management API auto-open) in its place.
         render_display_open_widget(compact=True)
+        # A plain button, not st.toggle(value=is_black, ...). This page is
+        # wrapped in st.fragment(run_every=0.4) and polls shared state that
+        # the phone remote (and other operator tabs) can also change — a
+        # toggle widget keeps its OWN last-rendered value in session_state
+        # once created, and only takes `value=` as the initial value at
+        # creation. If a poll tick landed right after an external change
+        # (e.g. the phone remote pressed Black), the toggle's stale
+        # internal value could disagree with the fresh `is_black` from the
+        # DB, read as "the user just flipped it", and immediately write
+        # black right back to the opposite of what was just set — the
+        # "blacks then instantly reverts" bug. A stateless button has no
+        # persisted value to go stale: it only ever flips whatever the DB
+        # says right now, so there's nothing for a poll race to fight with.
         is_black = bool(state["black"])
-        toggled_black = st.toggle("⬛ Black Screen", value=is_black, key="op_black_toggle")
-        if toggled_black != is_black:
-            set_state(black=1 if toggled_black else 0); st.rerun()
+        black_label = "🔆 Show Display (currently Black)" if is_black else "⬛ Black Screen"
+        if st.button(black_label, use_container_width=True, key="op_black_toggle_btn"):
+            set_state(black=0 if is_black else 1); st.rerun()
         st.write("")
         st.selectbox("Theme", list(THEMES.keys()), index=list(THEMES.keys()).index(theme), key="live_theme",
                      on_change=lambda: set_state(theme=st.session_state.live_theme))
@@ -6607,12 +7161,98 @@ def page_saved_services():
             if n_custom: parts.append(f"{n_custom} custom slide{'s' if n_custom != 1 else ''}")
             if n_deck: parts.append(f"{n_deck} imported deck{'s' if n_deck != 1 else ''}")
             st.caption(" · ".join(parts) if parts else "Empty service")
-            b1, b2 = st.columns(2)
-            if b1.button("Open in Builder", key=f"sb_{s['id']}"):
+            b1, b2, b3 = st.columns(3)
+            if b1.button("Open in Builder", key=f"sb_{s['id']}", use_container_width=True):
                 st.session_state.active_service_id = s["id"]; st.session_state.page = "Service Builder"; st.rerun()
-            if b2.button("Start", key=f"sp_{s['id']}"):
+            if b2.button("Start", key=f"sp_{s['id']}", use_container_width=True):
                 set_state(service_id=s["id"], item_index=0, slide_index=0, black=0, cleared=0, live=1)
                 st.session_state.active_service_id = s["id"]; st.session_state.page = "Presentation"; st.rerun()
+            if b3.button("📅 Next Sunday", key=f"svcdupnext_{s['id']}", use_container_width=True,
+                         help="Duplicate this service, dated one week later"):
+                _, shifted = duplicate_service_next_week(s["id"])
+                if shifted:
+                    st.toast(f"Created a copy of '{s['name']}' dated one week later.", icon="📅")
+                else:
+                    st.toast(f"Created a copy of '{s['name']}' — couldn't parse the original date, so it copied as-is.", icon="⚠️")
+                st.rerun()
+
+
+def _render_bar_row(label, value, max_value, suffix=""):
+    """One horizontal bar row for the Analytics page's 'most used songs'
+    list — styled as a filled track using the app's own gold accent
+    rather than Streamlit's default chart theme, so it sits visually
+    consistent with the rest of the console instead of looking like a
+    bolted-on widget."""
+    pct = round((value / max_value) * 100) if max_value else 0
+    render_html(f"""
+    <div style="margin-bottom:0.7rem;">
+        <div style="display:flex; justify-content:space-between; font-size:0.85rem; margin-bottom:0.25rem;">
+            <span style="color:{TEXT_PRIMARY}; font-weight:600;">{label}</span>
+            <span class="ecc-num" style="color:{TEXT_MUTED};">{value}{suffix}</span>
+        </div>
+        <div class="ecc-progress-track">
+            <div class="ecc-progress-fill" style="width:{pct}%;"></div>
+        </div>
+    </div>
+    """)
+
+
+def page_analytics():
+    st.markdown("### Analytics")
+    st.caption("A look at what's actually being used across your saved services.")
+
+    services = get_services()
+    all_songs = get_all_songs()
+    usage = compute_song_usage()
+
+    # ---- Top-line numbers ----
+    total_services = len(services)
+    total_song_items = sum(v["play_count"] for v in usage.values())
+    avg_songs_per_service = round(total_song_items / total_services, 1) if total_services else 0
+    songs_never_used = sum(1 for s in all_songs if s["id"] not in usage)
+
+    stat_cols = st.columns(4)
+    with stat_cols[0]:
+        _dashboard_stat("Saved Services", total_services)
+    with stat_cols[1]:
+        _dashboard_stat("Avg. Songs / Service", avg_songs_per_service)
+    with stat_cols[2]:
+        _dashboard_stat("Songs Ever Used", len(usage))
+    with stat_cols[3]:
+        _dashboard_stat("Songs Never Used", songs_never_used)
+
+    st.write("")
+
+    # ---- Most-used songs ----
+    st.markdown("#### Most-Used Songs")
+    if not usage:
+        st.caption("No songs have been added to a saved service yet.")
+    else:
+        by_id = {s["id"]: s for s in all_songs}
+        ranked = sorted(usage.items(), key=lambda kv: kv[1]["play_count"], reverse=True)[:10]
+        max_plays = ranked[0][1]["play_count"] if ranked else 1
+        with st.container(border=True):
+            for sid, info in ranked:
+                song = by_id.get(sid)
+                title = song["title"] if song else "(deleted song)"
+                _render_bar_row(title, info["play_count"], max_plays,
+                                 suffix=f" time{'s' if info['play_count'] != 1 else ''}")
+
+    st.write("")
+
+    # ---- Service length trend ----
+    st.markdown("#### Service Length Trend")
+    st.caption("Total items (songs, Bible passages, announcements, slides) per service, most recent first.")
+    if not services:
+        st.caption("No saved services yet.")
+    else:
+        recent_services = services[:12]
+        max_items = max((len(json.loads(s["items"])) for s in recent_services), default=1) or 1
+        with st.container(border=True):
+            for s in recent_services:
+                n_items = len(json.loads(s["items"]))
+                _render_bar_row(f"{s['name']} — {s['service_date']}", n_items, max_items,
+                                 suffix=f" item{'s' if n_items != 1 else ''}")
 
 
 def page_church_settings():
@@ -7005,6 +7645,111 @@ def page_display_settings():
 
 
 # ---------------------------------------------------------------------------
+# COMMAND PALETTE (Cmd/Ctrl+K — songs only)
+# ---------------------------------------------------------------------------
+
+def _render_command_palette():
+    """Global Cmd+K / Ctrl+K song search, available on every page once
+    signed in. Scoped to songs only (not services or Bible books) — the
+    fuzzy matcher (get_top_song_matches) already exists and is exactly
+    what Song Library's own search uses, so results here match what
+    you'd get there.
+
+    How it works: a hidden Streamlit button (0-height, invisible) is
+    JS-clicked when the user presses Cmd/Ctrl+K, which flips a
+    session_state flag and reruns — Streamlit has no client-only modal,
+    so opening the palette is necessarily a real rerun, same as every
+    other cross-page interaction in this app. Once open, a real
+    st.text_input drives get_top_song_matches on every keystroke
+    (each keystroke is its own rerun already, same mechanism as the
+    Song Library search box), and results are real st.button rows so
+    clicking one can actually navigate via st.session_state.page. Esc
+    or clicking outside the panel closes it via the same hidden-button
+    trick."""
+    if "_ecc_palette_open" not in st.session_state:
+        st.session_state["_ecc_palette_open"] = False
+
+    with st.container(key="ecc-palette-trigger"):
+        if st.button("Open command palette", key="ecc_palette_toggle_btn"):
+            st.session_state["_ecc_palette_open"] = not st.session_state["_ecc_palette_open"]
+            st.rerun()
+
+    st.iframe(
+        """
+        <style>#ecc-palette-hide-host { display: none; }</style>
+        <div id="ecc-palette-hide-host"></div>
+        <script>
+        (function() {
+            const doc = window.parent.document;
+            // Hide the trigger button's own Streamlit wrapper — it only
+            // exists to be clicked by JS below, never by a real person.
+            const hostBlocks = doc.querySelectorAll('div[class*="st-key-ecc-palette-trigger"]');
+            hostBlocks.forEach(el => { el.style.display = 'none'; });
+
+            if (doc._eccPaletteKeyBound) return;
+            doc._eccPaletteKeyBound = true;
+
+            function eccClickPaletteToggle() {
+                const buttons = doc.querySelectorAll('div[class*="st-key-ecc-palette-trigger"] button');
+                if (buttons.length) buttons[0].click();
+            }
+            doc.addEventListener('keydown', function(e) {
+                const k = e.key.toLowerCase();
+                if ((e.metaKey || e.ctrlKey) && k === 'k') {
+                    e.preventDefault();
+                    eccClickPaletteToggle();
+                }
+            });
+        })();
+        </script>
+        """,
+        height=1,
+    )
+
+    if not st.session_state["_ecc_palette_open"]:
+        return
+
+    render_html("""
+    <style>
+    #ecc-palette-overlay {
+        position: fixed; inset: 0; z-index: 999997;
+        background: rgba(8,8,10,0.6); backdrop-filter: blur(2px);
+    }
+    </style>
+    <div id="ecc-palette-overlay"></div>
+    """)
+
+    _, pcol, _ = st.columns([1, 2.2, 1])
+    with pcol:
+        st.markdown('<div class="ecc-palette-panel">', unsafe_allow_html=True)
+        top_row = st.columns([5, 1])
+        with top_row[0]:
+            st.markdown("**🔎 Jump to a song**")
+        with top_row[1]:
+            if st.button("✕", key="ecc_palette_close", use_container_width=True):
+                st.session_state["_ecc_palette_open"] = False
+                st.rerun()
+        query = st.text_input(
+            "Search songs...", key="ecc_palette_query", label_visibility="collapsed",
+            placeholder="Type a song title or artist — Esc or ✕ to close",
+        )
+        if query.strip():
+            matches = get_top_song_matches(query, limit=6)
+            if not matches:
+                st.caption("No matching songs.")
+            for m in matches:
+                if st.button(f"🎵 {m['title']} — {m['artist'] or '—'}",
+                              key=f"palette_go_{m['id']}", use_container_width=True):
+                    st.session_state.selected_song_id = m["id"]
+                    st.session_state.page = "Song Workspace"
+                    st.session_state["_ecc_palette_open"] = False
+                    st.rerun()
+        else:
+            st.caption("Start typing to search your song library.")
+        st.markdown('</div>', unsafe_allow_html=True)
+
+
+# ---------------------------------------------------------------------------
 # MAIN
 # ---------------------------------------------------------------------------
 
@@ -7053,6 +7798,39 @@ def main():
     if "logged_in" not in st.session_state:
         st.session_state.logged_in = False
 
+    # Restore-from-refresh: session_state itself is tied to the browser's
+    # websocket connection, so a plain page refresh wipes it exactly like
+    # closing the tab would — that's the "refresh always sends me back to
+    # login" bug. query_params, by contrast, are part of the URL, so the
+    # browser hands them right back on a refresh (same URL) but NOT when
+    # the tab is closed and a fresh one is opened without them. So: if
+    # this is a brand-new session_state (not logged in yet) but the URL
+    # still carries a token this server issued and hasn't since restarted
+    # away, treat it as "still the same visit, just reloaded" rather than
+    # forcing login again. A restart clearing _ACTIVE_LOGIN_TOKENS is
+    # intentional — same "front door locks again" behavior, just also
+    # covering a server restart/redeploy, not only a closed tab.
+    if not st.session_state.logged_in:
+        token = st.query_params.get("s")
+        if token and token in _ACTIVE_LOGIN_TOKENS:
+            st.session_state.logged_in = True
+            st.session_state["_ecc_session_token"] = token
+            # A real sign-in still asks which meeting this is (see
+            # render_login) — a refresh of an already-open session
+            # shouldn't re-ask, so skip straight past that screen and pull
+            # the last-picked meeting back out of settings (durable in the
+            # DB, unlike session_state) if one was ever chosen.
+            existing_meeting = get_settings().get("meeting_type")
+            if existing_meeting:
+                st.session_state["meeting_type"] = existing_meeting
+            # Restore whichever page the URL says was open, instead of
+            # always landing back on Dashboard — see the bottom of main(),
+            # which keeps this query param in sync with the real page on
+            # every rerun.
+            restored_page = st.query_params.get("p")
+            if restored_page:
+                st.session_state.page = restored_page
+
     if not st.session_state.logged_in:
         render_login()
         return
@@ -7074,6 +7852,7 @@ def main():
         st.session_state["_ecc_meeting_transition_pending"] = False
 
     sidebar()
+    _render_command_palette()
 
     pages = {
         "Dashboard": page_dashboard,
@@ -7084,11 +7863,20 @@ def main():
         "Song Library": page_song_library,
         "Import Slides": page_import_slides,
         "Saved Services": page_saved_services,
+        "Analytics": page_analytics,
         "Church Settings": page_church_settings,
         "Display Settings": page_display_settings,
         "Database": page_database_stats,
     }
     pages.get(st.session_state.page, page_dashboard)()
+
+    # Keep the URL's page param in sync with whichever page is actually
+    # showing, on every rerun — this is what makes the restore-from-refresh
+    # check above able to land back on the right page instead of always
+    # Dashboard. Cheap no-op write when it's already correct (Streamlit
+    # only touches the URL if the value actually changed).
+    if st.query_params.get("p") != st.session_state.page:
+        st.query_params["p"] = st.session_state.page
 
 
 DATABASE_TAB_PASSWORD = "2009"
@@ -7234,6 +8022,19 @@ def render_login():
     if st.button("Sign In", use_container_width=True):
         if st.session_state.login_username == LOGIN_USERNAME and st.session_state.login_password == LOGIN_PASSWORD:
             st.session_state.logged_in = True
+            # Mint a per-signin token and put it in the URL (query params)
+            # — session_state alone resets on a browser refresh (it's tied
+            # to the websocket connection, not the tab), which was exactly
+            # the "refresh always sends me back to login" bug. Query
+            # params survive a refresh because the browser reloads the
+            # SAME url; they do NOT survive closing the tab and opening a
+            # fresh one without the param, which is the "only re-ask on
+            # close" behavior that was asked for. See main()'s restore
+            # check for the other half of this.
+            token = secrets.token_urlsafe(16)
+            _ACTIVE_LOGIN_TOKENS.add(token)
+            st.session_state["_ecc_session_token"] = token
+            st.query_params["s"] = token
             # Ask which meeting this is right after sign-in, instead of a
             # generic "Welcome, <name>" — this app has one shared
             # church-wide login (not individual accounts), so greeting by

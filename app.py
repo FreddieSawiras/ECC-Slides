@@ -3379,57 +3379,76 @@ def inject_css():
         text-transform: uppercase; margin-top: 0.6rem;
     }}
 
-    /* ---- Dashboard: stat tiles, quick-action tiles, service grid ---- */
-    /* Stat strip — small metric cards under the hero. Reuses .ecc-num for
-       the figure itself so the numbers read as data (tabular, monospace)
-       against the Inter/Manrope prose everywhere else. */
-    .ecc-stat {{
-        background: linear-gradient(160deg, {CARD} 0%, #131217 100%);
-        border: 1px solid {CARD_BORDER}; border-radius: {RADIUS_MD};
-        padding: 1rem 1.2rem; box-shadow: {SHADOW_REST};
-        transition: border-color .18s ease, transform .18s ease;
+    /* ---- Dashboard v2: hero run-of-show, readiness ring, library pulse,
+       rotation rows. Replaces the old stat-tile / quick-action-tile /
+       service-card-grid dashboard entirely. ---- */
+
+    /* Hero — a taller, more editorial variant of the shared .ecc-hero
+       used elsewhere (Bible "Present Now" panel, etc.), since this one
+       needs to hold a countdown + ring + a scrollable agenda instead of
+       a couple of lines of text. */
+    .ecc-hero-v2 {{ padding: 1.6rem 1.7rem 1.5rem; }}
+    .ecc-hero-title {{
+        font-weight: 800; font-size: 1.7rem; color: {TEXT_PRIMARY};
+        line-height: 1.15; margin: 0.15rem 0 0.3rem;
     }}
-    .ecc-stat:hover {{ border-color: {ACCENT}55; transform: translateY(-1px); }}
-    .ecc-stat-value {{
+    .ecc-countdown {{
+        display: inline-block; margin-top: 0.5rem; font-weight: 700; font-size: 0.85rem;
+        color: {ACCENT}; background: {ACCENT}18; border: 1px solid {ACCENT}40;
+        border-radius: 999px; padding: 0.2rem 0.7rem;
+    }}
+    .ecc-countdown-now {{
+        color: {LIVE_GREEN}; background: {LIVE_GREEN}18; border-color: {LIVE_GREEN}40;
+    }}
+
+    /* Run of show — the actual agenda, in play order. */
+    .ecc-ros {{
+        border: 1px solid {CARD_BORDER}; border-radius: {RADIUS_MD}; overflow: hidden;
+        background: {BG}; max-height: 340px; overflow-y: auto;
+    }}
+    .ecc-ros-row {{
+        display: flex; align-items: center; gap: 0.7rem;
+        padding: 0.6rem 0.9rem; border-bottom: 1px solid {CARD_BORDER};
+        transition: background .15s ease;
+    }}
+    .ecc-ros-row:last-child {{ border-bottom: none; }}
+    .ecc-ros-row-live {{ background: {LIVE_GREEN}14; }}
+    .ecc-ros-n {{
         font-family: var(--ecc-num); font-variant-numeric: tabular-nums;
-        font-weight: 700; font-size: 1.6rem; color: {TEXT_PRIMARY}; line-height: 1.1;
+        color: {TEXT_MUTED}; font-weight: 700; font-size: 0.8rem; min-width: 1.3rem;
     }}
-    .ecc-stat-label {{
-        text-transform: uppercase; letter-spacing: .1em; font-size: 0.68rem;
-        color: {TEXT_MUTED}; font-weight: 700; margin-top: 0.3rem;
+    .ecc-ros-live-dot {{
+        min-width: 0.55rem; height: 0.55rem; border-radius: 50%; background: {LIVE_GREEN};
+        box-shadow: 0 0 0 3px {LIVE_GREEN}30; animation: ecc-pulse-dot 1.8s ease-in-out infinite;
     }}
-    /* Quick-action tiles — bigger tap target than a plain st.button, icon
-       stacked above label. The wrapping div gets a class via
-       st.container(key=...) -> "st-key-ecc-action-<slug>" (Streamlit
-       mirrors container keys onto the DOM), matching the same pattern
-       already used for .ecc-danger / del_wrap_ buttons above. */
-    div[class*="st-key-ecc-action-"] .stButton>button {{
-        background: linear-gradient(160deg, {CARD} 0%, #131217 100%) !important;
-        border: 1px solid {CARD_BORDER} !important; border-radius: {RADIUS_MD} !important;
-        padding: 1.1rem 0.6rem !important; height: auto !important;
-        font-size: 0.92rem !important; font-weight: 700 !important;
-        white-space: normal !important; line-height: 1.35 !important;
-        box-shadow: {SHADOW_REST} !important;
-        transition: border-color .15s ease, box-shadow .15s ease, transform .15s ease !important;
+    @keyframes ecc-pulse-dot {{
+        0%, 100% {{ opacity: 1; }} 50% {{ opacity: 0.4; }}
     }}
-    div[class*="st-key-ecc-action-"] .stButton>button:hover {{
-        border-color: {ACCENT} !important; color: {ACCENT} !important;
-        box-shadow: 0 6px 20px {ACCENT}22 !important; transform: translateY(-2px) !important;
+    .ecc-ros-icon {{ font-size: 0.95rem; }}
+    .ecc-ros-title {{ color: {TEXT_PRIMARY}; font-size: 0.9rem; font-weight: 600; }}
+    .ecc-ros-row-live .ecc-ros-title {{ color: {LIVE_GREEN}; }}
+
+    /* Library Pulse (below-the-fold, planner-facing) */
+    .ecc-pulse-card {{
+        background: {CARD}; border: 1px solid {CARD_BORDER}; border-radius: {RADIUS_MD};
+        padding: 1rem 1.1rem;
     }}
-    /* Recent Services grid card — replaces the old full-width
-       st.container(border=True) rows so cards sit side-by-side instead of
-       stacking into a long scroll. */
-    .ecc-svc-card {{
-        background: linear-gradient(160deg, {CARD} 0%, #131217 100%);
-        border: 1px solid {CARD_BORDER}; border-radius: {RADIUS_MD};
-        padding: 1.1rem 1.2rem 0.9rem; margin-bottom: 0.9rem;
-        box-shadow: {SHADOW_REST}; transition: border-color .18s ease, transform .18s ease;
-        min-height: 92px;
+    .ecc-pulse-bar-track {{
+        width: 100%; height: 10px; border-radius: 999px; background: {CARD_BORDER}; overflow: hidden;
     }}
-    .ecc-svc-card:hover {{ border-color: {ACCENT}55; transform: translateY(-1px); }}
-    .ecc-svc-name {{ font-weight: 700; font-size: 0.98rem; color: {TEXT_PRIMARY}; }}
-    /* Hero mini progress bar — "X/Y items ready" under the Today's Service
-       headline. Width is set inline per-render via style="width:NN%". */
+    .ecc-pulse-bar-fill {{
+        height: 100%; border-radius: 999px; background: linear-gradient(90deg, {ACCENT}, #E8C878);
+    }}
+    .ecc-pulse-caption {{ margin-top: 0.6rem; font-size: 0.82rem; color: {TEXT_MUTED}; line-height: 1.5; }}
+
+    /* Rotation rows (below-the-fold, planner-facing) */
+    .ecc-rotation-row {{ padding: 0.5rem 0; }}
+    .ecc-rotation-title {{ font-weight: 700; color: {TEXT_PRIMARY}; font-size: 0.9rem; display: block; }}
+    .ecc-rotation-gap {{ color: {TEXT_MUTED}; font-size: 0.76rem; }}
+
+    /* Hero mini progress bar — reused by Analytics' bar-row lists
+       (_render_bar_row: most-used songs, service length trend). Width is
+       set inline per-render via style="width:NN%". */
     .ecc-progress-track {{
         width: 100%; height: 6px; border-radius: 999px; background: {CARD_BORDER};
         margin-top: 0.7rem; overflow: hidden;
@@ -4963,185 +4982,208 @@ def sidebar():
 # PAGES
 # ---------------------------------------------------------------------------
 
-def _dashboard_stat(label, value):
-    """One small metric tile for the dashboard stat strip. Kept as a tiny
-    helper (rather than inlined 4x) so the markup for every tile is
-    guaranteed identical."""
+def _parse_service_time_to_today(service_date_str, service_time_str):
+    """Best-effort parse of this app's free-text service_time field (e.g.
+    "10:00 AM") combined with service_date into a real datetime, for the
+    hero countdown. service_time is a plain st.text_input elsewhere in the
+    app (not a structured time picker), so this tries a small set of
+    common formats and returns None rather than raising if none match —
+    the countdown simply doesn't render rather than showing something
+    wrong."""
+    if not service_date_str or not service_time_str:
+        return None
+    try:
+        d = datetime.date.fromisoformat(service_date_str.strip())
+    except ValueError:
+        return None
+    cleaned = service_time_str.strip().upper().replace(".", "")
+    for fmt in ("%I:%M %p", "%I:%M%p", "%I %p", "%H:%M"):
+        try:
+            t = datetime.datetime.strptime(cleaned, fmt).time()
+            return datetime.datetime.combine(d, t)
+        except ValueError:
+            continue
+    return None
+
+
+def _service_item_icon(item_type):
+    return {"song": "🎵", "bible": "📖", "custom": "🖼", "announcement": "📣", "imagedeck": "🖼"}.get(item_type, "•")
+
+
+def _render_readiness_ring(pct, size=92):
+    """A circular readiness indicator (SVG) instead of the old linear
+    progress bar — reads as a single confident number on approach, the
+    way a real dashboard gauge does, rather than a strip of green
+    competing with everything else in the hero for attention."""
+    r = (size - 10) / 2
+    circumference = 2 * 3.14159265 * r
+    offset = circumference * (1 - pct / 100)
+    color = LIVE_GREEN if pct >= 100 else (ACCENT if pct >= 40 else BLACK_RED)
     render_html(f"""
-    <div class="ecc-stat">
-        <div class="ecc-stat-value ecc-num">{value}</div>
-        <div class="ecc-stat-label">{label}</div>
-    </div>
+    <svg width="{size}" height="{size}" viewBox="0 0 {size} {size}" style="transform:rotate(-90deg);">
+        <circle cx="{size/2}" cy="{size/2}" r="{r}" fill="none" stroke="{CARD_BORDER}" stroke-width="7"/>
+        <circle cx="{size/2}" cy="{size/2}" r="{r}" fill="none" stroke="{color}" stroke-width="7"
+                stroke-linecap="round" stroke-dasharray="{circumference:.1f}"
+                stroke-dashoffset="{offset:.1f}" style="transition: stroke-dashoffset .4s ease;"/>
+        <text x="{size/2}" y="{size/2}" fill="{TEXT_PRIMARY}" font-size="{size*0.24}" font-weight="800"
+              text-anchor="middle" dominant-baseline="central" transform="rotate(90 {size/2} {size/2})"
+              font-family="Inter, sans-serif">{pct}%</text>
+    </svg>
     """)
 
 
-def _dashboard_service_card(s):
-    """One card in the Recent Services grid: name, date, counts, and a
-    Live/Black/Paused-style status pill when this is the service currently
-    loaded into presentation_state (reuses the same semantic status colors
-    as render_status_badge on the Presentation page, so 'this is the one
-    that's live right now' reads identically in both places)."""
-    items = json.loads(s["items"])
-    n_songs = sum(1 for i in items if i["type"] == "song")
-    n_bible = sum(1 for i in items if i["type"] == "bible")
+def _render_run_of_show(items, state, service_id):
+    """The heart of the new dashboard: the next service's actual agenda,
+    not a summary of it. Each row is a real item (song title, passage
+    reference, announcement) with its type icon, in play order — the
+    thing an operator scans in the 30 seconds before walking on stage,
+    and the thing a planner scans to judge whether next week's set
+    actually flows. The item presentation_state says is currently live
+    gets a highlighted row and a pulsing dot, so if service is already
+    running, this doubles as a live status board."""
+    is_loaded = state.get("service_id") == service_id
+    live_idx = state.get("item_index") if (is_loaded and state.get("live") and not state.get("cleared")) else None
 
-    state = get_state()
-    is_loaded = state.get("service_id") == s["id"]
-    if is_loaded and bool(state.get("black")):
-        status_html = '<span class="ecc-status ecc-status-black">Black</span>'
-    elif is_loaded and bool(state.get("cleared")):
-        status_html = '<span class="ecc-status ecc-status-paused">Paused</span>'
-    elif is_loaded and bool(state.get("live")):
-        status_html = '<span class="ecc-status ecc-status-live">Live</span>'
-    else:
-        status_html = ""
-
-    render_html(f"""
-    <div class="ecc-svc-card">
-        <div style="display:flex; align-items:flex-start; justify-content:space-between; gap:0.5rem;">
-            <div class="ecc-svc-name">{s['name']}</div>
-            {status_html}
+    rows_html = []
+    for i, item in enumerate(items):
+        icon = _service_item_icon(item["type"])
+        title = item.get("title") or "(untitled)"
+        is_live_row = (i == live_idx)
+        row_class = "ecc-ros-row ecc-ros-row-live" if is_live_row else "ecc-ros-row"
+        dot = '<span class="ecc-ros-live-dot"></span>' if is_live_row else f'<span class="ecc-ros-n">{i + 1}</span>'
+        rows_html.append(f"""
+        <div class="{row_class}">
+            {dot}
+            <span class="ecc-ros-icon">{icon}</span>
+            <span class="ecc-ros-title">{title}</span>
         </div>
-        <div class="ecc-muted" style="margin-top:0.2rem;">
-            {s['service_date']} · {n_songs} song{'s' if n_songs != 1 else ''} ·
-            {n_bible} Bible passage{'s' if n_bible != 1 else ''}
-        </div>
-    </div>
-    """)
-    b1, b2, b3 = st.columns(3)
-    if b1.button("Open", key=f"open_{s['id']}", use_container_width=True):
-        st.session_state.active_service_id = s["id"]; st.session_state.page = "Presentation"; st.rerun()
-    if b2.button("Edit", key=f"edit_{s['id']}", use_container_width=True):
-        st.session_state.active_service_id = s["id"]; st.session_state.page = "Service Builder"; st.rerun()
-    if b3.button("Duplicate", key=f"dup_{s['id']}", use_container_width=True):
-        duplicate_service(s["id"]); st.rerun()
-    if st.button("📅 Duplicate → Next Sunday", key=f"dupnext_{s['id']}", use_container_width=True):
-        _, shifted = duplicate_service_next_week(s["id"])
-        if shifted:
-            st.toast(f"Created a copy of '{s['name']}' dated one week later.", icon="📅")
-        else:
-            st.toast(f"Created a copy of '{s['name']}' — couldn't parse the original date, so it copied as-is.", icon="⚠️")
-        st.rerun()
+        """)
+    render_html(f'<div class="ecc-ros">{"".join(rows_html)}</div>')
 
 
 def page_dashboard():
     settings = get_settings()
-    st.markdown(f"### Good morning, {settings['church_name']}.")
-
     services = get_services()
     upcoming = services[0] if services else None
+    state = get_state()
 
-    # ---- Hero: today's service, with a small progress bar showing how
-    # much of the service is actually built out (items present) rather
-    # than just a static "Ready / Not yet built" line of text. ----
-    st.markdown('<div class="ecc-hero">', unsafe_allow_html=True)
+    hour = datetime.datetime.now().hour
+    greeting = "Good morning" if hour < 12 else ("Good afternoon" if hour < 18 else "Good evening")
+    st.markdown(f"### {greeting}, {settings['church_name']}.")
+
+    # =========================================================================
+    # HERO — the next service's real run-of-show, not a stat summary of it.
+    # This is deliberately the only big thing on the page: a countdown, a
+    # readiness ring, and the actual ordered agenda, side by side.
+    # =========================================================================
+    st.markdown('<div class="ecc-hero ecc-hero-v2">', unsafe_allow_html=True)
     if upcoming:
         items = json.loads(upcoming["items"])
-        n_songs = sum(1 for i in items if i["type"] == "song")
-        n_bible = sum(1 for i in items if i["type"] == "bible")
         n_items = len(items)
-        # "Readiness" is a simple proxy: a service with at least a handful
-        # of items prepared reads as further along than an empty shell.
-        # Capped at 8 items = 100% so the bar isn't perpetually near-empty
-        # for a normal-sized service.
         pct = min(100, round((n_items / 8) * 100)) if n_items else 0
+        when_dt = _parse_service_time_to_today(upcoming["service_date"], upcoming["service_time"])
 
-        st.markdown('<div class="ecc-label">Today\'s Service</div>', unsafe_allow_html=True)
-        st.markdown(f"## {upcoming['name']}")
-        st.markdown(
-            f'<span class="ecc-muted">{upcoming["service_date"]} · {upcoming["service_time"] or "TBD"} · '
-            f'{n_songs} songs prepared · {n_bible} passages prepared</span>',
-            unsafe_allow_html=True,
-        )
-        render_html(f"""
-        <div class="ecc-progress-track">
-            <div class="ecc-progress-fill" style="width:{pct}%;"></div>
-        </div>
-        <div class="ecc-muted" style="margin-top:0.35rem; font-size:0.78rem;">
-            {n_items} item{'s' if n_items != 1 else ''} prepared ·
-            {"Ready to present" if items else "Not yet built"}
-        </div>
-        """)
+        top = st.columns([3, 1])
+        with top[0]:
+            st.markdown('<div class="ecc-label">Next Up</div>', unsafe_allow_html=True)
+            st.markdown(f'<div class="ecc-hero-title">{upcoming["name"]}</div>', unsafe_allow_html=True)
+            when_str = f'{upcoming["service_date"]}'
+            if upcoming["service_time"]:
+                when_str += f' · {upcoming["service_time"]}'
+            countdown_html = ""
+            if when_dt:
+                delta = when_dt - datetime.datetime.now()
+                total_min = int(delta.total_seconds() // 60)
+                if -180 <= total_min <= 0:
+                    countdown_html = '<span class="ecc-countdown ecc-countdown-now">Starting now</span>'
+                elif total_min > 0:
+                    hrs, mins = divmod(total_min, 60)
+                    label = f"{hrs}h {mins}m" if hrs else f"{mins}m"
+                    countdown_html = f'<span class="ecc-countdown">in {label}</span>'
+            st.markdown(
+                f'<div class="ecc-muted">{when_str}</div>{countdown_html}',
+                unsafe_allow_html=True,
+            )
+        with top[1]:
+            _render_readiness_ring(pct)
+
         st.write("")
-        col1, _ = st.columns([1, 3])
-        with col1:
+        if items:
+            _render_run_of_show(items, state, upcoming["id"])
+        else:
+            st.caption("No items yet — build the run of show in Service Builder.")
+
+        st.write("")
+        action_cols = st.columns([1, 1, 2])
+        with action_cols[0]:
             st.markdown('<div class="ecc-primary">', unsafe_allow_html=True)
-            if st.button("Open Service", use_container_width=True):
+            if st.button("▶ Open", use_container_width=True):
                 st.session_state.active_service_id = upcoming["id"]
                 st.session_state.page = "Presentation"
                 st.rerun()
             st.markdown('</div>', unsafe_allow_html=True)
+        with action_cols[1]:
+            if st.button("✎ Edit", use_container_width=True):
+                st.session_state.active_service_id = upcoming["id"]
+                st.session_state.page = "Service Builder"
+                st.rerun()
     else:
-        st.markdown('<div class="ecc-label">Today\'s Service</div>', unsafe_allow_html=True)
-        st.markdown("## No service prepared yet")
-        st.caption("Create one to get started.")
+        st.markdown('<div class="ecc-label">Next Up</div>', unsafe_allow_html=True)
+        st.markdown('<div class="ecc-hero-title">No service prepared yet</div>', unsafe_allow_html=True)
+        st.caption("Build one in Service Builder to see it here.")
     st.markdown('</div>', unsafe_allow_html=True)
 
-    # ---- Stat strip: at-a-glance numbers, using the same tabular-num
-    # treatment the rest of the app reserves for data (slide counts,
-    # timers). Previously the dashboard showed zero real numbers outside
-    # the hero card. ----
-    total_songs = get_song_count()
-    total_services = len(services)
-    total_service_items = sum(len(json.loads(s["items"])) for s in services) if services else 0
-    avg_items = round(total_service_items / total_services, 1) if total_services else 0
-
-    stat_cols = st.columns(4)
-    with stat_cols[0]:
-        _dashboard_stat("Songs in Library", total_songs)
-    with stat_cols[1]:
-        _dashboard_stat("Saved Services", total_services)
-    with stat_cols[2]:
-        _dashboard_stat("Avg. Items / Service", avg_items)
-    with stat_cols[3]:
-        state = get_state()
-        live_now = bool(state.get("live")) and not bool(state.get("black")) and not bool(state.get("cleared"))
-        _dashboard_stat("Presentation", "Live" if live_now else "Idle")
-
     st.write("")
 
-    # ---- Quick Actions: icon tiles instead of plain buttons — bigger tap
-    # target, same gold-glow-on-hover language as the meeting-picker
-    # buttons elsewhere in the app, via the .ecc-action-* container keys
-    # wired up in inject_css(). ----
-    st.markdown("#### Quick Actions")
-    a1, a2, a3, a4 = st.columns(4)
-    with a1:
-        with st.container(key="ecc-action-create"):
-            if st.button("➕\n\nCreate Service", use_container_width=True):
-                st.session_state.page = "Service Builder"; st.rerun()
-    with a2:
-        with st.container(key="ecc-action-addsong"):
-            if st.button("🎵\n\nAdd Song", use_container_width=True):
-                st.session_state.page = "Song Library"; st.session_state.show_add_song = True; st.rerun()
-    with a3:
-        with st.container(key="ecc-action-bible"):
-            if st.button("📖\n\nFind Bible Verse", use_container_width=True):
-                st.session_state.page = "Bible"; st.rerun()
-    with a4:
-        with st.container(key="ecc-action-present"):
-            if st.button("▶\n\nStart Presentation", use_container_width=True):
-                st.session_state.page = "Presentation"; st.rerun()
+    # =========================================================================
+    # BELOW THE FOLD — the planner's half: quieter, visual, not another
+    # row of equal-weight boxes. One usage chart, one rotation nudge.
+    # =========================================================================
+    lower = st.columns([1, 1])
+    with lower[0]:
+        _render_library_pulse()
+    with lower[1]:
+        _render_rotation_suggestions()
 
-    st.write("")
 
-    # ---- Recent Services: a real grid (2 per row) instead of a vertical
-    # stack, so cards use the page's horizontal space instead of forcing a
-    # long scroll for 5 services. ----
-    st.markdown("#### Recent Services")
-    if not services:
-        st.caption("Nothing here yet — your saved services will appear as cards.")
-    else:
-        recent = services[:6]
-        for row_start in range(0, len(recent), 2):
-            row_services = recent[row_start:row_start + 2]
-            grid_cols = st.columns(2)
-            for col, s in zip(grid_cols, row_services):
-                with col:
-                    _dashboard_service_card(s)
+def _render_library_pulse():
+    """Replaces the old 4-tile stat strip with one composed visual: a
+    donut of how the library's songs split by category (or usage recency,
+    if categories aren't in use), plus the two numbers that actually
+    change a planner's decisions — songs never used, and services logged
+    overall. This is a Tuesday-afternoon glance, not an operator's
+    checklist, so it sits below the fold and stays visually quiet."""
+    all_songs = get_all_songs()
+    usage = compute_song_usage()
+    services = get_services()
 
-    st.write("")
-    _render_rotation_suggestions()
+    st.markdown("##### Library Pulse")
+
+    if not all_songs:
+        st.caption("Add songs to your library to see usage patterns here.")
+        return
+
+    used_count = len(usage)
+    never_used = len(all_songs) - used_count
+    pct_used = round((used_count / len(all_songs)) * 100) if all_songs else 0
+
+    render_html(f"""
+    <div class="ecc-pulse-card">
+        <div class="ecc-pulse-row">
+            <div class="ecc-pulse-bar-track">
+                <div class="ecc-pulse-bar-fill" style="width:{pct_used}%;"></div>
+            </div>
+        </div>
+        <div class="ecc-pulse-caption">
+            <span class="ecc-num" style="color:{TEXT_PRIMARY};font-weight:700;">{used_count}</span> of
+            <span class="ecc-num" style="color:{TEXT_PRIMARY};font-weight:700;">{len(all_songs)}</span> songs have been used in a service
+            &nbsp;·&nbsp;
+            <span class="ecc-num" style="color:{TEXT_MUTED};">{len(services)}</span> services logged
+        </div>
+    </div>
+    """)
+    if never_used:
+        st.caption(f"{never_used} song{'s' if never_used != 1 else ''} in the library have never made it into a set.")
 
 
 ROTATION_WEEKS_THRESHOLD = 6  # a song is "due for rotation" once it's been
@@ -5160,8 +5202,11 @@ def _render_rotation_suggestions():
     due"). Deliberately capped to a handful of songs — this is a nudge,
     not a full library browse; Song Library already covers that."""
     all_songs = get_all_songs()
+    st.markdown("##### Due for Rotation")
     if not all_songs:
+        st.caption("Nothing to suggest yet.")
         return
+
     usage = compute_song_usage()
     today = datetime.date.today()
 
@@ -5181,30 +5226,34 @@ def _render_rotation_suggestions():
             candidates.append((weeks_ago, weeks_ago, song))
 
     if not candidates:
+        st.caption(f"Everything's been played within the last {ROTATION_WEEKS_THRESHOLD} weeks.")
         return
     candidates.sort(key=lambda c: c[0], reverse=True)
-    candidates = candidates[:6]
+    candidates = candidates[:4]
 
-    st.markdown("#### Due for Rotation")
-    st.caption(f"Songs untouched for {ROTATION_WEEKS_THRESHOLD}+ weeks — worth reconsidering for an upcoming set.")
-    rotation_cols = st.columns(3)
-    for i, (_, weeks_ago, song) in enumerate(candidates):
-        with rotation_cols[i % 3]:
-            with st.container(border=True):
-                st.markdown(f"**{song['title']}**")
-                st.caption(song["artist"] or "—")
-                gap_label = "Never used" if weeks_ago is None else f"{weeks_ago} weeks ago"
-                st.markdown(f'<span class="ecc-muted">{gap_label}</span>', unsafe_allow_html=True)
-                if st.button("➕ Add to Service", key=f"rotation_add_{song['id']}", use_container_width=True):
-                    sid = ensure_active_service()
-                    if not sid:
-                        st.warning("No active service yet — create one in Service Builder first.")
-                    else:
-                        service = get_service(sid)
-                        service_items = json.loads(service["items"])
-                        service_items.append(make_song_item(song))
-                        update_service_items(sid, service_items)
-                        st.toast(f"Added '{song['title']}' to the current service.", icon="✅")
+    for _, weeks_ago, song in candidates:
+        gap_label = "Never used" if weeks_ago is None else f"{weeks_ago}w ago"
+        row = st.columns([5, 2])
+        with row[0]:
+            render_html(f"""
+            <div class="ecc-rotation-row">
+                <span class="ecc-rotation-title">{song['title']}</span>
+                <span class="ecc-rotation-gap">{gap_label}</span>
+            </div>
+            """)
+        with row[1]:
+            if st.button("＋ Add", key=f"rotation_add_{song['id']}", use_container_width=True):
+                sid = ensure_active_service()
+                if not sid:
+                    st.warning("No active service yet — create one in Service Builder first.")
+                else:
+                    service = get_service(sid)
+                    service_items = json.loads(service["items"])
+                    service_items.append(make_song_item(song))
+                    update_service_items(sid, service_items)
+                    st.toast(f"Added '{song['title']}' to the current service.", icon="✅")
+
+
 
 
 def _live_search_input(label, key, placeholder=""):
